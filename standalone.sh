@@ -705,13 +705,13 @@ alert tcp any any -> $HOME_NET 445 (msg:"LATERAL - lsarpc named pipe (LSA / DCSy
 # DCERPC interface UUIDs (alert on bind/call to these RPC interfaces)
 # 367abb81-9844-35f1-ad32-98f038001003 = svcctl (Service Control Mgr)
 alert dcerpc any any -> $HOME_NET any (msg:"LATERAL - DCERPC bind to svcctl interface"; \
-  dcerpc.iface; content:"|81 ab 7a 36 44 98 f1 35 ad 32 98 f0 38 00 10 03|"; \
-  sid:9001020; rev:1; classtype:attempted-admin;)
+  dcerpc.iface:367abb81-9844-35f1-ad32-98f038001003; \
+  sid:9001020; rev:2; classtype:attempted-admin;)
 
 # 12345778-1234-abcd-ef00-0123456789ac = SAMR
 alert dcerpc any any -> $HOME_NET any (msg:"LATERAL - DCERPC bind to SAMR (account enum)"; \
-  dcerpc.iface; content:"|78 57 34 12 34 12 cd ab ef 00 01 23 45 67 89 ac|"; \
-  sid:9001021; rev:1; classtype:attempted-recon;)
+  dcerpc.iface:12345778-1234-abcd-ef00-0123456789ac; \
+  sid:9001021; rev:2; classtype:attempted-recon;)
 CUSTOM_RULES_EOF
 
 # Preserve-config short path
