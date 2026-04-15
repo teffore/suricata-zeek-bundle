@@ -29,9 +29,14 @@ apt-get install -y suricata jq logrotate
 # Stop suricata (apt auto-starts it with eth0 which fails)
 systemctl stop suricata || true
 
-# Fix /etc/default/suricata — Ubuntu service reads IFACE from here
-sed -i "s/IFACE=eth0/IFACE=${PRIMARY_IF}/" /etc/default/suricata
-sed -i "s/RUN=no/RUN=yes/" /etc/default/suricata
+# Fix /etc/default/suricata — older Ubuntu Suricata packages read IFACE from
+# here. The OISF stable PPA build of Suricata 8.0.4 no longer ships this file
+# (the systemd unit reads /etc/suricata/suricata.yaml directly), so guard the
+# edits.
+if [ -f /etc/default/suricata ]; then
+  sed -i "s/IFACE=eth0/IFACE=${PRIMARY_IF}/" /etc/default/suricata
+  sed -i "s/RUN=no/RUN=yes/" /etc/default/suricata
+fi
 
 # dpkg may have saved config as .dpkg-new if it detected conflicts
 if [ ! -f /etc/suricata/suricata.yaml ] && [ -f /etc/suricata/suricata.yaml.dpkg-new ]; then
