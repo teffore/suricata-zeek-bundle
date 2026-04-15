@@ -13,6 +13,7 @@ fetch, VPC Traffic Mirroring wiring) so it runs on any existing Ubuntu 22.04 hos
 | `zeek_setup.sh` | Installs Zeek 8.x from the OBS repo, intel feeds, zeekctl cron |
 | `custom.rules` | ~70 custom Suricata signatures (SIDs 9000001–9000612) |
 | `verify.sh` | Post-install health + canary-alert check |
+| `testing/` | Kali attacker tooling + full attack battery + alert-summary script |
 
 ## Requirements
 
@@ -139,6 +140,111 @@ Loaded in `local.zeek`:
 
 Appended to `/var/lib/suricata/rules/suricata.rules` after `suricata-update`
 so they survive rule refreshes.
+
+## Testing & validation (Kali attacker)
+
+The sensor was developed against a reproducible lab: a Kali attacker box
+driving scripted attacks at a victim host while traffic is mirrored to the
+Suricata/Zeek sensor. The `testing/` directory bundles those scripts so you
+can drive the same test suite against any target you control.
+
+### Contents
+
+| Script | Purpose |
+|---|---|
+| `testing/kali_setup.sh` | Installs Kali attacker tooling: `nmap`, `hydra`, `nikto`, `hping3`, `dnsutils`, `smbclient`, `impacket-scripts`, `python3-impacket` |
+| `testing/run_attacks.sh <victim_ip>` | Runs the full attack battery (see categories below) |
+| `testing/verify_alerts.sh` | Runs on the sensor; summarizes alerts, Zeek notices, VXLAN decap evidence, decoder stats |
+
+### Attack coverage
+
+`run_attacks.sh` exercises **18 categories** with ~200+ individual probes:
+
+**Reconnaissance**
+- ICMP ping sweep, Nmap SYN scan (top 100), service/version detection, OS
+  detection, vulnerability scripts (`--script vuln`), CVE detection (`vulners`)
+
+**Web application attacks**
+- SQL injection (union, auth bypass), directory traversal (plain + URL-encoded),
+  XSS (script + event-handler), Shellshock, suspicious user-agents (sqlmap,
+  nikto, DirBuster), sensitive file probes (`.env`, `/phpmyadmin/`, `server-status`)
+
+**CVE exploit simulations (2021–2025)**
+- Log4Shell (CVE-2021-44228), Spring4Shell (2022-22965), Confluence OGNL
+  (2023-22527), MOVEit SQLi (2023-34362), Apache path traversal
+  (2021-41773/42013), Citrix NetScaler (2023-3519), FortiOS SSLVPN (2018-13379),
+  vCenter (2021-21972), ProxyShell (2021-34473), Palo Alto PAN-OS (2024-3400),
+  CUPS IPP (2024-47176), Ivanti Connect Secure (2025-0282), Cleo LexiCom /
+  Cl0p (2024-55956), PHP-CGI (2024-4577), Check Point (2024-24919), ActiveMQ
+  (2023-46604), React Server Components (2025-55182)
+
+**Brute force & credential attacks**
+- SSH (hydra + per-user failed logins), FTP, SMB, Telnet, RDP, LDAP anonymous bind
+
+**DNS abuse**
+- Long-subdomain tunneling (iodine/dnscat2 patterns), TXT record exfil,
+  suspicious TLDs, zone transfer attempts, high-rate random-subdomain floods
+
+**Cloud / metadata attacks**
+- IMDSv1 exploitation, IMDSv2 token requests, IMDS bypass variants (decimal,
+  octal, IPv6), credential + user-data theft, ECS/Lambda/EKS metadata abuse,
+  Docker socket patterns, S3 bucket enumeration via DNS, AKIA credential-format
+  exfil, AWS CLI/SDK user-agents from unusual sources, Capital One attack chain
+
+**C2 framework patterns**
+- Cobalt Strike beacon URIs, Meterpreter defaults, PowerShell Empire, Sliver,
+  Mythic, ransomware callbacks (Conti, LockBit, REvil), crypto mining (XMRig,
+  Stratum)
+
+**Evasion techniques**
+- IP fragmentation, double/triple URL encoding, case randomization,
+  Unicode/full-width bypass, chunked encoding abuse, oversized headers,
+  SNI/Host mismatch, HTTP request smuggling (CL.TE), CRLF injection,
+  TCP segmentation, header-case variation, nested encoding
+
+**Malware indicators**
+- EICAR test string (POST + URL), PowerShell download cradles, phishing kit
+  paths, double-extension file probes, base64 shellcode in POST bodies
+
+**Negative controls**
+- Legitimate browser GETs, API calls, search queries, form submissions, asset
+  requests, well-known DNS lookups, standard TLS handshakes — these should
+  **not** fire alerts (tuning-drift canaries)
+
+### Running the suite
+
+On the attacker host:
+```bash
+sudo ./testing/kali_setup.sh           # one-time install
+./testing/run_attacks.sh <victim_ip>   # ~5–10 min
+```
+
+On the sensor host:
+```bash
+sudo ./testing/verify_alerts.sh
+```
+
+`verify_alerts.sh` prints:
+- Suricata service status and interface/VXLAN diagnostics
+- `fast.log` tail (last 50 alerts)
+- Top 30 alert signatures by volume (written in full to `/tmp/sig-breakdown.txt`)
+- Alert categories breakdown
+- Event-type totals from `eve.json`
+- Decoder stats
+- Zeek summary: log line counts, notices fired, tunnel.log (VXLAN decap evidence),
+  top inner-flow conversations from `conn.log`
+
+Exit code: 0 if ≥3 alerts observed, 1 otherwise — suitable for CI gates.
+
+### Expected detection
+
+In the reference lab (AWS VPC Traffic Mirroring → sensor), a single
+`run_attacks.sh` pass produces several hundred Suricata alerts across ~40–60
+distinct signature IDs, plus Zeek notices for SSH/FTP brute force, detected
+web apps, and any intel-framework hits against URLhaus/Feodo. The HTML
+iteration reports in the source CDK repo (`reports/iteration-*.html`,
+`reports/attack-vs-detection-*.html`) document how coverage evolved across
+8 tuning iterations.
 
 ## Logs
 
