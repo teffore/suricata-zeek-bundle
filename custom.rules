@@ -1,0 +1,639 @@
+
+# ========== Traffic mirror validation rules ==========
+# sid:9000001 (TEST - ICMP) removed — pure noise (447 alerts/run, top of the
+# histogram by volume). Real ICMP is covered by Suricata's decoder-event
+# rules + ET ICMP + our C2 - Large ICMP payload sig (9000612).
+alert tcp any any -> $HOME_NET 22 (msg:"TEST - SSH connection to HOME_NET"; sid:9000002; rev:2;)
+alert tcp any any -> $HOME_NET any (msg:"TEST - TCP SYN scan detected"; flags:S,12; threshold:type both, track by_src, count 5, seconds 60; sid:9000003; rev:2;)
+
+# ========== DNS tunneling detection rules ==========
+
+# Long subdomain names (>40 chars in single label) — classic iodine/dnscat2 pattern
+alert dns any any -> any any (msg:"DNS TUNNEL - Long subdomain label (>40 chars)"; \
+  dns.query; pcre:"/^[a-z0-9]{40,}\./i"; \
+  sid:9000101; rev:1; classtype:bad-unknown;)
+
+# Very long subdomain names (>60 chars) — high confidence tunneling
+alert dns any any -> any any (msg:"DNS TUNNEL - Very long subdomain label (>60 chars)"; \
+  dns.query; pcre:"/^[a-z0-9]{60,}\./i"; \
+  sid:9000102; rev:1; classtype:bad-unknown;)
+
+# Hex-encoded subdomain (common in DNS exfiltration tools)
+alert dns any any -> any any (msg:"DNS TUNNEL - Hex-encoded subdomain"; \
+  dns.query; pcre:"/^[a-f0-9]{20,}\./i"; \
+  sid:9000103; rev:1; classtype:bad-unknown;)
+
+# Base64-like subdomain pattern
+alert dns any any -> any any (msg:"DNS TUNNEL - Base64-like subdomain"; \
+  dns.query; pcre:"/^[A-Za-z0-9+\/=]{30,}\./"; \
+  sid:9000104; rev:1; classtype:bad-unknown;)
+
+# High-frequency DNS queries from single source (volume-based tunneling)
+alert dns any any -> any any (msg:"DNS TUNNEL - High query rate from single source"; \
+  threshold:type both, track by_src, count 20, seconds 10; \
+  sid:9000105; rev:1; classtype:bad-unknown;)
+
+# Suspicious TLDs commonly used by malware/tunneling
+alert dns any any -> any any (msg:"DNS POLICY - Query to suspicious TLD (.tk)"; \
+  dns.query; content:".tk"; endswith; nocase; \
+  sid:9000106; rev:1; classtype:policy-violation;)
+
+alert dns any any -> any any (msg:"DNS POLICY - Query to .xyz TLD"; \
+  dns.query; content:".xyz"; endswith; nocase; \
+  sid:9000107; rev:1; classtype:policy-violation;)
+
+alert dns any any -> any any (msg:"DNS POLICY - Query to .onion (Tor)"; \
+  dns.query; content:".onion"; endswith; nocase; \
+  sid:9000108; rev:1; classtype:policy-violation;)
+
+# DNS zone transfer attempt (AXFR)
+alert tcp any any -> $HOME_NET 53 (msg:"DNS RECON - Zone transfer attempt (AXFR)"; \
+  dsize:>10; content:"|00 00 FC|"; \
+  sid:9000109; rev:1; classtype:attempted-recon;)
+
+# NULL record queries (dnscat2 signature)
+alert dns any any -> any any (msg:"DNS TUNNEL - NULL record query (dnscat2)"; \
+  dns.query; content:"|00 00 0A|"; \
+  sid:9000110; rev:1; classtype:bad-unknown;)
+
+# Excessive TXT record requests (data exfiltration channel)
+alert dns any any -> any any (msg:"DNS TUNNEL - High volume TXT record queries"; \
+  dns.query; pcre:"/^.+\.exfil\./i"; \
+  threshold:type both, track by_src, count 5, seconds 30; \
+  sid:9000111; rev:1; classtype:bad-unknown;)
+
+# Entropy-like patterns (all-random-looking subdomain)
+alert dns any any -> any any (msg:"DNS TUNNEL - High-entropy subdomain (mixed chars)"; \
+  dns.query; pcre:"/^(?=[a-z0-9]{25,})(?=(?:[a-z0-9]*[0-9]){5,})(?=(?:[a-z0-9]*[a-z]){10,})[a-z0-9]+\./i"; \
+  sid:9000112; rev:1; classtype:bad-unknown;)
+
+# ========== URL encoding evasion detection (Iteration 1) ==========
+
+# Double URL encoding of path traversal (%252e = .)
+alert http any any -> any any (msg:"EVASION - Double URL-encoded path traversal"; \
+  http.uri; content:"%252e%252e"; nocase; \
+  sid:9000201; rev:1; classtype:web-application-attack;)
+
+# Triple URL encoding
+# NOTE: Use http.uri.raw — http.uri is normalized (URL-decoded once)
+# so the literal encoded form '%25252e' is gone before content matching.
+alert http any any -> any any (msg:"EVASION - Triple URL-encoded path traversal"; \
+  http.uri.raw; content:"%25252e"; nocase; \
+  sid:9000202; rev:2; classtype:web-application-attack;)
+
+# Unicode full-width character bypass — match on http.uri (post-normalize)
+# OR http.request.body (POST body) since attacks may use either.
+alert http any any -> any any (msg:"EVASION - Unicode full-width char in URL/body"; \
+  pcre:"/[\xef\xbc\x8e\xef\xbc\x8f]/H"; \
+  sid:9000203; rev:2; classtype:web-application-attack;)
+
+# Double-encoded SQLi (also needs raw to see %25 prefix)
+alert http any any -> any any (msg:"EVASION - Double URL-encoded SQLi keyword"; \
+  http.uri.raw; content:"%2527"; nocase; content:"%2520OR%2520"; nocase; \
+  sid:9000204; rev:2; classtype:web-application-attack;)
+
+# CRLF injection in URL
+alert http any any -> any any (msg:"EVASION - CRLF injection in URL"; \
+  http.uri.raw; content:"%0d%0a"; nocase; \
+  sid:9000205; rev:2; classtype:web-application-attack;)
+
+# ========== Cloud metadata access patterns (Iteration 1) ==========
+
+# Azure metadata access via SSRF
+alert http any any -> any any (msg:"CLOUD - Azure IMDS access via SSRF"; \
+  http.uri; content:"169.254.169.254/metadata/instance"; nocase; \
+  sid:9000210; rev:1; classtype:attempted-recon;)
+
+# Azure metadata token endpoint
+alert http any any -> any any (msg:"CLOUD - Azure managed identity token request via SSRF"; \
+  http.uri; content:"169.254.169.254/metadata/identity/oauth2/token"; nocase; \
+  sid:9000211; rev:1; classtype:attempted-recon;)
+
+# GCP metadata access
+alert http any any -> any any (msg:"CLOUD - GCP metadata access via SSRF"; \
+  http.uri; content:"metadata.google.internal"; nocase; \
+  sid:9000212; rev:1; classtype:attempted-recon;)
+
+# Azure Storage enumeration
+alert dns any any -> any any (msg:"CLOUD - Azure Blob Storage enumeration"; \
+  dns.query; content:".blob.core.windows.net"; endswith; nocase; \
+  sid:9000213; rev:1; classtype:attempted-recon;)
+
+# GCP Storage enumeration
+alert dns any any -> any any (msg:"CLOUD - GCP Cloud Storage enumeration"; \
+  dns.query; content:".storage.googleapis.com"; endswith; nocase; \
+  sid:9000214; rev:1; classtype:attempted-recon;)
+
+# Azure AD credential theft attempt
+alert http any any -> any any (msg:"CLOUD - Azure AD token endpoint credential attempt"; \
+  http.uri; content:"login.microsoftonline.com"; nocase; \
+  http.request_body; content:"grant_type=password"; nocase; \
+  sid:9000215; rev:1; classtype:attempted-admin;)
+
+# AWS credential format in POST body (AKIA pattern)
+alert http any any -> any any (msg:"EXFIL - AWS access key format in POST body"; \
+  http.request_body; pcre:"/AKIA[0-9A-Z]{16}/"; \
+  sid:9000216; rev:1; classtype:credential-theft;)
+
+# GCP service account key format exfil
+alert http any any -> any any (msg:"EXFIL - GCP service account key format in POST"; \
+  http.request_body; content:"\"type\":\"service_account\""; nocase; \
+  content:"\"private_key\""; nocase; \
+  sid:9000217; rev:1; classtype:credential-theft;)
+
+# ========== Web Shell Detection (Iteration 2) ==========
+
+alert http any any -> any any (msg:"WEBSHELL - Request for c99 shell"; \
+  http.uri; content:"c99.php"; nocase; \
+  sid:9000301; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"WEBSHELL - Request for r57 shell"; \
+  http.uri; content:"r57.php"; nocase; \
+  sid:9000302; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"WEBSHELL - Request for b374k shell"; \
+  http.uri; content:"b374k.php"; nocase; \
+  sid:9000303; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"WEBSHELL - Request for WSO shell"; \
+  http.uri; content:"wso.php"; nocase; \
+  sid:9000304; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"WEBSHELL - Generic shell.php request"; \
+  http.uri; content:"/shell.php"; nocase; \
+  sid:9000305; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"WEBSHELL - China Chopper pattern (z0 base64)"; \
+  http.request_body; content:"z0="; depth:5; \
+  sid:9000306; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"WEBSHELL - JSP webshell cmd parameter"; \
+  http.uri; content:".jsp"; nocase; content:"cmd="; \
+  sid:9000307; rev:1; classtype:web-application-attack;)
+
+# ========== SQL Injection Custom Rules ==========
+
+alert http any any -> any any (msg:"SQLI - Time-based SQLi (SLEEP)"; \
+  http.uri; content:"SLEEP("; nocase; \
+  sid:9000310; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"SQLI - Time-based SQLi (WAITFOR DELAY)"; \
+  http.uri; content:"WAITFOR"; nocase; content:"DELAY"; nocase; \
+  sid:9000311; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"SQLI - Error-based SQLi (extractvalue)"; \
+  http.uri; content:"extractvalue"; nocase; \
+  sid:9000312; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"SQLI - UNION SELECT LOAD_FILE exfil"; \
+  http.uri; content:"UNION"; nocase; content:"LOAD_FILE"; nocase; \
+  sid:9000313; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"SQLI - INTO OUTFILE webshell write"; \
+  http.uri; content:"INTO"; nocase; content:"OUTFILE"; nocase; \
+  sid:9000314; rev:1; classtype:web-application-attack;)
+
+# ========== XSS Custom Rules ==========
+
+alert http any any -> any any (msg:"XSS - SVG onload payload"; \
+  http.uri; pcre:"/svg[\x00-\x20]*\/?[\x00-\x20]*onload/i"; \
+  sid:9000320; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"XSS - javascript: protocol"; \
+  http.uri; content:"javascript"; nocase; content:":alert"; nocase; \
+  sid:9000321; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"XSS - body onload payload"; \
+  http.uri; pcre:"/<body[\x00-\x20]+onload/i"; \
+  sid:9000322; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"XSS - img onerror payload"; \
+  http.uri; pcre:"/<img[^>]+onerror=/i"; \
+  sid:9000323; rev:1; classtype:web-application-attack;)
+
+# ========== XXE, SSTI, LFI, NoSQL Detection ==========
+
+alert http any any -> any any (msg:"XXE - External entity with file:// protocol"; \
+  http.request_body; content:"<!ENTITY"; nocase; content:"SYSTEM"; nocase; content:"file://"; nocase; \
+  sid:9000330; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"SSTI - Template injection {{7*7}}"; \
+  http.uri; content:"{{7*7}}"; \
+  sid:9000331; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"LFI - PHP filter wrapper"; \
+  http.uri; content:"php://filter"; nocase; \
+  sid:9000332; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"LFI - PHP data:// wrapper with base64"; \
+  http.uri; content:"data://text/plain|3b|base64"; nocase; \
+  sid:9000333; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"LFI - expect:// wrapper (RCE)"; \
+  http.uri; content:"expect://"; nocase; \
+  sid:9000334; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"NOSQLI - MongoDB \$ne operator injection"; \
+  http.request_body; content:"{\"$ne\":"; \
+  sid:9000335; rev:1; classtype:web-application-attack;)
+
+# ========== Active Directory / LDAP / Kerberos Detection (Iteration 3) ==========
+
+# LDAP injection patterns in URL
+alert http any any -> any any (msg:"LDAPI - LDAP injection wildcard in parameter"; \
+  http.uri; pcre:"/[?&][a-z_]+=\*\)\(/i"; \
+  sid:9000401; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"LDAPI - LDAP filter bypass (objectClass=*)"; \
+  http.uri; content:"objectClass=*"; nocase; \
+  sid:9000402; rev:1; classtype:web-application-attack;)
+
+# NTLM authentication attempts in HTTP (pass-the-hash / relay)
+alert http any any -> any any (msg:"AD - NTLM authentication type 1 negotiate"; \
+  http.header; content:"Authorization: NTLM TlRMTVNTUAAB"; nocase; \
+  sid:9000410; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"AD - NTLM authentication type 3 response (auth)"; \
+  http.header; content:"Authorization: NTLM TlRMTVNTUAAD"; nocase; \
+  sid:9000411; rev:1; classtype:attempted-admin;)
+
+# Kerberoasting - SPN-based service ticket requests in URLs
+alert http any any -> any any (msg:"AD - Kerberoasting SPN in URL parameter"; \
+  http.uri; content:"spn="; nocase; pcre:"/spn=(HTTP|MSSQLSvc|CIFS|HOST|LDAP)\//i"; \
+  sid:9000412; rev:1; classtype:attempted-admin;)
+
+# BloodHound/SharpHound discovery
+alert http any any -> any any (msg:"AD - BloodHound SharpHound tool usage"; \
+  http.uri; content:"sharphound"; nocase; \
+  sid:9000413; rev:1; classtype:trojan-activity;)
+
+alert http any any -> any any (msg:"AD - Impacket tool user-agent"; \
+  http.user_agent; content:"impacket"; nocase; \
+  sid:9000414; rev:1; classtype:trojan-activity;)
+
+alert http any any -> any any (msg:"AD - Responder tool user-agent"; \
+  http.user_agent; content:"Responder"; \
+  sid:9000415; rev:1; classtype:trojan-activity;)
+
+# DNS queries for AD SRV records (domain controller discovery)
+alert dns any any -> any any (msg:"AD - LDAP SRV record discovery (_ldap._tcp)"; \
+  dns.query; content:"_ldap._tcp"; nocase; \
+  sid:9000420; rev:1; classtype:attempted-recon;)
+
+alert dns any any -> any any (msg:"AD - Kerberos SRV record discovery (_kerberos._tcp)"; \
+  dns.query; content:"_kerberos._tcp"; nocase; \
+  sid:9000421; rev:1; classtype:attempted-recon;)
+
+alert dns any any -> any any (msg:"AD - Global Catalog SRV discovery (_gc._tcp)"; \
+  dns.query; content:"_gc._tcp"; nocase; \
+  sid:9000422; rev:1; classtype:attempted-recon;)
+
+# ADCS (Certificate Services) abuse
+alert http any any -> any any (msg:"AD - Active Directory Certificate Services access"; \
+  http.uri; content:"/certsrv/"; nocase; \
+  sid:9000423; rev:1; classtype:attempted-admin;)
+
+# Group Policy Preferences password file (cpassword)
+alert http any any -> any any (msg:"AD - Group Policy Preferences Groups.xml access"; \
+  http.uri; content:"Groups.xml"; nocase; content:"Preferences"; nocase; \
+  sid:9000424; rev:1; classtype:policy-violation;)
+
+# NTDS.dit database file access
+alert http any any -> any any (msg:"AD - ntds.dit database file access attempt"; \
+  http.uri; content:"ntds.dit"; nocase; \
+  sid:9000425; rev:1; classtype:attempted-admin;)
+
+# DCSync pattern
+alert http any any -> any any (msg:"AD - DCSync DRSUAPI replication request"; \
+  http.request_body; content:"DRSUAPI"; nocase; content:"GetNCChanges"; nocase; \
+  sid:9000426; rev:1; classtype:attempted-admin;)
+
+# Direct LDAP/Kerberos TCP connection to victim
+alert tcp any any -> $HOME_NET 88 (msg:"AD - Kerberos direct TCP connection"; \
+  flow:to_server; flags:S,12; \
+  sid:9000430; rev:2; classtype:attempted-recon;)
+
+alert tcp any any -> $HOME_NET 389 (msg:"AD - LDAP direct TCP connection"; \
+  flow:to_server; flags:S,12; \
+  sid:9000431; rev:2; classtype:attempted-recon;)
+
+alert tcp any any -> $HOME_NET 636 (msg:"AD - LDAPS direct TCP connection"; \
+  flow:to_server; flags:S,12; \
+  sid:9000432; rev:2; classtype:attempted-recon;)
+
+# ========== Supply Chain Attack Detection (Iteration 4) ==========
+
+# Malicious package postinstall scripts
+alert http any any -> any any (msg:"SUPPLYCHAIN - Malicious postinstall script in npm package"; \
+  http.request_body; content:"postinstall"; nocase; content:"curl"; nocase; \
+  sid:9000501; rev:1; classtype:trojan-activity;)
+
+alert http any any -> any any (msg:"SUPPLYCHAIN - Cryptominer in npm postinstall"; \
+  http.request_body; content:"postinstall"; nocase; content:"xmrig"; nocase; \
+  sid:9000502; rev:1; classtype:trojan-activity;)
+
+# PyPI malicious setup.py
+alert http any any -> any any (msg:"SUPPLYCHAIN - Malicious PyPI setup.py with shell exec"; \
+  http.request_body; content:"os.system"; nocase; content:"curl"; nocase; \
+  sid:9000503; rev:1; classtype:trojan-activity;)
+
+# GitHub token exfiltration
+alert http any any -> any any (msg:"EXFIL - GitHub token (ghs_ pattern) in POST body"; \
+  http.request_body; pcre:"/ghs_[A-Za-z0-9]{36,}/"; \
+  sid:9000504; rev:1; classtype:credential-theft;)
+
+alert http any any -> any any (msg:"EXFIL - GitHub PAT (ghp_ pattern) in POST body"; \
+  http.request_body; pcre:"/ghp_[A-Za-z0-9]{36,}/"; \
+  sid:9000505; rev:1; classtype:credential-theft;)
+
+# Typosquatted package names (common real-world examples)
+alert http any any -> any any (msg:"SUPPLYCHAIN - Known npm typosquat (eventstram)"; \
+  http.uri; content:"eventstram"; nocase; \
+  sid:9000510; rev:1; classtype:trojan-activity;)
+
+alert http any any -> any any (msg:"SUPPLYCHAIN - Known pip typosquat (reqeusts)"; \
+  http.uri; content:"reqeusts"; nocase; \
+  sid:9000511; rev:1; classtype:trojan-activity;)
+
+# Terraform registry spoofing
+alert http any any -> any any (msg:"SUPPLYCHAIN - Suspicious Terraform registry TLD"; \
+  http.uri; pcre:"/registry\.terraform\.(xyz|tk|top|ml|ga)/i"; \
+  sid:9000512; rev:1; classtype:trojan-activity;)
+
+# CLI tool user-agents from HTTP (outside proper package manager contexts)
+alert http any any -> any any (msg:"SUPPLYCHAIN - npm CLI accessing non-registry endpoint"; \
+  http.user_agent; content:"npm/"; nocase; \
+  http.uri; content:"/api/"; pcre:"/\/api\/(keys|secrets|admin)/i"; \
+  sid:9000513; rev:1; classtype:policy-violation;)
+
+# ========== Anomaly Tuning / Noise Suppression ==========
+# Note: These use pass rules to whitelist specific patterns. Pass rules
+# are evaluated before alert rules and prevent alerts.
+
+# Suppress internal Nmap scans from known hosts (placeholder example)
+# pass tcp $HOME_NET any -> any any (msg:"Whitelisted scanner"; sid:9000990; rev:1;)
+
+# Note: Can't easily suppress already-fired alerts via custom rules.
+# Production tuning is done via threshold.config or suricata-update --disable.
+
+# ========== Advanced C2 Framework Detection (Iteration 5) ==========
+
+alert http any any -> any any (msg:"C2 - Havoc framework news.html beacon URI"; \
+  http.uri; content:"/news.html?id="; nocase; \
+  sid:9000601; rev:1; classtype:trojan-activity;)
+
+alert http any any -> any any (msg:"C2 - Brute Ratel BRC4 api/search pattern"; \
+  http.uri; pcre:"/\/api\/search\/[a-f0-9]{16}/i"; \
+  sid:9000602; rev:1; classtype:trojan-activity;)
+
+alert http any any -> any any (msg:"C2 - Mythic agent_message endpoint"; \
+  http.uri; content:"/api/v1.4/agent_message"; nocase; \
+  sid:9000603; rev:1; classtype:trojan-activity;)
+
+alert http any any -> any any (msg:"C2 - Poshc2/Empire news.php task beacon"; \
+  http.uri; content:"/news.php?task="; nocase; \
+  sid:9000604; rev:1; classtype:trojan-activity;)
+
+# Beaconing behavioral patterns
+alert http any any -> any any (msg:"C2 - Repeated CA00 submit.php beacon pattern"; \
+  http.uri; content:"/submit.php?id=CA00"; nocase; \
+  threshold:type both, track by_src, count 3, seconds 30; \
+  sid:9000605; rev:1; classtype:trojan-activity;)
+
+# DNS beaconing
+alert dns any any -> any any (msg:"C2 - Periodic DNS beacon pattern"; \
+  dns.query; pcre:"/^beacon-[0-9]{10}\./i"; \
+  threshold:type both, track by_src, count 3, seconds 30; \
+  sid:9000606; rev:1; classtype:trojan-activity;)
+
+# Reverse shell command patterns
+alert http any any -> any any (msg:"RCE - Bash reverse shell in URL"; \
+  http.uri; content:"bash"; nocase; content:"%2Fdev%2Ftcp%2F"; nocase; \
+  sid:9000610; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"RCE - Python reverse shell import pattern"; \
+  http.uri; content:"python"; nocase; content:"socket%2Csubprocess%2Cos"; nocase; \
+  sid:9000611; rev:1; classtype:attempted-admin;)
+
+# ICMP tunneling (large data payload)
+alert icmp any any -> any any (msg:"C2 - Large ICMP payload (possible tunneling)"; \
+  dsize:>512; itype:8; \
+  sid:9000612; rev:1; classtype:bad-unknown;)
+
+alert icmp any any -> any any (msg:"C2 - ICMP with repeating pattern (tunneling)"; \
+  content:"AAAAAAAAAAAAAAAA"; depth:16; \
+  sid:9000613; rev:1; classtype:bad-unknown;)
+
+# DNS-over-HTTPS to known DoH resolvers (potential tunneling)
+alert http any any -> any any (msg:"C2 - DoH query to cloudflare-dns"; \
+  http.uri; content:"cloudflare-dns.com/dns-query"; nocase; \
+  sid:9000614; rev:1; classtype:policy-violation;)
+
+# ========== Container/Kubernetes Detection (Iteration 6) ==========
+
+alert http any any -> any any (msg:"CONTAINER - Docker socket access attempt"; \
+  http.uri; content:"docker.sock"; nocase; \
+  sid:9000701; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"CONTAINER - Privileged container creation"; \
+  http.request_body; content:"Privileged"; nocase; content:"true"; nocase; \
+  sid:9000702; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"CONTAINER - nsenter host namespace escape"; \
+  http.request_body; content:"nsenter"; nocase; content:"/proc/1/ns/mnt"; nocase; \
+  sid:9000703; rev:1; classtype:attempted-admin;)
+
+alert tcp any any -> $HOME_NET 6443 (msg:"K8S - Direct Kubernetes API server connection"; \
+  flow:to_server; flags:S,12; \
+  sid:9000710; rev:2; classtype:attempted-recon;)
+
+alert tcp any any -> $HOME_NET 10250 (msg:"K8S - Kubelet API direct connection"; \
+  flow:to_server; flags:S,12; \
+  sid:9000711; rev:2; classtype:attempted-recon;)
+
+alert tcp any any -> $HOME_NET 2379 (msg:"K8S - etcd direct unauthenticated access"; \
+  flow:to_server; flags:S,12; \
+  sid:9000712; rev:2; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"K8S - Kubelet exec endpoint access"; \
+  http.uri; content:"/exec/"; pcre:"/\/exec\/[a-z]+\/[a-z0-9-]+\/[a-z0-9-]+/i"; \
+  sid:9000713; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"K8S - Secrets API enumeration"; \
+  http.uri; content:"/api/v1/namespaces/kube-system/secrets"; nocase; \
+  sid:9000714; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"K8S - ClusterRoleBindings enumeration"; \
+  http.uri; content:"/clusterrolebindings"; nocase; \
+  sid:9000715; rev:1; classtype:attempted-recon;)
+
+alert http any any -> any any (msg:"CONTAINER - Cgroup release_agent escape"; \
+  http.uri; content:"/sys/fs/cgroup/release_agent"; nocase; \
+  sid:9000716; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"K8S - Service account token theft"; \
+  http.uri; content:"/var/run/secrets/kubernetes.io/serviceaccount/token"; nocase; \
+  sid:9000717; rev:1; classtype:credential-theft;)
+
+alert http any any -> any any (msg:"CONTAINER - Registry catalog enumeration"; \
+  http.uri; content:"/v2/_catalog"; \
+  sid:9000718; rev:1; classtype:attempted-recon;)
+
+# ========== API Abuse Detection (Iteration 7) ==========
+
+alert http any any -> any any (msg:"API - GraphQL introspection query"; \
+  http.request_body; content:"__schema"; nocase; \
+  sid:9000801; rev:1; classtype:attempted-recon;)
+
+alert http any any -> any any (msg:"API - JWT with 'none' algorithm"; \
+  http.header; content:"Bearer eyJ"; content:"alg\":\"none"; distance:0; within:200; \
+  sid:9000802; rev:1; classtype:attempted-admin;)
+
+alert http any any -> any any (msg:"API - Mass assignment with is_admin=true"; \
+  http.request_body; content:"is_admin"; nocase; content:"true"; distance:0; within:20; \
+  sid:9000803; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"API - OpenAPI/Swagger enumeration"; \
+  http.uri; pcre:"/\/(swagger|openapi|api-docs|v[23]\/api-docs)(\.json)?/i"; \
+  sid:9000804; rev:1; classtype:attempted-recon;)
+
+alert http any any -> any any (msg:"API - HTTP verb tampering (X-HTTP-Method-Override)"; \
+  http.header; content:"X-HTTP-Method-Override"; nocase; \
+  sid:9000805; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"API - Rate limit bypass (X-Originating-IP header)"; \
+  http.header; content:"X-Originating-IP"; nocase; \
+  sid:9000806; rev:1; classtype:web-application-attack;)
+
+alert http any any -> any any (msg:"API - Webhook SSRF to IMDS"; \
+  http.request_body; content:"webhook_url"; nocase; content:"169.254.169.254"; \
+  sid:9000807; rev:1; classtype:attempted-recon;)
+
+alert http any any -> any any (msg:"API - IDOR private resource enumeration"; \
+  http.uri; pcre:"/\/api\/[a-z]+\/[0-9]+\/private/i"; \
+  sid:9000808; rev:1; classtype:attempted-recon;)
+
+# ========== SaaS Exfil Destinations (Iteration 3) ==========
+# Detect outbound TLS to commonly-abused SaaS endpoints used for data
+# exfiltration / C2. SNI-based — works without TLS decryption.
+
+alert tls any any -> any any (msg:"EXFIL - TLS connection to Pastebin"; \
+  tls.sni; content:"pastebin.com"; nocase; \
+  sid:9000901; rev:1; classtype:policy-violation;)
+
+alert tls any any -> any any (msg:"EXFIL - TLS connection to transfer.sh"; \
+  tls.sni; content:"transfer.sh"; nocase; \
+  sid:9000902; rev:1; classtype:policy-violation;)
+
+alert tls any any -> any any (msg:"EXFIL - TLS connection to Discord webhook"; \
+  tls.sni; content:"discord.com"; nocase; \
+  sid:9000903; rev:1; classtype:policy-violation;)
+
+alert tls any any -> any any (msg:"EXFIL - TLS connection to GitHub gist"; \
+  tls.sni; content:"gist.githubusercontent.com"; nocase; \
+  sid:9000904; rev:1; classtype:policy-violation;)
+
+alert tls any any -> any any (msg:"EXFIL - TLS connection to telegra.ph"; \
+  tls.sni; content:"telegra.ph"; nocase; \
+  sid:9000905; rev:1; classtype:policy-violation;)
+
+# Also catch via DNS query (covers cases where TLS isn't established)
+alert dns any any -> any any (msg:"EXFIL - DNS query for Pastebin"; \
+  dns.query; content:"pastebin.com"; nocase; endswith; \
+  sid:9000910; rev:1; classtype:policy-violation;)
+
+alert dns any any -> any any (msg:"EXFIL - DNS query for transfer.sh"; \
+  dns.query; content:"transfer.sh"; nocase; endswith; \
+  sid:9000911; rev:1; classtype:policy-violation;)
+
+# ========== Tunneling-Service Reverse-Shell IOCs (Iteration 3) ==========
+# Outbound to ngrok / cloudflare tunnel / serveo / localtunnel — strong
+# pentester / red-team / unauthorized-tunnel indicator.
+
+alert dns any any -> any any (msg:"TUNNEL - DNS query for ngrok"; \
+  dns.query; content:"ngrok"; nocase; \
+  sid:9000920; rev:1; classtype:trojan-activity;)
+
+alert tls any any -> any any (msg:"TUNNEL - TLS SNI to ngrok"; \
+  tls.sni; content:"ngrok"; nocase; \
+  sid:9000921; rev:1; classtype:trojan-activity;)
+
+alert dns any any -> any any (msg:"TUNNEL - DNS query for trycloudflare"; \
+  dns.query; content:"trycloudflare.com"; nocase; \
+  sid:9000922; rev:1; classtype:trojan-activity;)
+
+alert tls any any -> any any (msg:"TUNNEL - TLS SNI to trycloudflare"; \
+  tls.sni; content:"trycloudflare.com"; nocase; \
+  sid:9000923; rev:1; classtype:trojan-activity;)
+
+alert dns any any -> any any (msg:"TUNNEL - DNS query for serveo"; \
+  dns.query; content:"serveo.net"; nocase; endswith; \
+  sid:9000924; rev:1; classtype:trojan-activity;)
+
+alert dns any any -> any any (msg:"TUNNEL - DNS query for localtunnel"; \
+  dns.query; content:"loca.lt"; nocase; endswith; \
+  sid:9000925; rev:1; classtype:trojan-activity;)
+
+# ========== Lateral Movement — SMB / DCERPC (Iteration 4) ==========
+# Detect Windows-style lateral movement primitives reaching our victim
+# (Linux samba). Even when auth fails, the SMB protocol exchange is
+# enough to populate Suricata's smb.named_pipe and dcerpc.iface buffers.
+# MITRE T1021.002 (SMB/Admin shares) and T1021.003 (DCOM/RPC) family.
+
+# Admin-share tree connects (ADMIN$, C$) — strong PsExec / lateral move IOC
+alert smb any any -> $HOME_NET any (msg:"LATERAL - SMB tree connect to ADMIN$"; \
+  smb.share; content:"ADMIN$"; nocase; \
+  sid:9001001; rev:1; classtype:attempted-admin;)
+
+alert smb any any -> $HOME_NET any (msg:"LATERAL - SMB tree connect to C$"; \
+  smb.share; content:"C$"; nocase; \
+  sid:9001002; rev:1; classtype:attempted-admin;)
+
+alert smb any any -> $HOME_NET any (msg:"LATERAL - SMB tree connect to IPC$ (enumeration)"; \
+  smb.share; content:"IPC$"; nocase; \
+  sid:9001003; rev:1; classtype:attempted-recon;)
+
+# Specific named pipes used by lateral move tools.
+# Iter-6 note: SMB2/3 transmits named pipe names as UTF-16LE. Zeek
+# decodes that transparently; Suricata needs the explicit hex-byte
+# form. Each char c becomes "c 00" in the byte stream.
+alert tcp any any -> $HOME_NET 445 (msg:"LATERAL - PsExec service named pipe (PSEXESVC)"; \
+  flow:to_server,established; \
+  content:"|50 00 53 00 45 00 58 00 45 00 53 00 56 00 43 00|"; nocase; \
+  sid:9001010; rev:3; classtype:attempted-admin;)
+
+alert tcp any any -> $HOME_NET 445 (msg:"LATERAL - svcctl named pipe (Service Control)"; \
+  flow:to_server,established; \
+  content:"|73 00 76 00 63 00 63 00 74 00 6c 00|"; nocase; \
+  sid:9001011; rev:3; classtype:attempted-admin;)
+
+alert tcp any any -> $HOME_NET 445 (msg:"LATERAL - winreg named pipe (Remote Registry)"; \
+  flow:to_server,established; \
+  content:"|77 00 69 00 6e 00 72 00 65 00 67 00|"; nocase; \
+  sid:9001012; rev:3; classtype:attempted-admin;)
+
+alert tcp any any -> $HOME_NET 445 (msg:"LATERAL - atsvc named pipe (AT scheduler)"; \
+  flow:to_server,established; \
+  content:"|61 00 74 00 73 00 76 00 63 00|"; nocase; \
+  sid:9001013; rev:3; classtype:attempted-admin;)
+
+alert tcp any any -> $HOME_NET 445 (msg:"LATERAL - samr named pipe (account enum)"; \
+  flow:to_server,established; \
+  content:"|73 00 61 00 6d 00 72 00|"; nocase; \
+  sid:9001014; rev:3; classtype:attempted-recon;)
+
+alert tcp any any -> $HOME_NET 445 (msg:"LATERAL - lsarpc named pipe (LSA / DCSync setup)"; \
+  flow:to_server,established; \
+  content:"|6c 00 73 00 61 00 72 00 70 00 63 00|"; nocase; \
+  sid:9001015; rev:3; classtype:attempted-admin;)
+
+# DCERPC interface UUIDs (alert on bind/call to these RPC interfaces)
+# 367abb81-9844-35f1-ad32-98f038001003 = svcctl (Service Control Mgr)
+alert dcerpc any any -> $HOME_NET any (msg:"LATERAL - DCERPC bind to svcctl interface"; \
+  dcerpc.iface; content:"|81 ab 7a 36 44 98 f1 35 ad 32 98 f0 38 00 10 03|"; \
+  sid:9001020; rev:1; classtype:attempted-admin;)
+
+# 12345778-1234-abcd-ef00-0123456789ac = SAMR
+alert dcerpc any any -> $HOME_NET any (msg:"LATERAL - DCERPC bind to SAMR (account enum)"; \
+  dcerpc.iface; content:"|78 57 34 12 34 12 cd ab ef 00 01 23 45 67 89 ac|"; \
+  sid:9001021; rev:1; classtype:attempted-recon;)
