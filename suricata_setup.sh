@@ -24,7 +24,7 @@ apt-get update -y
 apt-get install -y software-properties-common
 add-apt-repository -y ppa:oisf/suricata-stable
 apt-get update -y
-apt-get install -y suricata suricata-update jq logrotate
+apt-get install -y suricata jq logrotate
 
 # Stop suricata (apt auto-starts it with eth0 which fails)
 systemctl stop suricata || true
