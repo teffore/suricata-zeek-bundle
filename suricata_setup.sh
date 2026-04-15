@@ -22,6 +22,24 @@ echo "Primary interface: ${PRIMARY_IF}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y software-properties-common
+
+# If a pre-8 Suricata is already installed (e.g. distro 6.0.x, or a leftover
+# from the OISF 7.0 LTS PPA), purge it before bringing in 8. The 7.0 PPA
+# ships an LSB init.d wrapper (not a native systemd unit) that leaves stale
+# pidfiles behind, which then break the 8.x systemd unit on first start.
+if command -v suricata >/dev/null 2>&1; then
+  CURRENT_VER=$(suricata --build-info 2>/dev/null | awk '/^This is Suricata version/ {print $5}' | head -1)
+  MAJOR=${CURRENT_VER%%.*}
+  if [ -n "$MAJOR" ] && [ "$MAJOR" -lt 8 ] 2>/dev/null; then
+    echo "Found Suricata ${CURRENT_VER} (< 8); purging before reinstall"
+    systemctl stop suricata 2>/dev/null || true
+    rm -f /run/suricata.pid /var/run/suricata.pid
+    apt-get purge -y suricata suricata-update 2>/dev/null || true
+    add-apt-repository -y --remove ppa:oisf/suricata-7.0 2>/dev/null || true
+    add-apt-repository -y --remove ppa:oisf/suricata-6.0 2>/dev/null || true
+  fi
+fi
+
 add-apt-repository -y ppa:oisf/suricata-stable
 apt-get update -y
 apt-get install -y suricata jq logrotate
