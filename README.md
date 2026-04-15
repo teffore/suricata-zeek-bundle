@@ -14,6 +14,7 @@ fetch, VPC Traffic Mirroring wiring) so it runs on any existing Ubuntu 22.04 hos
 | `custom.rules` | ~70 custom Suricata signatures (SIDs 9000001–9000612) |
 | `verify.sh` | Post-install health + canary-alert check |
 | `testing/` | Kali attacker tooling + full attack battery + alert-summary script |
+| `standalone.sh` | Single-file installer — all of the above inlined into one script |
 
 ## Requirements
 
@@ -26,6 +27,13 @@ fetch, VPC Traffic Mirroring wiring) so it runs on any existing Ubuntu 22.04 hos
 
 ## Install
 
+**Option A — single-file installer** (everything inlined):
+```bash
+curl -LO https://github.com/teffore/suricata-zeek-bundle/releases/latest/download/standalone.sh
+sudo bash standalone.sh
+```
+
+**Option B — tarball** (if you want the individual files):
 ```bash
 tar -xzf suricata-zeek-bundle.tar.gz
 cd suricata-zeek-bundle
