@@ -977,7 +977,7 @@ echo "Primary interface: ${PRIMARY_IF}"
 # ---------- Add OBS Zeek repo ----------
 export DEBIAN_FRONTEND=noninteractive
 curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key \
-  | gpg --dearmor -o /etc/apt/trusted.gpg.d/security_zeek.gpg
+  | gpg --batch --yes --dearmor -o /etc/apt/trusted.gpg.d/security_zeek.gpg
 echo "deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /" \
   > /etc/apt/sources.list.d/security_zeek.list
 apt-get update -y
