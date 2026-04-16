@@ -141,6 +141,32 @@ echo "0 4 * * * root /opt/zeek/bin/zeekctl cron >/dev/null 2>&1" \
   > /etc/cron.d/zeek-cron
 chmod 644 /etc/cron.d/zeek-cron
 
+# ---------- systemd unit (auto-start on boot, clean shutdown) ----------
+# zeekctl is the control surface; wrap it in a oneshot systemd unit so the
+# kernel no longer SIGKILLs Zeek at shutdown (which caused "crashed" state
+# on next boot) and so Zeek restarts with the host rather than waiting for
+# the 04:00 zeekctl-cron job.
+cat > /etc/systemd/system/zeek.service <<'UNIT'
+[Unit]
+Description=Zeek Network Security Monitor
+Documentation=https://docs.zeek.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/zeek/bin/zeekctl start
+ExecStop=/opt/zeek/bin/zeekctl stop
+ExecReload=/opt/zeek/bin/zeekctl restart
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable zeek.service
+
 # ---------- Deploy ----------
 /opt/zeek/bin/zeekctl deploy
 /opt/zeek/bin/zeekctl status
