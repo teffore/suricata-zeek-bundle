@@ -8,13 +8,8 @@ fetch, VPC Traffic Mirroring wiring) so it runs on any existing Ubuntu 22.04 hos
 
 | File | Purpose |
 |---|---|
-| `install.sh` | Wrapper: detects prior installs, backs up config, runs both setup scripts |
-| `suricata_setup.sh` | Installs Suricata 8.x from the OISF PPA, applies tuning |
-| `zeek_setup.sh` | Installs Zeek 8.x from the OBS repo, intel feeds, zeekctl cron |
-| `custom.rules` | ~70 custom Suricata signatures (SIDs 9000001–9000612) |
-| `verify.sh` | Post-install health + canary-alert check |
+| `standalone.sh` | Single-file installer — Suricata, Zeek, custom rules, intel feeds, crons, logrotate, systemd units |
 | `testing/` | Kali attacker tooling + full attack battery + alert-summary script |
-| `standalone.sh` | Single-file installer — all of the above inlined into one script |
 
 ## Requirements
 
@@ -27,17 +22,9 @@ fetch, VPC Traffic Mirroring wiring) so it runs on any existing Ubuntu 22.04 hos
 
 ## Install
 
-**Option A — single-file installer** (everything inlined):
 ```bash
 curl -LO https://github.com/teffore/suricata-zeek-bundle/releases/latest/download/standalone.sh
 sudo bash standalone.sh
-```
-
-**Option B — tarball** (if you want the individual files):
-```bash
-tar -xzf suricata-zeek-bundle.tar.gz
-cd suricata-zeek-bundle
-sudo ./install.sh
 ```
 
 ### Flags
@@ -50,26 +37,24 @@ sudo ./install.sh
 
 ### Prior installs
 
-If Suricata or Zeek is already present, `install.sh` exits with code 3 and
+If Suricata or Zeek is already present, `standalone.sh` exits with code 3 and
 prints the detected versions. Re-run with `--force` to back up and upgrade,
 or `--preserve-config` to keep your tuning and only update rules.
 
-## Verify
+## Post-install checks
+
+No verification script is bundled. Quick manual checks:
 
 ```bash
-sudo ./verify.sh
+systemctl is-active suricata
+/opt/zeek/bin/zeekctl status
+sudo -u suricata suricata -T
+tail -f /var/log/suricata/eve.json
 ```
 
-Exits 0 on success. Checks: services up, versions 8.x, configs parse, custom
-rules loaded, live capture producing fresh `eve.json`, and a canary alert
-(SID 9000002) fires end-to-end.
+## What the installer configures
 
-The canary fails on hosts that aren't receiving mirrored traffic — expected
-if you haven't wired up a SPAN/tap yet. All other checks should still pass.
-
-## What the setup scripts configure
-
-### Suricata (`suricata_setup.sh`)
+### Suricata
 
 Installs Suricata from the **OISF stable PPA** (Ubuntu 22.04 ships 6.0.x, which
 is EOL; PPA tracks 8.0.x — required for HTTP/2, QUIC/HTTP/3, and JA4).
@@ -81,7 +66,7 @@ Rule sources enabled via `suricata-update`:
 - `sslbl/ssl-fp-blacklist`
 - `sslbl/ja3-fingerprints`
 - `etnetera/aggressive`
-- `custom.rules` (bundled — SIDs 9000001–9000612)
+- Bundled custom rules (SIDs 9000001–9001021)
 
 Tunings applied to `/etc/suricata/suricata.yaml`:
 
@@ -106,7 +91,7 @@ Operational bits installed:
 - **systemd drop-in** at `/etc/systemd/system/suricata.service.d/user.conf`
   pinning non-root execution
 
-### Zeek (`zeek_setup.sh`)
+### Zeek
 
 Installs **Zeek 8.0.x** from the openSUSE OBS `security:zeek` repo (Ubuntu
 ships older Zeek). Coexists with Suricata on the same NIC: Suricata via
@@ -136,18 +121,25 @@ Loaded in `local.zeek`:
 - `zeekctl cron` daily at 04:00 (rotation + crash recovery checks)
 - Logrotate: `/opt/zeek/logs/*/*.log`, 7 days compressed
 
-### Custom rules (`custom.rules`)
+### Custom rules
 
-~70 signatures in the `9000000` SID range:
+~130 signatures in the `9000000` SID range, embedded directly in `standalone.sh`
+and appended to `/var/lib/suricata/rules/suricata.rules` after `suricata-update`
+so they survive rule refreshes. Coverage:
+
 - **Traffic mirror validation** (SSH, TCP SYN scan canaries)
-- **DNS tunneling detection** — long subdomain labels, entropy patterns
-  targeting iodine / dnscat2
-- **Policy violations** — cleartext protocols, credential patterns in
-  POST bodies (AKIA, password fields)
-- **C2 heuristics** — large ICMP payloads, beacon patterns
-
-Appended to `/var/lib/suricata/rules/suricata.rules` after `suricata-update`
-so they survive rule refreshes.
+- **DNS tunneling** — long subdomain labels, entropy patterns (iodine, dnscat2)
+- **URL evasion** — double/triple encoding, Unicode bypass, CRLF injection
+- **Cloud metadata** — IMDSv1/v2, AWS credential-format exfil, GCP/Azure IMDS
+- **Web shells** — c99, r57, WSO, China Chopper, JSP cmd
+- **Injection** — SQLi, XSS, XXE, SSTI, LFI, NoSQL
+- **AD / Kerberos / LDAP** — anonymous bind, NTLM, Kerberoasting, DCSync
+- **Supply chain** — npm postinstall, PyPI setup.py, GitHub token exfil, typosquat
+- **C2 frameworks** — Havoc, Brute Ratel, Mythic, Poshc2, DNS beaconing, DoH
+- **Container / K8s** — Docker socket, nsenter namespace escape, K8s API
+- **API abuse** — key brute force, suspicious user-agents
+- **SaaS exfil** — telegra.ph, Pastebin, transfer.sh, ngrok, serveo
+- **Lateral movement** — SMB tree connects to ADMIN$/C$/IPC$, PsExec, svcctl, winreg, samr
 
 ## Testing & validation (Kali attacker)
 
