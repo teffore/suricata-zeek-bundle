@@ -80,4 +80,54 @@ else
   exit 1
 fi
 
+# --- nuclei (ProjectDiscovery) ---
+# CVE-template-based vulnerability scanner. One Go binary + template repo
+# that nuclei maintains itself. Good density of labeled attack patterns;
+# the templates map 1:1 to published CVEs so alert triage is straightforward.
+echo "=== Installing nuclei ==="
+if ! command -v nuclei >/dev/null 2>&1; then
+  # Release assets are versioned (e.g. nuclei_3.4.1_linux_amd64.zip) so the
+  # /releases/latest/download/<name> shortcut 404s. Resolve the real asset
+  # URL via the API.
+  apt-get install -y -qq unzip jq
+  NUCLEI_URL=$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
+    | jq -r '.assets[] | select(.name | test("linux_amd64\\.zip$")) | .browser_download_url' \
+    | head -1)
+  if [ -z "$NUCLEI_URL" ]; then
+    echo "FAIL: could not resolve nuclei linux_amd64.zip asset URL from upstream release" >&2
+    exit 1
+  fi
+  curl -fsSL "$NUCLEI_URL" -o /tmp/nuclei.zip
+  unzip -o /tmp/nuclei.zip -d /tmp/nuclei-extract
+  mv /tmp/nuclei-extract/nuclei /usr/local/bin/nuclei
+  chmod +x /usr/local/bin/nuclei
+  rm -rf /tmp/nuclei.zip /tmp/nuclei-extract
+fi
+# Update templates now so the attack step doesn't pay the ~10s cost.
+# -silent so the 10k+ template-update log doesn't dominate CI output.
+nuclei -update-templates -silent || true
+echo "  nuclei: $(nuclei -version 2>&1 | head -1)"
+
+# --- flightsim (AlphaSOC) ---
+# Purpose-built IDS validator: generates known-bad traffic patterns
+# (C2 domains, DGA, DNS tunnel, mining) to external destinations.
+# Requires the attacker-ENI mirror session to be captured at all
+# (victim-ENI mirror alone won't see attacker->internet traffic).
+echo "=== Installing flightsim ==="
+if ! command -v flightsim >/dev/null 2>&1; then
+  # Flightsim ships a prebuilt .deb (flightsim_<ver>_linux_64-bit.deb)
+  # which is simpler than extracting the tarball. apt resolves deps for us.
+  FLIGHTSIM_URL=$(curl -fsSL https://api.github.com/repos/alphasoc/flightsim/releases/latest \
+    | jq -r '.assets[] | select(.name | test("linux_64-bit\\.deb$")) | .browser_download_url' \
+    | head -1)
+  if [ -z "$FLIGHTSIM_URL" ]; then
+    echo "FAIL: could not resolve flightsim linux_64-bit.deb asset URL from upstream release" >&2
+    exit 1
+  fi
+  curl -fsSL "$FLIGHTSIM_URL" -o /tmp/flightsim.deb
+  apt-get install -y -qq /tmp/flightsim.deb
+  rm -f /tmp/flightsim.deb
+fi
+echo "  flightsim: $(flightsim --help 2>&1 | head -1 || echo 'not installed')"
+
 echo "=== Attacker toolkit setup complete ==="

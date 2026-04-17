@@ -1036,6 +1036,45 @@ ss = ctx.wrap_socket(s, server_hostname="1.1.1.1")
 ss.close()
 ' 2>/dev/null || true
 
+# ---------- Nuclei CVE template sweep ----------
+# Runs ProjectDiscovery nuclei against the Vulhub listeners (port 8080
+# Spring / 8983 Solr) plus the baseline nginx on :80. Rate-limited and
+# time-bounded so the sweep can't blow the attack-battery budget.
+# -tags cve,oast restricts to CVE templates; most will 404/miss but the
+# ones that DO match produce high-signal labeled traffic.
+echo "[34] nuclei CVE template sweep (Vulhub listeners + nginx)"
+if command -v nuclei >/dev/null 2>&1; then
+  timeout 180 nuclei \
+    -u "http://${VICTIM_IP}" \
+    -u "http://${VICTIM_IP}:8080" \
+    -u "http://${VICTIM_IP}:8983" \
+    -tags cve,log4j,spring,solr \
+    -rate-limit 30 -timeout 5 -silent -stats=false \
+    -exclude-severity info,low \
+    -o /tmp/nuclei-results.txt 2>/dev/null || true
+  echo "  nuclei findings: $(wc -l < /tmp/nuclei-results.txt 2>/dev/null || echo 0)"
+else
+  echo "  nuclei not installed; skipping"
+fi
+
+# ---------- flightsim IDS-validator traffic ----------
+# AlphaSOC flightsim generates purpose-built malicious-looking traffic:
+# - c2:           contacts ~500 known-C2 domains (triggers reputation rules)
+# - dga:          resolves domain-generation-algorithm domains
+# - tunnel-dns:   long TXT queries to sandbox.alphasoc.xyz (trips DNS tunnel SIDs)
+# - miner:        mining pool stratum protocol (trips cryptocurrency rules)
+# Requires attacker-ENI mirror session (see validate-detections.yml) —
+# without it these destinations never cross the sensor's visible wire.
+echo "[35] flightsim purpose-built IDS validator traffic"
+if command -v flightsim >/dev/null 2>&1; then
+  for mod in c2 dga tunnel-dns miner; do
+    echo "  flightsim run $mod"
+    timeout 90 flightsim run "$mod" 2>/dev/null || true
+  done
+else
+  echo "  flightsim not installed; skipping"
+fi
+
 # ---------- Vulhub-targeted exploitation ----------
 # These hit the deliberately-vulnerable listeners installed by
 # victim_setup.sh: Log4Shell via Solr on :8983, Spring4Shell via
