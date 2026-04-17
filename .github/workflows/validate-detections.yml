@@ -148,7 +148,9 @@ jobs:
           VICTIM_IP=$(ip_of "${{ steps.ec2.outputs.victim_id }}")
           ATTACKER_IP=$(ip_of "${{ steps.ec2.outputs.attacker_id }}")
           VICTIM_PRIVATE=$(private_of "${{ steps.ec2.outputs.victim_id }}")
+          ATTACKER_PRIVATE=$(private_of "${{ steps.ec2.outputs.attacker_id }}")
           VICTIM_ENI=$(primary_eni_of "${{ steps.ec2.outputs.victim_id }}")
+          ATTACKER_ENI=$(primary_eni_of "${{ steps.ec2.outputs.attacker_id }}")
           SENSOR_ENI=$(primary_eni_of "${{ steps.ec2.outputs.sensor_id }}")
           # Source/dest check must be off on the mirror-target ENI so mirrored
           # frames with arbitrary inner IPs aren't dropped by the Nitro NIC.
@@ -158,7 +160,9 @@ jobs:
           echo "victim_ip=${VICTIM_IP}" >> "$GITHUB_OUTPUT"
           echo "attacker_ip=${ATTACKER_IP}" >> "$GITHUB_OUTPUT"
           echo "victim_private=${VICTIM_PRIVATE}" >> "$GITHUB_OUTPUT"
+          echo "attacker_private=${ATTACKER_PRIVATE}" >> "$GITHUB_OUTPUT"
           echo "victim_eni=${VICTIM_ENI}" >> "$GITHUB_OUTPUT"
+          echo "attacker_eni=${ATTACKER_ENI}" >> "$GITHUB_OUTPUT"
           echo "sensor_eni=${SENSOR_ENI}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for SSH on all three
@@ -283,9 +287,49 @@ jobs:
             --description "${{ steps.ctx.outputs.run_tag }}-sess" \
             --tag-specifications "ResourceType=traffic-mirror-session,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
             --query 'TrafficMirrorSession.TrafficMirrorSessionId' --output text)
+
+          # Second mirror: attacker ENI -> same sensor target, VNI=2.
+          # The filter rejects attacker<->victim traffic because session 1
+          # already captures it on the victim side; without that reject,
+          # every attacker->victim packet would land in Suricata twice
+          # (inflated alert counts, doubled flow records).
+          FILTER_ATTACKER_ID=$(aws ec2 create-traffic-mirror-filter \
+            --description "${{ steps.ctx.outputs.run_tag }}-flt-attacker" \
+            --tag-specifications "ResourceType=traffic-mirror-filter,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorFilter.TrafficMirrorFilterId' --output text)
+          # Lower rule-number = higher priority. Reject-victim evaluated first.
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction egress --rule-number 50 --rule-action reject \
+            --source-cidr-block 0.0.0.0/0 \
+            --destination-cidr-block "${{ steps.wait.outputs.victim_private }}/32" >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction ingress --rule-number 50 --rule-action reject \
+            --destination-cidr-block 0.0.0.0/0 \
+            --source-cidr-block "${{ steps.wait.outputs.victim_private }}/32" >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction egress --rule-number 100 --rule-action accept \
+            --source-cidr-block 0.0.0.0/0 --destination-cidr-block 0.0.0.0/0 >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction ingress --rule-number 100 --rule-action accept \
+            --source-cidr-block 0.0.0.0/0 --destination-cidr-block 0.0.0.0/0 >/dev/null
+          SESS_ATTACKER_ID=$(aws ec2 create-traffic-mirror-session \
+            --network-interface-id "${{ steps.wait.outputs.attacker_eni }}" \
+            --traffic-mirror-target-id "$TGT_ID" \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --session-number 2 --virtual-network-id 2 \
+            --description "${{ steps.ctx.outputs.run_tag }}-sess-attacker" \
+            --tag-specifications "ResourceType=traffic-mirror-session,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorSession.TrafficMirrorSessionId' --output text)
+
           echo "tgt_id=${TGT_ID}" >> "$GITHUB_OUTPUT"
           echo "filter_id=${FILTER_ID}" >> "$GITHUB_OUTPUT"
+          echo "filter_attacker_id=${FILTER_ATTACKER_ID}" >> "$GITHUB_OUTPUT"
           echo "sess_id=${SESS_ID}" >> "$GITHUB_OUTPUT"
+          echo "sess_attacker_id=${SESS_ATTACKER_ID}" >> "$GITHUB_OUTPUT"
           # AWS takes a few seconds to program the mirror — don't race it.
           sleep 15
 
@@ -403,9 +447,17 @@ jobs:
         run: |
           # Reverse creation order. Every step `|| true` so one failure
           # does not leak the others.
+          if [ -n "${{ steps.mirror.outputs.sess_attacker_id }}" ]; then
+            aws ec2 delete-traffic-mirror-session \
+              --traffic-mirror-session-id "${{ steps.mirror.outputs.sess_attacker_id }}" 2>/dev/null || true
+          fi
           if [ -n "${{ steps.mirror.outputs.sess_id }}" ]; then
             aws ec2 delete-traffic-mirror-session \
               --traffic-mirror-session-id "${{ steps.mirror.outputs.sess_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.mirror.outputs.filter_attacker_id }}" ]; then
+            aws ec2 delete-traffic-mirror-filter \
+              --traffic-mirror-filter-id "${{ steps.mirror.outputs.filter_attacker_id }}" 2>/dev/null || true
           fi
           if [ -n "${{ steps.mirror.outputs.filter_id }}" ]; then
             aws ec2 delete-traffic-mirror-filter \

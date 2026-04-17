@@ -80,4 +80,45 @@ else
   exit 1
 fi
 
+# --- nuclei (ProjectDiscovery) ---
+# CVE-template-based vulnerability scanner. One Go binary + template repo
+# that nuclei maintains itself. Good density of labeled attack patterns;
+# the templates map 1:1 to published CVEs so alert triage is straightforward.
+echo "=== Installing nuclei ==="
+if ! command -v nuclei >/dev/null 2>&1; then
+  NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_linux_amd64.zip"
+  curl -fsSL "$NUCLEI_URL" -o /tmp/nuclei.zip
+  apt-get install -y -qq unzip
+  unzip -o /tmp/nuclei.zip -d /tmp/nuclei-extract
+  mv /tmp/nuclei-extract/nuclei /usr/local/bin/nuclei
+  chmod +x /usr/local/bin/nuclei
+  rm -rf /tmp/nuclei.zip /tmp/nuclei-extract
+fi
+# Update templates now so the attack step doesn't pay the ~10s cost.
+# -silent so the 10k+ template-update log doesn't dominate CI output.
+nuclei -update-templates -silent || true
+echo "  nuclei: $(nuclei -version 2>&1 | head -1)"
+
+# --- flightsim (AlphaSOC) ---
+# Purpose-built IDS validator: generates known-bad traffic patterns
+# (C2 domains, DGA, DNS tunnel, mining) to external destinations.
+# Requires the attacker-ENI mirror session to be captured at all
+# (victim-ENI mirror alone won't see attacker->internet traffic).
+echo "=== Installing flightsim ==="
+if ! command -v flightsim >/dev/null 2>&1; then
+  FLIGHTSIM_URL="https://github.com/alphasoc/flightsim/releases/latest/download/flightsim_linux_x86_64.tar.gz"
+  curl -fsSL "$FLIGHTSIM_URL" -o /tmp/flightsim.tgz
+  tar -xzf /tmp/flightsim.tgz -C /tmp/
+  # Archive layout is flightsim_<ver>_linux_x86_64/flightsim; find the binary.
+  FLIGHTSIM_BIN=$(find /tmp -maxdepth 3 -type f -name 'flightsim' | head -1)
+  if [ -n "$FLIGHTSIM_BIN" ]; then
+    mv "$FLIGHTSIM_BIN" /usr/local/bin/flightsim
+    chmod +x /usr/local/bin/flightsim
+  else
+    echo "WARN: flightsim binary not found in tarball" >&2
+  fi
+  rm -rf /tmp/flightsim.tgz /tmp/flightsim_*
+fi
+echo "  flightsim: $(flightsim --help 2>&1 | head -1 || echo 'not installed')"
+
 echo "=== Attacker toolkit setup complete ==="
