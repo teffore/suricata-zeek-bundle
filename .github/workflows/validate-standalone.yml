@@ -161,7 +161,7 @@ jobs:
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.public_ip }} '
               set -e
-              /opt/zeek/bin/zeekctl status
+              sudo /opt/zeek/bin/zeekctl status
               /opt/zeek/bin/zeek --version
               /opt/zeek/bin/zeek --version 2>&1 | grep -qE "version 8\." \
                 || { echo "Zeek is not 8.x"; exit 1; }
