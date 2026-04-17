@@ -500,6 +500,11 @@ cat >> /opt/zeek/share/zeek/site/local.zeek <<'EOF'
 # SSH brute-force threshold — 5 trips on ordinary DevOps automation.
 # Default is 30; 15 is a middle ground that still catches hydra bursts.
 redef SSH::password_guesses_limit = 15;
+# SumStats bucket window. Default 30 mins means a burst that completes
+# in 3 minutes (our CI attack phase) won't produce a notice until the
+# bucket flushes, well after verify_alerts.sh has read notice.log.
+# Shorten to 2 mins so CI sees the notice before it looks for it.
+redef SSH::guessing_timeout = 2 mins;
 
 # Iteration 8 — volumetric detection via stats framework. Stock
 # Zeek 8 doesn't ship misc/scan (that's a zkg package, separate

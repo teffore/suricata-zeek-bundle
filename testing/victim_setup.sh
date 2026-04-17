@@ -20,6 +20,36 @@ echo "=== [victim_setup] base packages ==="
 sudo apt-get update -qq
 sudo apt-get install -y -qq nginx openssh-server ca-certificates curl git iproute2
 
+echo "=== [victim_setup] samba on :139/:445 (deliberately misconfigured share) ==="
+# Needed so attacker-side SMB / DCE-RPC probes reach tree-connect and
+# named-pipe open, which is where our lateral-movement rules
+# (9001001-9001021) match. The share is guest-writable on purpose — this
+# is a detection lab, not a hardened target.
+sudo apt-get install -y -qq samba
+sudo tee /etc/samba/smb.conf > /dev/null <<'SMBCONF'
+[global]
+   workgroup = LAB
+   security = user
+   map to guest = Bad User
+   guest account = nobody
+   log level = 0
+   disable netbios = no
+   server min protocol = NT1
+   server max protocol = SMB3
+
+[lab]
+   path = /tmp/smbshare
+   browsable = yes
+   writable = yes
+   guest ok = yes
+   read only = no
+   create mask = 0666
+   directory mask = 0777
+SMBCONF
+sudo mkdir -p /tmp/smbshare && sudo chmod 777 /tmp/smbshare
+sudo systemctl restart smbd nmbd || true
+sudo systemctl enable --now smbd nmbd || true
+
 echo "=== [victim_setup] nginx on :80 (always 200 ok) ==="
 sudo tee /etc/nginx/sites-available/default > /dev/null <<'CONF'
 server {
@@ -86,7 +116,7 @@ for port in 8080 8983; do
 done
 
 echo "=== [victim_setup] final listener summary ==="
-ss -tln | grep -E ':(22|80|8080|8983) ' || true
+ss -tln | grep -E ':(22|80|139|445|8080|8983) ' || true
 echo ""
 echo "=== [victim_setup] docker ps ==="
 sudo docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}' || true

