@@ -203,6 +203,9 @@ jobs:
               # required — Suricata/Zeek read packets off the NIC directly.
               sudo ip link set ens6 up
               sudo ip link set ens6 promisc on
+              # AWS mirror encapsulates each frame in VXLAN (+50 B overhead).
+              # Default MTU on t3 ENIs is 9001 already; reassert for safety.
+              sudo ip link set ens6 mtu 9001
               ip -br link show ens6
             '
 
@@ -292,19 +295,32 @@ jobs:
 
       - name: Smoke-check mirror (VXLAN frames on sensor ens6)
         run: |
-          # Trigger a ping from attacker -> victim in the background, then
-          # tcpdump on sensor ens6 for UDP 4789 (VXLAN). If zero frames
-          # arrive the mirror is misconfigured and no attack will produce
-          # alerts — fail here so the root cause is obvious.
+          # Generate continuous traffic attacker -> victim for the duration
+          # of the capture. `nohup` + detached I/O so sshd doesn't kill the
+          # background process when the outer ssh exits.
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.attacker_ip }} \
-            "ping -c 10 -i 0.5 ${{ steps.wait.outputs.victim_private }} >/dev/null &"
-          CAP=$(ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "nohup bash -c 'for i in \$(seq 1 30); do ping -c 1 ${{ steps.wait.outputs.victim_private }}; curl -fs --max-time 1 http://${{ steps.wait.outputs.victim_private }}/ >/dev/null; sleep 0.5; done' </dev/null >/dev/null 2>&1 &"
+          sleep 3
+          # Count actual packet lines (timestamped) — do NOT grep for
+          # 'VXLAN', tcpdump doesn't print that string without -v. Use
+          # -c 10 + exit status: if 10 frames arrive in 15s tcpdump exits
+          # 0; if timeout hits first, it exits non-zero.
+          set +e
+          PKTS=$(ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.sensor_ip }} \
-            "sudo timeout 10 tcpdump -c 5 -nn -i ens6 'udp port 4789' 2>&1 | grep -c VXLAN || true")
-          echo "VXLAN frames captured: $CAP"
-          if [ "$CAP" -lt 1 ]; then
+            "sudo timeout 15 tcpdump -c 10 -nn -i ens6 'udp port 4789' 2>&1 | grep -Ec '^[0-9]{2}:[0-9]{2}:[0-9]{2}\\.'")
+          set -e
+          echo "VXLAN frames captured in 15s: $PKTS"
+          if [ "${PKTS:-0}" -lt 1 ]; then
             echo "FAIL: no VXLAN traffic on sensor ens6 — mirror session is not delivering"
+            echo "--- diagnostic: ens6 link state ---"
+            ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ubuntu@${{ steps.wait.outputs.sensor_ip }} "ip -s link show ens6; ethtool -S ens6 2>/dev/null | grep -Ei 'drop|error' | head" || true
+            echo "--- diagnostic: mirror session state ---"
+            aws ec2 describe-traffic-mirror-sessions \
+              --traffic-mirror-session-ids "${{ steps.mirror.outputs.sess_id }}" \
+              --query 'TrafficMirrorSessions[0]' --output json || true
             exit 1
           fi
 
