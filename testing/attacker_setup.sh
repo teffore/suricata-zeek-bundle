@@ -115,26 +115,18 @@ echo "  nuclei: $(nuclei -version 2>&1 | head -1)"
 # (victim-ENI mirror alone won't see attacker->internet traffic).
 echo "=== Installing flightsim ==="
 if ! command -v flightsim >/dev/null 2>&1; then
-  # Same versioned-asset issue as nuclei — resolve via API.
+  # Flightsim ships a prebuilt .deb (flightsim_<ver>_linux_64-bit.deb)
+  # which is simpler than extracting the tarball. apt resolves deps for us.
   FLIGHTSIM_URL=$(curl -fsSL https://api.github.com/repos/alphasoc/flightsim/releases/latest \
-    | jq -r '.assets[] | select(.name | test("linux_x86_64\\.tar\\.gz$")) | .browser_download_url' \
+    | jq -r '.assets[] | select(.name | test("linux_64-bit\\.deb$")) | .browser_download_url' \
     | head -1)
   if [ -z "$FLIGHTSIM_URL" ]; then
-    echo "FAIL: could not resolve flightsim linux_x86_64.tar.gz asset URL from upstream release" >&2
+    echo "FAIL: could not resolve flightsim linux_64-bit.deb asset URL from upstream release" >&2
     exit 1
   fi
-  curl -fsSL "$FLIGHTSIM_URL" -o /tmp/flightsim.tgz
-  tar -xzf /tmp/flightsim.tgz -C /tmp/
-  # Archive layout is flightsim_<ver>_linux_x86_64/flightsim; find the binary.
-  FLIGHTSIM_BIN=$(find /tmp -maxdepth 3 -type f -name 'flightsim' | head -1)
-  if [ -n "$FLIGHTSIM_BIN" ]; then
-    mv "$FLIGHTSIM_BIN" /usr/local/bin/flightsim
-    chmod +x /usr/local/bin/flightsim
-  else
-    echo "FAIL: flightsim binary not found in tarball at $FLIGHTSIM_URL" >&2
-    exit 1
-  fi
-  rm -rf /tmp/flightsim.tgz /tmp/flightsim_*
+  curl -fsSL "$FLIGHTSIM_URL" -o /tmp/flightsim.deb
+  apt-get install -y -qq /tmp/flightsim.deb
+  rm -f /tmp/flightsim.deb
 fi
 echo "  flightsim: $(flightsim --help 2>&1 | head -1 || echo 'not installed')"
 
