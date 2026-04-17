@@ -12,3 +12,7 @@ id_ed25519.*
 
 # Claude Code state
 .claude/
+
+# Local-only IAM helper — contains env-specific role-name assumptions,
+# kept out of the repo so forks don't pick it up
+update-iam-role.ps1
