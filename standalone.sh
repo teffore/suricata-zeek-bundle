@@ -179,17 +179,14 @@ suricata-update enable-source etnetera/aggressive
 suricata-update enable-source abuse.ch/sslbl-blacklist
 suricata-update enable-source abuse.ch/sslbl-ja3
 
-# Mute two high-volume low-value signatures:
+# Mute one high-volume low-value signature via suricata-update's disable.conf:
 #   - SURICATA HTTP Response excessive header repetition: a stream decoder
 #     event that fires on any repeated response header. Dominated the alert
 #     output (~67%) in prior CI runs.
-#   - SID 9000002 (TEST - SSH connection to HOME_NET): the custom canary
-#     fires on our own management SSH in single-ENI mirror mode. Keep the
-#     rule for manual smoke-testing but disable the noisy auto-fire.
+# (SID 9000002 noise is handled downstream at the custom-rules append step.)
 install -d -m 0755 /etc/suricata
 cat > /etc/suricata/disable.conf <<'DISABLE'
 re: SURICATA HTTP Response excessive header repetition
-9000002
 DISABLE
 
 # Update rules (puts them in /var/lib/suricata/rules/). suricata-update
@@ -310,8 +307,14 @@ LOGROTATE
 : "${BUNDLE_DIR:=$(dirname "$(readlink -f "$0")")}"
 if [ -f "${BUNDLE_DIR}/custom.rules" ]; then
   cp "${BUNDLE_DIR}/custom.rules" /var/lib/suricata/rules/custom.rules
-  cat /var/lib/suricata/rules/custom.rules >> /var/lib/suricata/rules/suricata.rules
-  echo "Custom rules installed from ${BUNDLE_DIR}/custom.rules"
+  # Custom rules are appended directly to suricata.rules (not managed by
+  # suricata-update), so /etc/suricata/disable.conf does not filter them.
+  # Strip the test canary SID 9000002 at append time — the file on disk
+  # still has it, so anyone can re-add manually, but it doesn't fire on
+  # our own management SSH in single-ENI mirror mode.
+  grep -v 'sid:9000002' /var/lib/suricata/rules/custom.rules \
+    >> /var/lib/suricata/rules/suricata.rules
+  echo "Custom rules installed from ${BUNDLE_DIR}/custom.rules (canary 9000002 filtered)"
 else
   echo "WARN: custom.rules not found at ${BUNDLE_DIR}/custom.rules — skipping"
 fi
