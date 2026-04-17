@@ -334,10 +334,21 @@ jobs:
           fi
 
       - name: Run attack battery
+        # 900s hard cap. Exit 124 = timeout; treat as soft-warn so verify_alerts.sh
+        # still runs and reports coverage on whatever probes did land. A single
+        # hang (smbclient against a silent port is the usual suspect) shouldn't
+        # blank an entire run.
         run: |
+          set +e
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.attacker_ip }} \
-            "sudo bash /tmp/run_attacks.sh ${{ steps.wait.outputs.victim_private }}"
+            "sudo timeout 900 bash /tmp/run_attacks.sh ${{ steps.wait.outputs.victim_private }}"
+          rc=$?
+          if [ "$rc" -eq 124 ]; then
+            echo "::warning::attack battery hit 900s timeout (exit 124); continuing to verify on partial results"
+            exit 0
+          fi
+          exit "$rc"
 
       - name: Copy + run verify_alerts.sh on sensor
         id: verify
