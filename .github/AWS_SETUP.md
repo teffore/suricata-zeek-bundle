@@ -1,8 +1,15 @@
-# AWS setup for the Actions workflow
+# AWS setup for the Actions workflows
 
-The `validate-standalone.yml` workflow provisions a fresh EC2 per run in your
-AWS account. This is a one-time setup — do it once and every future run
-works.
+Two workflows provision ephemeral AWS resources per run:
+
+- `validate-standalone.yml` — one EC2, install-only smoke test. Runs on every
+  push that touches `standalone.sh`.
+- `validate-detections.yml` — three EC2s (sensor, victim, attacker) plus a
+  VPC Traffic Mirror session, end-to-end detection validation. Manual
+  trigger only. Requires Nitro-family instance types (t3/m5/c5/...) —
+  VPC Traffic Mirroring is not supported on non-Nitro hardware.
+
+This is a one-time setup — do it once and every future run works.
 
 ## What you're creating
 
@@ -59,7 +66,7 @@ account can't assume it even if they know the ARN.
 
 ### Permissions policy (paste exactly)
 
-This is the minimum the workflow needs. No `iam:*`, no `s3:*`, nothing
+This is the minimum both workflows need. No `iam:*`, no `s3:*`, nothing
 outside EC2 + a read of the Ubuntu AMI ID from SSM Parameter Store.
 
 ```json
@@ -83,7 +90,24 @@ outside EC2 + a read of the Ubuntu AMI ID from SSM Parameter Store.
         "ec2:ImportKeyPair",
         "ec2:DeleteKeyPair",
         "ec2:DescribeKeyPairs",
-        "ec2:CreateTags"
+        "ec2:CreateTags",
+        "ec2:CreateNetworkInterface",
+        "ec2:AttachNetworkInterface",
+        "ec2:DetachNetworkInterface",
+        "ec2:DeleteNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:ModifyNetworkInterfaceAttribute",
+        "ec2:CreateTrafficMirrorTarget",
+        "ec2:DeleteTrafficMirrorTarget",
+        "ec2:DescribeTrafficMirrorTargets",
+        "ec2:CreateTrafficMirrorFilter",
+        "ec2:CreateTrafficMirrorFilterRule",
+        "ec2:DeleteTrafficMirrorFilter",
+        "ec2:DeleteTrafficMirrorFilterRule",
+        "ec2:DescribeTrafficMirrorFilters",
+        "ec2:CreateTrafficMirrorSession",
+        "ec2:DeleteTrafficMirrorSession",
+        "ec2:DescribeTrafficMirrorSessions"
       ],
       "Resource": "*"
     },
@@ -95,6 +119,11 @@ outside EC2 + a read of the Ubuntu AMI ID from SSM Parameter Store.
   ]
 }
 ```
+
+The network-interface and traffic-mirror actions are only used by
+`validate-detections.yml`. If you don't plan to run that workflow, you
+can omit the bottom half of the first statement — `validate-standalone.yml`
+works with just the original action set.
 
 ## 3. Add the role ARN to the repo
 
@@ -111,14 +140,23 @@ the workflow.
 
 ## Cost
 
-Per run:
+Per `validate-standalone.yml` run:
 
 - EC2 t3.medium on-demand: ~$0.0416/hr → ~$0.005 for a 7-min run
 - 20 GB gp3 volume: ~$0.08/GB-month → negligible at 7 min
 - Data out (AMI pulls, apt, PPA): few MB, negligible
 
-Typical run: **under $0.01**. Actions runner minutes are separate but free
-on public repos.
+Typical run: **under $0.01**.
+
+Per `validate-detections.yml` run:
+
+- 3× t3.medium on-demand for ~15 min ≈ $0.03
+- 3× 20 GB gp3 for ~15 min ≈ $0.001
+- VPC Traffic Mirroring: free when source and target are in the same AZ
+- Data out: negligible (attack traffic stays intra-VPC)
+
+Typical run: **~$0.05**. Actions runner minutes are separate but free on
+public repos.
 
 ## Manual trigger
 

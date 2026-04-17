@@ -1,0 +1,426 @@
+# Validates that the sensor actually *detects* attacks — not just that it
+# installs. Provisions three ephemeral EC2 instances (attacker, victim,
+# sensor) plus a VPC Traffic Mirror session from the victim's ENI to a
+# secondary ENI on the sensor, runs the Kali-style attack battery from
+# testing/run_attacks.sh, and gates success on testing/verify_alerts.sh.
+#
+# Trigger: workflow_dispatch only. Run time ~15 min, cost ~$0.05/run.
+#
+# Flow:
+#   1. OIDC -> assume IAM role (same role as validate-standalone.yml, with
+#      extra traffic-mirror + ENI permissions — see .github/AWS_SETUP.md)
+#   2. Launch 3x t3.medium Ubuntu 22.04 in the same default subnet (AZ)
+#   3. Attach secondary ENI to sensor for mirror-target duty
+#   4. Install nginx+sshd on victim; install standalone.sh --iface ens6 on
+#      sensor; install testing/kali_setup.sh on attacker
+#   5. Create traffic-mirror target / filter / session (victim ENI -> sensor ens6)
+#   6. Smoke-check that VXLAN frames reach the sensor
+#   7. Run testing/run_attacks.sh from attacker against victim private IP
+#   8. Run testing/verify_alerts.sh on sensor; gate on exit 0
+#   9. Upload fast.log, sig-breakdown.txt, zeek logs as artifacts
+#  10. Teardown (always): mirror session -> filter -> target -> ENI ->
+#      instances -> SG -> key pair. Reverse of create order.
+
+name: Validate detections (Kali + victim + mirror)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_TYPE: t3.medium
+
+jobs:
+  detect:
+    name: Attack + detect on mirrored traffic
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set run context
+        id: ctx
+        run: |
+          RUN_TAG="gha-det-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          MY_IP=$(curl -fsSL https://checkip.amazonaws.com)
+          AMI_ID=$(aws ssm get-parameter \
+            --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+            --query Parameter.Value --output text)
+          echo "run_tag=${RUN_TAG}" >> "$GITHUB_OUTPUT"
+          echo "my_ip=${MY_IP}" >> "$GITHUB_OUTPUT"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve default VPC + subnet
+        id: net
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values=$VPC_ID Name=default-for-az,Values=true \
+            --query 'Subnets[0].SubnetId' --output text)
+          echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
+          echo "subnet_id=${SUBNET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate ephemeral SSH key + register pair
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/gha_id -N '' -q
+          chmod 600 ~/.ssh/gha_id
+          aws ec2 import-key-pair \
+            --key-name "${{ steps.ctx.outputs.run_tag }}" \
+            --public-key-material "fileb://$HOME/.ssh/gha_id.pub"
+
+      - name: Create security group
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "${{ steps.ctx.outputs.run_tag }}" \
+            --description "ephemeral GHA detection run" \
+            --vpc-id "${{ steps.net.outputs.vpc_id }}" \
+            --query GroupId --output text)
+          # SSH from runner
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 \
+            --cidr "${{ steps.ctx.outputs.my_ip }}/32"
+          # Intra-SG any-to-any so attacker <-> victim flows freely and VXLAN
+          # mirror packets (UDP 4789) reach the sensor's secondary ENI.
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol -1 --source-group "$SG_ID"
+          echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Launch sensor, victim, attacker
+        id: ec2
+        run: |
+          launch() {
+            local role="$1"
+            aws ec2 run-instances \
+              --image-id "${{ steps.ctx.outputs.ami_id }}" \
+              --instance-type "${{ env.INSTANCE_TYPE }}" \
+              --key-name "${{ steps.ctx.outputs.run_tag }}" \
+              --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
+              --subnet-id "${{ steps.net.outputs.subnet_id }}" \
+              --associate-public-ip-address \
+              --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=20,VolumeType=gp3}' \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ steps.ctx.outputs.run_tag }}-${role}},{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}},{Key=Role,Value=${role}}]" \
+              --query 'Instances[0].InstanceId' --output text
+          }
+          SENSOR_ID=$(launch sensor)
+          VICTIM_ID=$(launch victim)
+          ATTACKER_ID=$(launch attacker)
+          echo "sensor_id=${SENSOR_ID}" >> "$GITHUB_OUTPUT"
+          echo "victim_id=${VICTIM_ID}" >> "$GITHUB_OUTPUT"
+          echo "attacker_id=${ATTACKER_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for all instances running
+        id: wait
+        run: |
+          aws ec2 wait instance-status-ok --instance-ids \
+            "${{ steps.ec2.outputs.sensor_id }}" \
+            "${{ steps.ec2.outputs.victim_id }}" \
+            "${{ steps.ec2.outputs.attacker_id }}"
+          ip_of() {
+            aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+          }
+          private_of() {
+            aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text
+          }
+          primary_eni_of() {
+            aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId' --output text
+          }
+          SENSOR_IP=$(ip_of "${{ steps.ec2.outputs.sensor_id }}")
+          VICTIM_IP=$(ip_of "${{ steps.ec2.outputs.victim_id }}")
+          ATTACKER_IP=$(ip_of "${{ steps.ec2.outputs.attacker_id }}")
+          VICTIM_PRIVATE=$(private_of "${{ steps.ec2.outputs.victim_id }}")
+          VICTIM_ENI=$(primary_eni_of "${{ steps.ec2.outputs.victim_id }}")
+          echo "sensor_ip=${SENSOR_IP}" >> "$GITHUB_OUTPUT"
+          echo "victim_ip=${VICTIM_IP}" >> "$GITHUB_OUTPUT"
+          echo "attacker_ip=${ATTACKER_IP}" >> "$GITHUB_OUTPUT"
+          echo "victim_private=${VICTIM_PRIVATE}" >> "$GITHUB_OUTPUT"
+          echo "victim_eni=${VICTIM_ENI}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH on all three
+        run: |
+          for IP in "${{ steps.wait.outputs.sensor_ip }}" \
+                    "${{ steps.wait.outputs.victim_ip }}" \
+                    "${{ steps.wait.outputs.attacker_ip }}"; do
+            ok=0
+            for i in $(seq 1 30); do
+              if nc -z -w 5 "$IP" 22; then ok=1; break; fi
+              sleep 5
+            done
+            [ "$ok" = 1 ] || { echo "SSH never came up on $IP"; exit 1; }
+          done
+          # Also wait for cloud-init on each so apt isn't racing with us
+          for IP in "${{ steps.wait.outputs.sensor_ip }}" \
+                    "${{ steps.wait.outputs.victim_ip }}" \
+                    "${{ steps.wait.outputs.attacker_ip }}"; do
+            ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ubuntu@"$IP" "cloud-init status --wait"
+          done
+
+      - name: Attach secondary ENI (ens6) to sensor
+        id: eni
+        run: |
+          ENI_ID=$(aws ec2 create-network-interface \
+            --subnet-id "${{ steps.net.outputs.subnet_id }}" \
+            --groups "${{ steps.sg.outputs.sg_id }}" \
+            --description "${{ steps.ctx.outputs.run_tag }}-mirror-target" \
+            --tag-specifications "ResourceType=network-interface,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'NetworkInterface.NetworkInterfaceId' --output text)
+          aws ec2 modify-network-interface-attribute \
+            --network-interface-id "$ENI_ID" --no-source-dest-check
+          ATTACH_ID=$(aws ec2 attach-network-interface \
+            --network-interface-id "$ENI_ID" \
+            --instance-id "${{ steps.ec2.outputs.sensor_id }}" \
+            --device-index 1 \
+            --query AttachmentId --output text)
+          echo "eni_id=${ENI_ID}" >> "$GITHUB_OUTPUT"
+          echo "attach_id=${ATTACH_ID}" >> "$GITHUB_OUTPUT"
+          # Give the kernel a moment to see the new NIC
+          sleep 10
+
+      - name: Bring up ens6 on sensor
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} '
+              set -e
+              # Secondary ENIs on Ubuntu 22.04 need manual up. No IP is
+              # required — Suricata/Zeek read packets off the NIC directly.
+              sudo ip link set ens6 up
+              sudo ip link set ens6 promisc on
+              ip -br link show ens6
+            '
+
+      - name: Install standalone.sh on sensor (bound to ens6)
+        run: |
+          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            standalone.sh ubuntu@${{ steps.wait.outputs.sensor_ip }}:/tmp/standalone.sh
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} \
+            "sudo bash /tmp/standalone.sh --force --iface ens6"
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} '
+              set -e
+              systemctl is-active suricata
+              sudo /opt/zeek/bin/zeekctl status
+              sudo apt-get install -y -qq tcpdump jq
+            '
+
+      - name: Install victim services (nginx + sshd)
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.victim_ip }} '
+              set -e
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx openssh-server
+              # Respond 200 "ok" on every path so attacker probes get a
+              # response (and path-sensitive rules see realistic wire
+              # patterns, not 404s).
+              sudo tee /etc/nginx/sites-available/default > /dev/null <<CONF
+          server {
+              listen 80 default_server;
+              server_name _;
+              location / { return 200 "ok\n"; add_header Content-Type text/plain; }
+          }
+          CONF
+              sudo systemctl restart nginx
+              sudo systemctl enable --now ssh
+            '
+
+      - name: Install attacker toolkit (kali_setup.sh)
+        run: |
+          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            testing/kali_setup.sh ubuntu@${{ steps.wait.outputs.attacker_ip }}:/tmp/kali_setup.sh
+          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            testing/run_attacks.sh ubuntu@${{ steps.wait.outputs.attacker_ip }}:/tmp/run_attacks.sh
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
+            "sudo bash /tmp/kali_setup.sh && chmod +x /tmp/run_attacks.sh"
+
+      - name: Create traffic-mirror plumbing
+        id: mirror
+        run: |
+          TGT_ID=$(aws ec2 create-traffic-mirror-target \
+            --network-interface-id "${{ steps.eni.outputs.eni_id }}" \
+            --description "${{ steps.ctx.outputs.run_tag }}-tgt" \
+            --tag-specifications "ResourceType=traffic-mirror-target,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorTarget.TrafficMirrorTargetId' --output text)
+          FILTER_ID=$(aws ec2 create-traffic-mirror-filter \
+            --description "${{ steps.ctx.outputs.run_tag }}-flt" \
+            --tag-specifications "ResourceType=traffic-mirror-filter,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorFilter.TrafficMirrorFilterId' --output text)
+          # Allow-all ingress + egress so every packet the victim ENI sees
+          # or sends is mirrored to the sensor.
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ID" \
+            --traffic-direction ingress --rule-number 100 \
+            --rule-action accept --protocol -1 \
+            --destination-cidr-block 0.0.0.0/0 --source-cidr-block 0.0.0.0/0 >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ID" \
+            --traffic-direction egress --rule-number 100 \
+            --rule-action accept --protocol -1 \
+            --destination-cidr-block 0.0.0.0/0 --source-cidr-block 0.0.0.0/0 >/dev/null
+          SESS_ID=$(aws ec2 create-traffic-mirror-session \
+            --network-interface-id "${{ steps.wait.outputs.victim_eni }}" \
+            --traffic-mirror-target-id "$TGT_ID" \
+            --traffic-mirror-filter-id "$FILTER_ID" \
+            --session-number 1 --virtual-network-id 1 \
+            --description "${{ steps.ctx.outputs.run_tag }}-sess" \
+            --tag-specifications "ResourceType=traffic-mirror-session,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorSession.TrafficMirrorSessionId' --output text)
+          echo "tgt_id=${TGT_ID}" >> "$GITHUB_OUTPUT"
+          echo "filter_id=${FILTER_ID}" >> "$GITHUB_OUTPUT"
+          echo "sess_id=${SESS_ID}" >> "$GITHUB_OUTPUT"
+          # AWS takes a few seconds to program the mirror — don't race it.
+          sleep 15
+
+      - name: Smoke-check mirror (VXLAN frames on sensor ens6)
+        run: |
+          # Trigger a ping from attacker -> victim in the background, then
+          # tcpdump on sensor ens6 for UDP 4789 (VXLAN). If zero frames
+          # arrive the mirror is misconfigured and no attack will produce
+          # alerts — fail here so the root cause is obvious.
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
+            "ping -c 10 -i 0.5 ${{ steps.wait.outputs.victim_private }} >/dev/null &"
+          CAP=$(ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} \
+            "sudo timeout 10 tcpdump -c 5 -nn -i ens6 'udp port 4789' 2>&1 | grep -c VXLAN || true")
+          echo "VXLAN frames captured: $CAP"
+          if [ "$CAP" -lt 1 ]; then
+            echo "FAIL: no VXLAN traffic on sensor ens6 — mirror session is not delivering"
+            exit 1
+          fi
+
+      - name: Run attack battery
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
+            "sudo bash /tmp/run_attacks.sh ${{ steps.wait.outputs.victim_private }}"
+
+      - name: Copy + run verify_alerts.sh on sensor
+        id: verify
+        run: |
+          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            testing/verify_alerts.sh ubuntu@${{ steps.wait.outputs.sensor_ip }}:/tmp/verify_alerts.sh
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} \
+            "sudo bash /tmp/verify_alerts.sh"
+
+      - name: Collect sensor logs for artifact
+        if: always() && steps.wait.outputs.sensor_ip != ''
+        run: |
+          mkdir -p /tmp/sensor-logs
+          for f in \
+            /tmp/sig-breakdown.txt \
+            /var/log/suricata/fast.log \
+            /var/log/suricata/suricata.log \
+            /var/log/suricata-setup.log; do
+            ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ubuntu@${{ steps.wait.outputs.sensor_ip }} "sudo cat $f 2>/dev/null" \
+              > "/tmp/sensor-logs/$(basename $f)" || true
+          done
+          # Trim eve.json — full file can be huge
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} \
+            "sudo head -c 2000000 /var/log/suricata/eve.json" \
+            > /tmp/sensor-logs/eve.head.json || true
+          # Zeek notices + weird + conn (top of current run)
+          for z in notice weird conn dns http ssl; do
+            ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ubuntu@${{ steps.wait.outputs.sensor_ip }} \
+              "sudo head -c 500000 /opt/zeek/logs/current/${z}.log 2>/dev/null" \
+              > "/tmp/sensor-logs/zeek-${z}.log" || true
+          done
+
+      - name: Upload detection artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: detection-logs-${{ github.run_id }}
+          path: /tmp/sensor-logs/
+          if-no-files-found: warn
+
+      - name: Dump failure logs inline
+        if: failure() && steps.wait.outputs.sensor_ip != ''
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} '
+              echo "=== /var/log/suricata-setup.log (tail) ==="
+              sudo tail -200 /var/log/suricata-setup.log 2>/dev/null || true
+              echo "=== journalctl -u suricata ==="
+              sudo journalctl -u suricata --no-pager -n 100 || true
+              echo "=== zeekctl diag ==="
+              sudo /opt/zeek/bin/zeekctl diag 2>/dev/null || true
+              echo "=== eve.json alert count ==="
+              sudo grep -c \"\\\"event_type\\\":\\\"alert\\\"\" /var/log/suricata/eve.json 2>/dev/null || echo 0
+            ' || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          # Reverse creation order. Every step `|| true` so one failure
+          # does not leak the others.
+          if [ -n "${{ steps.mirror.outputs.sess_id }}" ]; then
+            aws ec2 delete-traffic-mirror-session \
+              --traffic-mirror-session-id "${{ steps.mirror.outputs.sess_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.mirror.outputs.filter_id }}" ]; then
+            aws ec2 delete-traffic-mirror-filter \
+              --traffic-mirror-filter-id "${{ steps.mirror.outputs.filter_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.mirror.outputs.tgt_id }}" ]; then
+            aws ec2 delete-traffic-mirror-target \
+              --traffic-mirror-target-id "${{ steps.mirror.outputs.tgt_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.eni.outputs.attach_id }}" ]; then
+            aws ec2 detach-network-interface \
+              --attachment-id "${{ steps.eni.outputs.attach_id }}" --force 2>/dev/null || true
+            # ENI can't be deleted until detach completes
+            for i in $(seq 1 20); do
+              STATE=$(aws ec2 describe-network-interfaces \
+                --network-interface-ids "${{ steps.eni.outputs.eni_id }}" \
+                --query 'NetworkInterfaces[0].Status' --output text 2>/dev/null || echo gone)
+              [ "$STATE" = "available" ] && break
+              [ "$STATE" = "gone" ] && break
+              sleep 3
+            done
+          fi
+          if [ -n "${{ steps.eni.outputs.eni_id }}" ]; then
+            aws ec2 delete-network-interface \
+              --network-interface-id "${{ steps.eni.outputs.eni_id }}" 2>/dev/null || true
+          fi
+          for ID in \
+            "${{ steps.ec2.outputs.sensor_id }}" \
+            "${{ steps.ec2.outputs.victim_id }}" \
+            "${{ steps.ec2.outputs.attacker_id }}"; do
+            [ -n "$ID" ] && aws ec2 terminate-instances --instance-ids "$ID" >/dev/null 2>&1 || true
+          done
+          for ID in \
+            "${{ steps.ec2.outputs.sensor_id }}" \
+            "${{ steps.ec2.outputs.victim_id }}" \
+            "${{ steps.ec2.outputs.attacker_id }}"; do
+            [ -n "$ID" ] && aws ec2 wait instance-terminated --instance-ids "$ID" 2>/dev/null || true
+          done
+          if [ -n "${{ steps.sg.outputs.sg_id }}" ]; then
+            aws ec2 delete-security-group \
+              --group-id "${{ steps.sg.outputs.sg_id }}" 2>/dev/null || true
+          fi
+          aws ec2 delete-key-pair \
+            --key-name "${{ steps.ctx.outputs.run_tag }}" 2>/dev/null || true
