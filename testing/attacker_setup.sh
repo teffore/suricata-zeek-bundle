@@ -53,4 +53,31 @@ if [ "${#failed[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# ---------- Create impacket-* shell wrappers ----------
+# Kali's impacket-scripts package ships /usr/bin/impacket-psexec (and friends)
+# as small shell wrappers. Ubuntu's python3-impacket installs only the Python
+# sources under /usr/share/... — no shims — so run_attacks.sh's calls like
+# 'impacket-psexec ...' fail with 'command not found'. Generate the wrappers
+# here so the attack battery's lateral-movement section actually runs.
+EXAMPLE_PY=$(find /usr/share -maxdepth 4 -name psexec.py -path "*impacket*" 2>/dev/null | head -1)
+if [ -n "$EXAMPLE_PY" ]; then
+  EXAMPLES_DIR=$(dirname "$EXAMPLE_PY")
+  echo ""
+  echo "Creating impacket-* wrappers from ${EXAMPLES_DIR}"
+  for tool in psexec services reg samrdump atexec lookupsid smbclient \
+              smbserver wmiexec dcomexec secretsdump GetNPUsers GetUserSPNs; do
+    if [ -f "${EXAMPLES_DIR}/${tool}.py" ]; then
+      cat > "/usr/local/bin/impacket-${tool}" <<WRAPPER
+#!/bin/bash
+exec python3 "${EXAMPLES_DIR}/${tool}.py" "\$@"
+WRAPPER
+      chmod +x "/usr/local/bin/impacket-${tool}"
+    fi
+  done
+  echo "  wrappers: $(ls /usr/local/bin/impacket-* 2>/dev/null | wc -l) created"
+else
+  echo "WARN: impacket examples not found under /usr/share — impacket-* commands unavailable" >&2
+  exit 1
+fi
+
 echo "=== Attacker toolkit setup complete ==="
