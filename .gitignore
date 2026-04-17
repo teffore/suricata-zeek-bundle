@@ -9,3 +9,6 @@ id_ed25519
 id_ed25519.*
 .env
 .env.*
+
+# Claude Code state
+.claude/
