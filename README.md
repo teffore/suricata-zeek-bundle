@@ -152,7 +152,7 @@ can drive the same test suite against any target you control.
 
 | Script | Purpose |
 |---|---|
-| `testing/kali_setup.sh` | Installs Kali attacker tooling: `nmap`, `hydra`, `nikto`, `hping3`, `dnsutils`, `smbclient`, `impacket-scripts`, `python3-impacket` |
+| `testing/attacker_setup.sh` | Installs the attacker toolkit on a plain Ubuntu 22.04 box: `nmap`, `hydra`, `nikto`, `hping3`, `dnsutils`, `smbclient`, `xxd`, `curl`, `python3-impacket` (provides the `impacket-*` commands). Installs each package independently so one missing universe package doesn't roll back the whole batch. |
 | `testing/run_attacks.sh <victim_ip>` | Runs the full attack battery (see categories below) |
 | `testing/verify_alerts.sh` | Runs on the sensor; summarizes alerts, Zeek notices, VXLAN decap evidence, decoder stats |
 
@@ -215,7 +215,7 @@ can drive the same test suite against any target you control.
 
 On the attacker host:
 ```bash
-sudo ./testing/kali_setup.sh           # one-time install
+sudo ./testing/attacker_setup.sh       # one-time install
 ./testing/run_attacks.sh <victim_ip>   # ~5–10 min
 ```
 

@@ -13,7 +13,7 @@
 #   2. Launch 3x t3.medium Ubuntu 22.04 in the same default subnet (AZ)
 #   3. Disable source/dest check on sensor primary ENI; set promisc + MTU 9001
 #   4. Install nginx+sshd on victim; install standalone.sh on sensor;
-#      install testing/kali_setup.sh on attacker
+#      install testing/attacker_setup.sh on attacker
 #   5. Create traffic-mirror target / filter / session (victim ENI -> sensor
 #      primary ENI)
 #   6. Smoke-check that VXLAN frames reach the sensor
@@ -235,15 +235,34 @@ jobs:
               sudo systemctl enable --now ssh
             '
 
-      - name: Install attacker toolkit (kali_setup.sh)
+      - name: Install attacker toolkit
         run: |
           scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            testing/kali_setup.sh ubuntu@${{ steps.wait.outputs.attacker_ip }}:/tmp/kali_setup.sh
+            testing/attacker_setup.sh ubuntu@${{ steps.wait.outputs.attacker_ip }}:/tmp/attacker_setup.sh
           scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             testing/run_attacks.sh ubuntu@${{ steps.wait.outputs.attacker_ip }}:/tmp/run_attacks.sh
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.attacker_ip }} \
-            "sudo bash /tmp/kali_setup.sh && chmod +x /tmp/run_attacks.sh"
+            "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
+
+      - name: Verify attacker tools present
+        run: |
+          # The old kali_setup.sh silently swallowed failures and the attack
+          # run would hit 'command not found' for every tool. Hard-fail here
+          # if anything the attack battery expects is missing.
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.attacker_ip }} '
+              set -e
+              missing=()
+              for t in nmap hydra nikto hping3 dig smbclient impacket-psexec xxd curl; do
+                command -v "$t" >/dev/null || missing+=("$t")
+              done
+              if [ "${#missing[@]}" -gt 0 ]; then
+                echo "MISSING: ${missing[*]}"
+                exit 1
+              fi
+              echo "all attacker tools present"
+            '
 
       - name: Create traffic-mirror plumbing
         id: mirror
