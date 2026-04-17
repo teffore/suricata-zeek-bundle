@@ -255,11 +255,15 @@ sed -i 's/spm-algo: auto/spm-algo: hs/' /etc/suricata/suricata.yaml
 #     flows it only sees one direction of. The OISF default yaml has
 #     this commented as `#   async-oneside: false` under the `stream:`
 #     block — we just uncomment and flip to true.
-# (b) max-pending-packets: docs recommend 10000+ for 8+ core hosts;
-#     we use 5000 to right-size for the 2-vCPU t3.medium sensor
-#     (RAM-bound before queue-depth-bound at this size).
+# (b) max-pending-packets: docs recommend 10000+ for 8+ core hosts. On
+#     a 2-vCPU CI lab sensor we use 5000 (RAM-bound before queue-depth-
+#     bound); on production 4+ vCPU instances we use 10000 per docs.
+#     Picked at install time via nproc so the same script does the
+#     right thing on both shapes.
 sed -i 's/^#   async-oneside: false.*/  async-oneside: true/' /etc/suricata/suricata.yaml
-sed -i 's/^max-pending-packets: 1024/max-pending-packets: 5000/' /etc/suricata/suricata.yaml
+MAX_PP=10000
+[ "$(nproc)" -lt 4 ] && MAX_PP=5000
+sed -i "s/^max-pending-packets: .*/max-pending-packets: ${MAX_PP}/" /etc/suricata/suricata.yaml
 
 # ---------- Enhancement #10: JA4 TLS fingerprint ----------
 # JA4 (and JA4+) supersedes JA3 as the standard client TLS fingerprint
@@ -348,7 +352,7 @@ else
 fi
 
 echo "Config updated with interface: ${PRIMARY_IF}"
-echo "Enhancements applied: community-id, tls/ja3, ja4, hassh, metadata, daily updates, log rotation (HUP), hyperscan, anomaly, non-root, async-oneside, max-pending-packets=5000"
+echo "Enhancements applied: community-id, tls/ja3, ja4, hassh, metadata, daily updates, log rotation (HUP), hyperscan, anomaly, non-root, async-oneside, max-pending-packets=${MAX_PP} ($(nproc) vCPU)"
 
 # Validate config (as the suricata user so it doesn't create
 # root-owned log files in /var/log/suricata that block the daemon
@@ -384,6 +388,34 @@ apt-get update -y
 # zeek-8.0 is the versioned package name; pulls the latest 8.0.x patch.
 apt-get install -y zeek-8.0
 /opt/zeek/bin/zeek --version
+
+# ---------- zkg third-party packages ----------
+# zkg ships with Zeek 8. autoconfig is a first-run setup that creates
+# /opt/zeek/etc/zkg/config; refresh pulls the current source catalog;
+# install --force auto-accepts the "enable auto-load?" prompt. Each
+# package auto-loads via /opt/zeek/share/zeek/site/packages/__load__.zeek
+# which local.zeek picks up by default — no explicit @load needed.
+#
+#   zeek/foxio/ja4              — JA4S/JA4H/JA4SSH/JA4T/JA4L/JA4D family
+#                                 (Suricata only ships client JA4 due
+#                                 to patent policy on the rest).
+#   mitre-attack/bzar           — ATT&CK technique classification for
+#                                 SMB/DCE-RPC/Kerberos events; produces
+#                                 ATTACK::* notices.
+#   corelight/zeek-long-connections — interim conn.log rows for still-
+#                                 open flows so C2 beacons show up in
+#                                 real time instead of on flow-close.
+#   corelight/ecs-mapping       — rewrite Zeek field names to Elastic
+#                                 Common Schema at write time; breaks
+#                                 any downstream consumer expecting
+#                                 native Zeek names (id.orig_h, etc.).
+/opt/zeek/bin/zkg autoconfig
+/opt/zeek/bin/zkg refresh
+/opt/zeek/bin/zkg install --force zeek/foxio/ja4
+/opt/zeek/bin/zkg install --force mitre-attack/bzar
+/opt/zeek/bin/zkg install --force corelight/zeek-long-connections
+/opt/zeek/bin/zkg install --force corelight/ecs-mapping
+/opt/zeek/bin/zkg list
 
 # ---------- node.cfg: standalone on primary interface ----------
 sed -i "s/interface=eth0/interface=${PRIMARY_IF}/" /opt/zeek/etc/node.cfg

@@ -16,7 +16,8 @@ fetch, VPC Traffic Mirroring wiring) so it runs on any existing Ubuntu 22.04 hos
 - Ubuntu 22.04 (Jammy)
 - Root / sudo
 - Outbound internet to: `launchpad.net` (OISF PPA), `download.opensuse.org`
-  (Zeek OBS), `urlhaus.abuse.ch` + `feodotracker.abuse.ch` (intel feeds)
+  (Zeek OBS), `urlhaus.abuse.ch` + `feodotracker.abuse.ch` (intel feeds),
+  `github.com` (zkg third-party Zeek packages)
 - A NIC receiving the traffic you want to inspect (SPAN port, tap, VXLAN
   mirror, or promiscuous capture on a bridged interface)
 
@@ -96,7 +97,7 @@ Tunings applied to `/etc/suricata/suricata.yaml`:
 | `metadata` in alerts | `yes` | Adds CVE / product / description / ATT&CK tags to eve.json alert output | [ET metadata](https://www.proofpoint.com/us/blog/threat-insight/emerging-threats-updates-improve-metadata-including-mitre-attck-tags) |
 | `mpm-algo` / `spm-algo` | `hs` (Hyperscan) | Faster multi-pattern matching on 75k+ rule sets | [Suricata Hyperscan docs](https://docs.suricata.io/en/latest/performance/hyperscan.html) |
 | `stream.async-oneside` | `true` | Handle asymmetric flows (AWS Traffic Mirror / SPAN sessions deliver directions separately) | [Suricata tuning](https://docs.suricata.io/en/latest/performance/tuning-considerations.html) |
-| `max-pending-packets` | `5000` | Right-sized for 2-vCPU sensor; docs' 10000+ guidance assumes 8+ cores | [Suricata tuning](https://docs.suricata.io/en/suricata-7.0.12/performance/tuning-considerations.html) |
+| `max-pending-packets` | `5000` (<4 vCPU) / `10000` (4+ vCPU) | Picked at install time from `nproc`. OISF docs recommend 10000+ for 8+ core hosts; below that, RAM overhead outweighs queue-depth benefit | [Suricata tuning](https://docs.suricata.io/en/suricata-7.0.12/performance/tuning-considerations.html) |
 | `anomaly` logging | enabled | Catches protocol violations that signature rules miss (TCP flag anomalies, protocol mismatch) | [eve-output anomaly](https://docs.suricata.io/en/suricata-8.0.0/output/eve/eve-json-output.html) |
 | Runtime user | `suricata` (non-root) | Drops privileges after startup via systemd drop-in; limits blast radius of any Suricata CVE | [Suricata drop-privs docs](https://docs.suricata.io/en/suricata-7.0.11/configuration/dropping-privileges.html) |
 | Pre-8 purge | automatic | Detects pre-v8 Suricata + purges before install so stale pidfiles from the 7.0 LTS PPA don't break the 8.x systemd unit | bundle-specific |
@@ -125,6 +126,13 @@ Loki, and any other SIEM can ingest natively without custom parsers.
 `zeek-cut` only reads TSV, so any downstream tool using it needs to move to
 `jq` / native JSON parsing.
 
+**Field names follow Elastic Common Schema (ECS)** — provided by the
+`corelight/ecs-mapping` zkg package (see zkg table below). Native Zeek
+names like `id.orig_h`, `id.resp_h`, `ssl.server_name` are rewritten to
+`source.ip`, `destination.ip`, `tls.server.name`, etc. at write time.
+Anything downstream expecting native Zeek field names will see nothing
+in those paths — point queries at the ECS names instead.
+
 Loaded in `local.zeek`:
 
 | `@load` | What it does | Why / Reference |
@@ -146,6 +154,16 @@ Loaded in `local.zeek`:
 | `policy/protocols/conn/known-services` | Tracks first-seen (host, port, proto) tuples — new-service alerting basis | same |
 | `policy/frameworks/analyzer/detect-protocols` | Logs services running on non-standard ports (shells on 443, HTTP on 22, etc.) | [frameworks/analyzer/detect-protocols](https://docs.zeek.org/en/lts/scripts/policy/frameworks/analyzer/detect-protocols.zeek.html) |
 | `misc/stats` | 60-second engine stats to `stats.log` — rate / memory / queue telemetry | [policy/misc/stats](https://docs.zeek.org/en/lts/scripts/policy/misc/stats.zeek.html) |
+
+**Third-party packages installed via `zkg` at deploy time** (fetched from
+GitHub, auto-loaded via `/opt/zeek/share/zeek/site/packages/__load__.zeek`):
+
+| Package | What it adds | Why / Reference |
+|---|---|---|
+| `zeek/foxio/ja4` | JA4+ family — **JA4S** (TLS server), **JA4H** (HTTP), **JA4SSH**, **JA4T/JA4L** (TCP/latency), **JA4D** (DHCP) across `ssl.log`, `http.log`, `ssh.log`, plus new `ja4ssh.log` and `ja4d.log` | Completes the fingerprint family; Suricata 8's native JA4 only ships the client-TLS variant due to patent policy / [github.com/FoxIO-LLC/ja4](https://github.com/FoxIO-LLC/ja4) |
+| `mitre-attack/bzar` | `ATTACK::*` notices tagged with MITRE ATT&CK technique IDs (T1021.002, T1047, T1003.006, …) when SMB / DCE-RPC / NTLM / Kerberos events match mapped patterns | Direct ATT&CK classification of Windows lateral-movement traffic; maintained by MITRE / [github.com/mitre-attack/bzar](https://github.com/mitre-attack/bzar) |
+| `corelight/zeek-long-connections` | Interim `conn.log` rows for flows that are still open (default every 60s) rather than only writing on flow-close | Makes C2 beacons, reverse shells, and data-exfil tunnels visible in real-time queries / [github.com/corelight/zeek-long-connections](https://github.com/corelight/zeek-long-connections) |
+| `corelight/ecs-mapping` | Rewrites every Zeek log field to the **Elastic Common Schema** (`id.orig_h` → `source.ip`, `ssl.server_name` → `tls.server.name`, etc.) at write time | Drop-in compatibility with Elastic Security, Kibana Zeek dashboards, and any SIEM that consumes ECS / [github.com/corelight/ecs-mapping](https://github.com/corelight/ecs-mapping) |
 
 **Intel Framework** (`/opt/zeek/intel/`):
 - `build-intel.sh` assembles `intel.dat` from:
