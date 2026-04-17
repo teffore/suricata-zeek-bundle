@@ -333,20 +333,22 @@
       "id": "lateral-smb-shares",
       "category": "lateral",
       "attacks": [
-        "SMB tree connect to ADMIN$ / C$ / IPC$"
+        "SMB tree connect to ADMIN$ / IPC$ (C$ is Windows-only, not offered by Samba)"
       ],
-      "expected_suricata_sids": [9001001, 9001002, 9001003],
+      "expected_suricata_sids": [9001001, 9001003],
       "expected_zeek_notices": [],
+      "notes": "9001002 (C$ tree connect) removed from expectations — Samba on the victim doesn't advertise the C$ administrative share, only Windows Server does. Would be restored if/when a Windows victim is added to the lab.",
       "mitre_technique": "T1021.002"
     },
     {
       "id": "lateral-named-pipes",
       "category": "lateral",
       "attacks": [
-        "PSEXESVC / svcctl / winreg / atsvc / samr / lsarpc named pipes via impacket"
+        "svcctl / winreg / atsvc / samr / lsarpc named pipes via impacket (PSEXESVC is Windows-only, Samba doesn't implement it)"
       ],
-      "expected_suricata_sids": [9001010, 9001011, 9001012, 9001013, 9001014, 9001015],
+      "expected_suricata_sids": [9001011, 9001012, 9001013, 9001014, 9001015],
       "expected_zeek_notices": [],
+      "notes": "9001010 (PSEXESVC named pipe) removed from expectations — PSEXESVC is the PsExec service pipe and only exists on Windows Server. Samba has no equivalent. Would be restored if/when a Windows victim is added to the lab.",
       "mitre_technique": "T1021.002"
     },
     {
