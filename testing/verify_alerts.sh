@@ -106,19 +106,20 @@ if [[ -d "${ZEEK_LOGS}" ]]; then
   echo ""
   echo "--- Zeek notices fired ---"
   if [[ -f "${ZEEK_LOGS}/notice.log" ]]; then
-    grep -v '^#' "${ZEEK_LOGS}/notice.log" | awk -F'\t' '{print $11}' | sort | uniq -c | sort -rn
+    jq -r '.note // empty' "${ZEEK_LOGS}/notice.log" 2>/dev/null | sort | uniq -c | sort -rn
   else
     echo "(no notice.log this rotation interval)"
   fi
   echo ""
   echo "--- Zeek tunnel.log (VXLAN decap evidence) ---"
   if [[ -f "${ZEEK_LOGS}/tunnel.log" ]]; then
-    grep -v '^#' "${ZEEK_LOGS}/tunnel.log" | awk -F'\t' '{print $7}' | sort | uniq -c
+    jq -r '.tunnel_type // empty' "${ZEEK_LOGS}/tunnel.log" 2>/dev/null | sort | uniq -c
   fi
   echo ""
   echo "--- Zeek inner-flow top conversations ---"
   if [[ -f "${ZEEK_LOGS}/conn.log" ]]; then
-    grep -v '^#' "${ZEEK_LOGS}/conn.log" | awk -F'\t' '{print $3, "->", $5, $7, $8}' | sort | uniq -c | sort -rn | head -10
+    jq -r '[(.["id.orig_h"] // "-"), "->", (.["id.resp_h"] // "-"), (.["id.resp_p"] // "-" | tostring), (.proto // "-"), (.service // "-")] | @tsv' \
+      "${ZEEK_LOGS}/conn.log" 2>/dev/null | sort | uniq -c | sort -rn | head -10
   fi
 fi
 

