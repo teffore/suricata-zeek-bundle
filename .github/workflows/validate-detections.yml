@@ -355,6 +355,8 @@ jobs:
         run: |
           scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             testing/verify_alerts.sh ubuntu@${{ steps.wait.outputs.sensor_ip }}:/tmp/verify_alerts.sh
+          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            testing/probe_catalog.json ubuntu@${{ steps.wait.outputs.sensor_ip }}:/tmp/probe_catalog.json
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.sensor_ip }} \
             "sudo bash /tmp/verify_alerts.sh"
@@ -365,6 +367,7 @@ jobs:
           mkdir -p /tmp/sensor-logs
           for f in \
             /tmp/sig-breakdown.txt \
+            /tmp/probe-to-sid-coverage.json \
             /var/log/suricata/fast.log \
             /var/log/suricata/suricata.log \
             /var/log/suricata-setup.log; do

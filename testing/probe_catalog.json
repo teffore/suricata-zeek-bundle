@@ -1,0 +1,395 @@
+{
+  "version": 1,
+  "description": "Maps attack scenarios in run_attacks.sh to the Suricata custom SIDs and Zeek notices that should fire. Scenario-level (not per-probe) granularity: each scenario groups related attacks that share the same expected detection. The verify_alerts.sh coverage join uses this to produce probe-to-sid-coverage.json. Keep expected_suricata_sids accurate against standalone.sh rule SIDs (9000001\u20139001021 range).",
+  "coverage_rule_default": "any",
+  "scenarios": [
+    {
+      "id": "mirror-canary-ssh",
+      "category": "plumbing",
+      "attacks": ["SSH connection to victim (canary for mirror reachability)"],
+      "expected_suricata_sids": [9000002],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1021.004"
+    },
+    {
+      "id": "mirror-canary-synscan",
+      "category": "plumbing",
+      "attacks": ["TCP SYN scan threshold canary"],
+      "expected_suricata_sids": [9000003],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1595.001"
+    },
+    {
+      "id": "dns-tunneling",
+      "category": "exfil",
+      "attacks": [
+        "Long subdomain labels (>40 and >60 chars)",
+        "Hex-encoded subdomains",
+        "Base64-like subdomains",
+        "High-entropy subdomains",
+        "NULL record queries (dnscat2)",
+        "High-volume TXT queries",
+        "AXFR zone transfer"
+      ],
+      "expected_suricata_sids": [9000101, 9000102, 9000103, 9000104, 9000105, 9000109, 9000110, 9000111, 9000112],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1071.004"
+    },
+    {
+      "id": "dns-suspicious-tld",
+      "category": "exfil",
+      "attacks": ["Queries to .tk / .xyz / .onion TLDs"],
+      "expected_suricata_sids": [9000106, 9000107, 9000108],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1071.004"
+    },
+    {
+      "id": "web-url-evasion",
+      "category": "web",
+      "attacks": [
+        "Double/triple URL-encoded path traversal",
+        "Unicode full-width evasion",
+        "Double URL-encoded SQLi keywords",
+        "CRLF injection"
+      ],
+      "expected_suricata_sids": [9000201, 9000202, 9000203, 9000204, 9000205],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1027"
+    },
+    {
+      "id": "cloud-metadata-ssrf",
+      "category": "cloud",
+      "attacks": [
+        "AWS IMDS v1/v2 via SSRF",
+        "Azure IMDS access",
+        "GCP metadata access",
+        "Azure/GCP storage enumeration",
+        "Azure AD token endpoint probes"
+      ],
+      "expected_suricata_sids": [9000210, 9000211, 9000212, 9000213, 9000214, 9000215],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1552.005"
+    },
+    {
+      "id": "cloud-credential-exfil",
+      "category": "cloud",
+      "attacks": [
+        "AWS access key format (AKIA...) in POST body",
+        "GCP service account key JSON in POST"
+      ],
+      "expected_suricata_sids": [9000216, 9000217],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1552.001"
+    },
+    {
+      "id": "web-shells",
+      "category": "web",
+      "attacks": [
+        "c99 / r57 / b374k / WSO shell requests",
+        "Generic shell.php",
+        "China Chopper (z0 base64)",
+        "JSP webshell cmd parameter"
+      ],
+      "expected_suricata_sids": [9000301, 9000302, 9000303, 9000304, 9000305, 9000306, 9000307],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1505.003"
+    },
+    {
+      "id": "sqli-advanced",
+      "category": "web",
+      "attacks": [
+        "Time-based SQLi (SLEEP, WAITFOR DELAY)",
+        "Error-based SQLi (extractvalue)",
+        "UNION SELECT LOAD_FILE",
+        "INTO OUTFILE webshell write"
+      ],
+      "expected_suricata_sids": [9000310, 9000311, 9000312, 9000313, 9000314],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1190"
+    },
+    {
+      "id": "xss",
+      "category": "web",
+      "attacks": [
+        "SVG onload",
+        "javascript: protocol",
+        "body onload",
+        "img onerror"
+      ],
+      "expected_suricata_sids": [9000320, 9000321, 9000322, 9000323],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1059.007"
+    },
+    {
+      "id": "xxe-ssti-lfi-nosqli",
+      "category": "web",
+      "attacks": [
+        "XXE with file:// protocol",
+        "SSTI {{7*7}} template injection",
+        "PHP filter / data:// / expect:// wrappers",
+        "MongoDB $ne operator injection"
+      ],
+      "expected_suricata_sids": [9000330, 9000331, 9000332, 9000333, 9000334, 9000335],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1190"
+    },
+    {
+      "id": "ldap-injection",
+      "category": "ad",
+      "attacks": [
+        "LDAP wildcard injection in parameter",
+        "LDAP filter bypass (objectClass=*)"
+      ],
+      "expected_suricata_sids": [9000401, 9000402],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1087.002"
+    },
+    {
+      "id": "ad-auth-relay",
+      "category": "ad",
+      "attacks": [
+        "NTLM type 1 negotiate / type 3 response over HTTP",
+        "Kerberoasting SPN request",
+        "BloodHound SharpHound user-agent",
+        "Impacket user-agent",
+        "Responder user-agent"
+      ],
+      "expected_suricata_sids": [9000410, 9000411, 9000412, 9000413, 9000414, 9000415],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1558.003"
+    },
+    {
+      "id": "ad-srv-discovery",
+      "category": "ad",
+      "attacks": [
+        "_ldap._tcp SRV discovery",
+        "_kerberos._tcp SRV discovery",
+        "_gc._tcp (global catalog) SRV discovery"
+      ],
+      "expected_suricata_sids": [9000420, 9000421, 9000422],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1018"
+    },
+    {
+      "id": "ad-sensitive-access",
+      "category": "ad",
+      "attacks": [
+        "ADCS enrollment endpoint access",
+        "Groups.xml (GPP) cpassword hunting",
+        "ntds.dit access attempt",
+        "DCSync DRSUAPI request"
+      ],
+      "expected_suricata_sids": [9000423, 9000424, 9000425, 9000426],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1003.006"
+    },
+    {
+      "id": "ad-direct-ports",
+      "category": "ad",
+      "attacks": [
+        "Direct Kerberos TCP 88",
+        "Direct LDAP TCP 389",
+        "Direct LDAPS TCP 636"
+      ],
+      "expected_suricata_sids": [9000430, 9000431, 9000432],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1021"
+    },
+    {
+      "id": "supply-chain-packages",
+      "category": "supply-chain",
+      "attacks": [
+        "npm postinstall shell exec",
+        "npm postinstall cryptominer",
+        "PyPI setup.py shell exec",
+        "Known npm typosquat (eventstram)",
+        "Known pip typosquat (reqeusts)",
+        "Terraform registry TLD impersonation",
+        "npm CLI hitting non-registry host"
+      ],
+      "expected_suricata_sids": [9000501, 9000502, 9000503, 9000510, 9000511, 9000512, 9000513],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1195.002"
+    },
+    {
+      "id": "github-token-exfil",
+      "category": "supply-chain",
+      "attacks": [
+        "ghs_ server-token pattern in POST",
+        "ghp_ PAT pattern in POST"
+      ],
+      "expected_suricata_sids": [9000504, 9000505],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1552.001"
+    },
+    {
+      "id": "c2-frameworks",
+      "category": "c2",
+      "attacks": [
+        "Havoc news.html beacon",
+        "Brute Ratel api/search pattern",
+        "Mythic agent_message endpoint",
+        "Poshc2/Empire news.php task beacon",
+        "Cobalt-style CA00 submit.php",
+        "Periodic DNS beacon"
+      ],
+      "expected_suricata_sids": [9000601, 9000602, 9000603, 9000604, 9000605, 9000606],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1071.001"
+    },
+    {
+      "id": "c2-reverse-shell",
+      "category": "c2",
+      "attacks": [
+        "Bash reverse shell in URL",
+        "Python reverse shell import in URL"
+      ],
+      "expected_suricata_sids": [9000610, 9000611],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1059.004"
+    },
+    {
+      "id": "c2-covert-channels",
+      "category": "c2",
+      "attacks": [
+        "Large ICMP payload (tunneling)",
+        "ICMP with repeating pattern",
+        "DoH query to cloudflare-dns"
+      ],
+      "expected_suricata_sids": [9000612, 9000613, 9000614],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1095"
+    },
+    {
+      "id": "container-escape",
+      "category": "container",
+      "attacks": [
+        "Docker socket access",
+        "Privileged container creation",
+        "nsenter host namespace escape",
+        "cgroup release_agent escape",
+        "Registry catalog enumeration"
+      ],
+      "expected_suricata_sids": [9000701, 9000702, 9000703, 9000716, 9000718],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1611"
+    },
+    {
+      "id": "kubernetes-api-abuse",
+      "category": "container",
+      "attacks": [
+        "Direct k8s API server (6443)",
+        "Kubelet API (10250) direct",
+        "etcd direct (2379)",
+        "Kubelet exec endpoint",
+        "Secrets API enumeration",
+        "ClusterRoleBindings enumeration",
+        "Service account token theft"
+      ],
+      "expected_suricata_sids": [9000710, 9000711, 9000712, 9000713, 9000714, 9000715, 9000717],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1552.004"
+    },
+    {
+      "id": "api-abuse",
+      "category": "web",
+      "attacks": [
+        "GraphQL introspection",
+        "JWT 'none' algorithm",
+        "Mass assignment is_admin=true",
+        "OpenAPI/Swagger enumeration",
+        "HTTP verb tampering",
+        "Rate-limit bypass via X-Originating-IP",
+        "Webhook SSRF to IMDS",
+        "IDOR private resource enumeration"
+      ],
+      "expected_suricata_sids": [9000801, 9000802, 9000803, 9000804, 9000805, 9000806, 9000807, 9000808],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1190"
+    },
+    {
+      "id": "saas-exfil-tls",
+      "category": "exfil",
+      "attacks": [
+        "TLS SNI to Pastebin / transfer.sh / Discord / GitHub gist / telegra.ph"
+      ],
+      "expected_suricata_sids": [9000901, 9000902, 9000903, 9000904, 9000905],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1567.002"
+    },
+    {
+      "id": "saas-exfil-dns",
+      "category": "exfil",
+      "attacks": [
+        "DNS query for Pastebin / transfer.sh"
+      ],
+      "expected_suricata_sids": [9000910, 9000911],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1567.002"
+    },
+    {
+      "id": "tunneling-services",
+      "category": "c2",
+      "attacks": [
+        "ngrok / trycloudflare / serveo / localtunnel DNS and TLS SNI"
+      ],
+      "expected_suricata_sids": [9000920, 9000921, 9000922, 9000923, 9000924, 9000925],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1090"
+    },
+    {
+      "id": "lateral-smb-shares",
+      "category": "lateral",
+      "attacks": [
+        "SMB tree connect to ADMIN$ / C$ / IPC$"
+      ],
+      "expected_suricata_sids": [9001001, 9001002, 9001003],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1021.002"
+    },
+    {
+      "id": "lateral-named-pipes",
+      "category": "lateral",
+      "attacks": [
+        "PSEXESVC / svcctl / winreg / atsvc / samr / lsarpc named pipes via impacket"
+      ],
+      "expected_suricata_sids": [9001010, 9001011, 9001012, 9001013, 9001014, 9001015],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1021.002"
+    },
+    {
+      "id": "lateral-dcerpc-bind",
+      "category": "lateral",
+      "attacks": [
+        "DCERPC bind to svcctl / SAMR interface UUIDs"
+      ],
+      "expected_suricata_sids": [9001020, 9001021],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1021.002"
+    },
+    {
+      "id": "zeek-ssh-bruteforce",
+      "category": "creds",
+      "attacks": ["Hydra SSH brute-force (threshold 15 attempts)"],
+      "expected_suricata_sids": [],
+      "expected_zeek_notices": ["SSH::Password_Guessing"],
+      "mitre_technique": "T1110.001"
+    },
+    {
+      "id": "zeek-protocol-detection",
+      "category": "evasion",
+      "attacks": ["Service on non-standard port (triggers detect-protocols)"],
+      "expected_suricata_sids": [],
+      "expected_zeek_notices": ["ProtocolDetector::Protocol_Found", "ProtocolDetector::Server_Found"],
+      "mitre_technique": "T1571"
+    },
+    {
+      "id": "zeek-intel-framework",
+      "category": "intel",
+      "attacks": ["Traffic to URLhaus/Feodo indicators loaded from abuse.ch"],
+      "expected_suricata_sids": [],
+      "expected_zeek_notices": ["Intel::Notice"],
+      "mitre_technique": "T1071.001"
+    }
+  ]
+}
