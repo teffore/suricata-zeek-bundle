@@ -221,40 +221,60 @@ jobs:
               ip -br link show "$IF"
             '
 
-      - name: Install standalone.sh on sensor
+      - name: Install sensor + victim + attacker (parallel)
         run: |
-          # Let standalone.sh auto-detect the primary NIC (ens5). No --iface
-          # flag needed in single-ENI mode.
-          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            standalone.sh ubuntu@${{ steps.wait.outputs.sensor_ip }}:/tmp/standalone.sh
-          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.sensor_ip }} \
-            "sudo bash /tmp/standalone.sh --force"
-          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.sensor_ip }} '
+          # Three install flows on three different boxes — zero dependencies
+          # between them, so run concurrently and bound wall-clock by the
+          # slowest (sensor, ~3 min for standalone.sh).
+          #
+          # Each subshell redirects to its own tee'd log so CI can still
+          # surface the root cause of any install failure after `wait`.
+          SSH_OPTS="-i $HOME/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SENSOR_IP="${{ steps.wait.outputs.sensor_ip }}"
+          VICTIM_IP="${{ steps.wait.outputs.victim_ip }}"
+          ATTACKER_IP="${{ steps.wait.outputs.attacker_ip }}"
+
+          (
+            echo "--- SENSOR install ---"
+            scp $SSH_OPTS standalone.sh ubuntu@"$SENSOR_IP":/tmp/standalone.sh
+            # Let standalone.sh auto-detect the primary NIC (ens5). No --iface
+            # flag needed in single-ENI mode.
+            ssh $SSH_OPTS ubuntu@"$SENSOR_IP" "sudo bash /tmp/standalone.sh --force"
+            ssh $SSH_OPTS ubuntu@"$SENSOR_IP" '
               set -e
               systemctl is-active suricata
               sudo /opt/zeek/bin/zeekctl status
               sudo apt-get install -y -qq tcpdump jq
             '
+          ) > /tmp/sensor-install.log 2>&1 &
+          SENSOR_PID=$!
 
-      - name: Install victim services (nginx + sshd + Vulhub CVEs)
-        run: |
-          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            testing/victim_setup.sh ubuntu@${{ steps.wait.outputs.victim_ip }}:/tmp/victim_setup.sh
-          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.victim_ip }} \
-            "sudo bash /tmp/victim_setup.sh"
+          (
+            echo "--- VICTIM install ---"
+            scp $SSH_OPTS testing/victim_setup.sh ubuntu@"$VICTIM_IP":/tmp/victim_setup.sh
+            ssh $SSH_OPTS ubuntu@"$VICTIM_IP" "sudo bash /tmp/victim_setup.sh"
+          ) > /tmp/victim-install.log 2>&1 &
+          VICTIM_PID=$!
 
-      - name: Install attacker toolkit
-        run: |
-          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            testing/attacker_setup.sh ubuntu@${{ steps.wait.outputs.attacker_ip }}:/tmp/attacker_setup.sh
-          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            testing/run_attacks.sh ubuntu@${{ steps.wait.outputs.attacker_ip }}:/tmp/run_attacks.sh
-          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
-            "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
+          (
+            echo "--- ATTACKER install ---"
+            scp $SSH_OPTS testing/attacker_setup.sh ubuntu@"$ATTACKER_IP":/tmp/attacker_setup.sh
+            scp $SSH_OPTS testing/run_attacks.sh   ubuntu@"$ATTACKER_IP":/tmp/run_attacks.sh
+            ssh $SSH_OPTS ubuntu@"$ATTACKER_IP" "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
+          ) > /tmp/attacker-install.log 2>&1 &
+          ATTACKER_PID=$!
+
+          fail=0
+          wait $SENSOR_PID   || { echo "SENSOR install failed";   fail=1; }
+          wait $VICTIM_PID   || { echo "VICTIM install failed";   fail=1; }
+          wait $ATTACKER_PID || { echo "ATTACKER install failed"; fail=1; }
+
+          # Always dump logs so success or failure is traceable in CI output.
+          echo "::group::sensor-install.log";   cat /tmp/sensor-install.log;   echo "::endgroup::"
+          echo "::group::victim-install.log";   cat /tmp/victim-install.log;   echo "::endgroup::"
+          echo "::group::attacker-install.log"; cat /tmp/attacker-install.log; echo "::endgroup::"
+
+          [ "$fail" = 0 ] || exit 1
 
       - name: Verify attacker tools present
         run: |
