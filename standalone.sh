@@ -1024,14 +1024,16 @@ alert dns any any -> any any (msg:"C2 - Periodic DNS beacon pattern"; \
   threshold:type both, track by_src, count 3, seconds 30; \
   sid:9000606; rev:1; classtype:trojan-activity;)
 
-# Reverse shell command patterns
+# Reverse shell command patterns — match against Suricata's normalized http.uri
+# buffer which holds the URI as sent on the wire. Attackers rarely double-encode
+# slashes or commas, so rules key on the literal forms.
 alert http any any -> any any (msg:"RCE - Bash reverse shell in URL"; \
-  http.uri; content:"bash"; nocase; content:"%2Fdev%2Ftcp%2F"; nocase; \
-  sid:9000610; rev:1; classtype:attempted-admin;)
+  http.uri; content:"bash"; nocase; content:"/dev/tcp/"; nocase; \
+  sid:9000610; rev:2; classtype:attempted-admin;)
 
 alert http any any -> any any (msg:"RCE - Python reverse shell import pattern"; \
-  http.uri; content:"python"; nocase; content:"socket%2Csubprocess%2Cos"; nocase; \
-  sid:9000611; rev:1; classtype:attempted-admin;)
+  http.uri; content:"python"; nocase; content:"socket,subprocess,os"; nocase; \
+  sid:9000611; rev:2; classtype:attempted-admin;)
 
 # ICMP tunneling (large data payload)
 alert icmp any any -> any any (msg:"C2 - Large ICMP payload (possible tunneling)"; \

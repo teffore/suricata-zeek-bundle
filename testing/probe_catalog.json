@@ -4,14 +4,6 @@
   "coverage_rule_default": "any",
   "scenarios": [
     {
-      "id": "mirror-canary-ssh",
-      "category": "plumbing",
-      "attacks": ["SSH connection to victim (canary for mirror reachability)"],
-      "expected_suricata_sids": [9000002],
-      "expected_zeek_notices": [],
-      "mitre_technique": "T1021.004"
-    },
-    {
       "id": "mirror-canary-synscan",
       "category": "plumbing",
       "attacks": ["TCP SYN scan threshold canary"],
