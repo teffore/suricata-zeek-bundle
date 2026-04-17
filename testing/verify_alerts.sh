@@ -1,12 +1,21 @@
 #!/bin/bash
-# verify_alerts.sh — Runs on the Suricata instance to check that alerts were generated.
+# verify_alerts.sh — Runs on the Suricata instance to check that the attack
+# battery generated the alerts we expected (coverage gate), not just any alerts.
 # Usage: ./verify_alerts.sh
-# Exit code: 0 = alerts detected (pass), 1 = no alerts (fail)
+# Exit code: 0 = both gates pass, 1 = either gate fails
+#   Gate 1: MIN_ALERTS sanity — pipeline is alive
+#   Gate 2: COVERAGE_MIN_PCT — at least N% of catalog scenarios had
+#           an expected SID or Zeek notice fire
 set +e
 
 LOG="/var/log/suricata/fast.log"
 EVE="/var/log/suricata/eve.json"
+CATALOG="/tmp/probe_catalog.json"
+COVERAGE_OUT="/tmp/probe-to-sid-coverage.json"
 MIN_ALERTS=3
+# Loose initial gate while the catalog stabilizes. Tighten to 80+ once the
+# expected SIDs stop drifting.
+COVERAGE_MIN_PCT=50
 
 echo "=== Verifying Suricata alerts ==="
 
@@ -123,13 +132,113 @@ if [[ -d "${ZEEK_LOGS}" ]]; then
   fi
 fi
 
-# Verdict
+# === Coverage report — join fired SIDs/notices against the probe catalog ===
+echo ""
+echo "=== Coverage report (scenario -> expected SID / notice) ==="
+COVERAGE_PASS=1   # 0 = fail, 1 = pass (default pass so missing catalog doesn't block)
+
+if [[ ! -f "${CATALOG}" ]]; then
+  echo "WARNING: ${CATALOG} not present on sensor; skipping coverage gate"
+else
+  # Fired Suricata SIDs (unique, as JSON array of numbers).
+  FIRED_SIDS_JSON="/tmp/fired_sids.json"
+  if [[ -f "${EVE}" ]]; then
+    jq -r 'select(.event_type=="alert") | .alert.signature_id' "${EVE}" 2>/dev/null \
+      | sort -un \
+      | jq -nR '[inputs | select(length>0) | tonumber]' > "${FIRED_SIDS_JSON}"
+  else
+    echo '[]' > "${FIRED_SIDS_JSON}"
+  fi
+
+  # Fired Zeek notices (unique, as JSON array of strings).
+  FIRED_NOTICES_JSON="/tmp/fired_notices.json"
+  if [[ -f "${ZEEK_LOGS}/notice.log" ]]; then
+    jq -r '.note // empty' "${ZEEK_LOGS}/notice.log" 2>/dev/null \
+      | sort -u \
+      | jq -nR '[inputs | select(length>0)]' > "${FIRED_NOTICES_JSON}"
+  else
+    echo '[]' > "${FIRED_NOTICES_JSON}"
+  fi
+
+  echo "Fired SIDs     : $(jq 'length' "${FIRED_SIDS_JSON}")"
+  echo "Fired notices  : $(jq 'length' "${FIRED_NOTICES_JSON}")"
+
+  # Join. Each scenario gets fired/missed lists for both SIDs and notices;
+  # covered = no expectation, OR any expected SID fired, OR any expected notice fired.
+  jq --slurpfile fsids "${FIRED_SIDS_JSON}" \
+     --slurpfile fnotices "${FIRED_NOTICES_JSON}" '
+    ($fsids[0]) as $FS |
+    ($fnotices[0]) as $FN |
+    (.scenarios | map(
+      . as $s |
+      {
+        id: $s.id,
+        category: $s.category,
+        mitre: $s.mitre_technique,
+        expected_sids: $s.expected_suricata_sids,
+        fired_sids: [$s.expected_suricata_sids[] | select(. as $sid | $FS | index($sid))],
+        missed_sids: [$s.expected_suricata_sids[] | select(. as $sid | ($FS | index($sid)) | not)],
+        expected_notices: $s.expected_zeek_notices,
+        fired_notices: [$s.expected_zeek_notices[] | select(. as $n | $FN | index($n))],
+        missed_notices: [$s.expected_zeek_notices[] | select(. as $n | ($FN | index($n)) | not)]
+      } |
+      .covered = (
+        (((.expected_sids | length) == 0) and ((.expected_notices | length) == 0))
+        or ((.fired_sids | length) > 0)
+        or ((.fired_notices | length) > 0)
+      )
+    )) as $scenarios |
+    {
+      total: ($scenarios | length),
+      covered: ($scenarios | map(select(.covered)) | length),
+      scenarios: $scenarios
+    }' "${CATALOG}" > "${COVERAGE_OUT}"
+
+  TOTAL_SCEN=$(jq '.total' "${COVERAGE_OUT}")
+  COVERED_SCEN=$(jq '.covered' "${COVERAGE_OUT}")
+  if [[ "${TOTAL_SCEN}" -gt 0 ]]; then
+    PCT=$((100 * COVERED_SCEN / TOTAL_SCEN))
+  else
+    PCT=0
+  fi
+
+  echo ""
+  echo "--- Per-scenario coverage (PASS/MISS, sids fired/expected, notices fired/expected) ---"
+  jq -r '.scenarios[] | [
+      (if .covered then "PASS" else "MISS" end),
+      .id,
+      "sids=\((.fired_sids|length))/\((.expected_sids|length))",
+      "notices=\((.fired_notices|length))/\((.expected_notices|length))",
+      .mitre
+    ] | @tsv' "${COVERAGE_OUT}" | column -t -s $'\t'
+
+  echo ""
+  echo "--- Missed SIDs (scenarios where an expected SID did not fire) ---"
+  jq -r '.scenarios[] | select(.missed_sids | length > 0) |
+    "\(.id): missing \(.missed_sids | map(tostring) | join(","))"' "${COVERAGE_OUT}" | head -40
+
+  echo ""
+  echo "Coverage: ${COVERED_SCEN}/${TOTAL_SCEN} scenarios (${PCT}%, gate=${COVERAGE_MIN_PCT}%)"
+  if [[ "${PCT}" -lt "${COVERAGE_MIN_PCT}" ]]; then
+    COVERAGE_PASS=0
+  fi
+fi
+
+# === Verdict ===
 echo ""
 TOTAL=$((FAST_COUNT + ALERT_COUNT))
-if [[ "${TOTAL}" -ge "${MIN_ALERTS}" ]]; then
-  echo "PASS: Suricata detected alerts (fast=${FAST_COUNT}, eve=${ALERT_COUNT})"
+SANITY_PASS=1
+if [[ "${TOTAL}" -lt "${MIN_ALERTS}" ]]; then
+  SANITY_PASS=0
+fi
+
+if [[ "${SANITY_PASS}" -eq 1 && "${COVERAGE_PASS}" -eq 1 ]]; then
+  echo "PASS: sanity (fast=${FAST_COUNT}, eve=${ALERT_COUNT}) + coverage gate"
   exit 0
 else
-  echo "FAIL: Not enough alerts detected (fast=${FAST_COUNT}, eve=${ALERT_COUNT}, min=${MIN_ALERTS})"
+  [[ "${SANITY_PASS}" -eq 0 ]] && \
+    echo "FAIL (sanity): fast=${FAST_COUNT}, eve=${ALERT_COUNT}, min=${MIN_ALERTS}"
+  [[ "${COVERAGE_PASS}" -eq 0 ]] && \
+    echo "FAIL (coverage): ${COVERED_SCEN}/${TOTAL_SCEN} covered (${PCT}%), gate=${COVERAGE_MIN_PCT}%"
   exit 1
 fi
