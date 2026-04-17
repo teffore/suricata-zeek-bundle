@@ -214,26 +214,13 @@ jobs:
               sudo apt-get install -y -qq tcpdump jq
             '
 
-      - name: Install victim services (nginx + sshd)
+      - name: Install victim services (nginx + sshd + Vulhub CVEs)
         run: |
+          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            testing/victim_setup.sh ubuntu@${{ steps.wait.outputs.victim_ip }}:/tmp/victim_setup.sh
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.victim_ip }} '
-              set -e
-              sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx openssh-server
-              # Respond 200 "ok" on every path so attacker probes get a
-              # response (and path-sensitive rules see realistic wire
-              # patterns, not 404s).
-              sudo tee /etc/nginx/sites-available/default > /dev/null <<CONF
-          server {
-              listen 80 default_server;
-              server_name _;
-              location / { return 200 "ok\n"; add_header Content-Type text/plain; }
-          }
-          CONF
-              sudo systemctl restart nginx
-              sudo systemctl enable --now ssh
-            '
+            ubuntu@${{ steps.wait.outputs.victim_ip }} \
+            "sudo bash /tmp/victim_setup.sh"
 
       - name: Install attacker toolkit
         run: |
