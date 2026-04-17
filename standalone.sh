@@ -137,7 +137,7 @@ fi
 
 add-apt-repository -y ppa:oisf/suricata-stable
 apt-get update -y
-apt-get install -y suricata jq logrotate
+apt-get install -y suricata logrotate
 
 # Stop suricata (apt auto-starts it with eth0 which fails)
 systemctl stop suricata || true
@@ -163,14 +163,37 @@ for f in classification.config reference.config threshold.config; do
   fi
 done
 
-# Enable extra rule sources
-suricata-update enable-source tgreen/hunting
-suricata-update enable-source ptresearch/attackdetection
-suricata-update enable-source sslbl/ssl-fp-blacklist
-suricata-update enable-source sslbl/ja3-fingerprints
-suricata-update enable-source etnetera/aggressive
+# Refresh the suricata-update source catalog so enable-source knows about
+# current feed names (without this, every enable-source below warns "Source
+# index does not exist, will use bundled one" and misses recent renames).
+suricata-update update-sources
 
-# Update rules (puts them in /var/lib/suricata/rules/)
+# Enable extra rule sources beyond ET Open (which is on by default):
+#   tgreen/hunting         — Travis Green's hunting pack (CVE-era exploit sigs)
+#   etnetera/aggressive    — Etnetera aggressive ruleset (high-FP, high-signal)
+#   abuse.ch/sslbl-blacklist — TLS certs from known-bad infra (was sslbl/ssl-fp-blacklist)
+#   abuse.ch/sslbl-ja3     — JA3 client fingerprints of malware families (was sslbl/ja3-fingerprints)
+# Previously enabled: ptresearch/attackdetection — removed, no longer exists upstream.
+suricata-update enable-source tgreen/hunting
+suricata-update enable-source etnetera/aggressive
+suricata-update enable-source abuse.ch/sslbl-blacklist
+suricata-update enable-source abuse.ch/sslbl-ja3
+
+# Mute two high-volume low-value signatures:
+#   - SURICATA HTTP Response excessive header repetition: a stream decoder
+#     event that fires on any repeated response header. Dominated the alert
+#     output (~67%) in prior CI runs.
+#   - SID 9000002 (TEST - SSH connection to HOME_NET): the custom canary
+#     fires on our own management SSH in single-ENI mirror mode. Keep the
+#     rule for manual smoke-testing but disable the noisy auto-fire.
+install -d -m 0755 /etc/suricata
+cat > /etc/suricata/disable.conf <<'DISABLE'
+re: SURICATA HTTP Response excessive header repetition
+9000002
+DISABLE
+
+# Update rules (puts them in /var/lib/suricata/rules/). suricata-update
+# honors /etc/suricata/disable.conf on every run.
 suricata-update
 
 # Fix interface in suricata.yaml AFTER suricata-update
