@@ -269,12 +269,12 @@ jobs:
           aws ec2 create-traffic-mirror-filter-rule \
             --traffic-mirror-filter-id "$FILTER_ID" \
             --traffic-direction ingress --rule-number 100 \
-            --rule-action accept --protocol -1 \
+            --rule-action accept \
             --destination-cidr-block 0.0.0.0/0 --source-cidr-block 0.0.0.0/0 >/dev/null
           aws ec2 create-traffic-mirror-filter-rule \
             --traffic-mirror-filter-id "$FILTER_ID" \
             --traffic-direction egress --rule-number 100 \
-            --rule-action accept --protocol -1 \
+            --rule-action accept \
             --destination-cidr-block 0.0.0.0/0 --source-cidr-block 0.0.0.0/0 >/dev/null
           SESS_ID=$(aws ec2 create-traffic-mirror-session \
             --network-interface-id "${{ steps.wait.outputs.victim_eni }}" \
