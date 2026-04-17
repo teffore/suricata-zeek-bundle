@@ -86,9 +86,18 @@ fi
 # the templates map 1:1 to published CVEs so alert triage is straightforward.
 echo "=== Installing nuclei ==="
 if ! command -v nuclei >/dev/null 2>&1; then
-  NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_linux_amd64.zip"
+  # Release assets are versioned (e.g. nuclei_3.4.1_linux_amd64.zip) so the
+  # /releases/latest/download/<name> shortcut 404s. Resolve the real asset
+  # URL via the API.
+  apt-get install -y -qq unzip jq
+  NUCLEI_URL=$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
+    | jq -r '.assets[] | select(.name | test("linux_amd64\\.zip$")) | .browser_download_url' \
+    | head -1)
+  if [ -z "$NUCLEI_URL" ]; then
+    echo "FAIL: could not resolve nuclei linux_amd64.zip asset URL from upstream release" >&2
+    exit 1
+  fi
   curl -fsSL "$NUCLEI_URL" -o /tmp/nuclei.zip
-  apt-get install -y -qq unzip
   unzip -o /tmp/nuclei.zip -d /tmp/nuclei-extract
   mv /tmp/nuclei-extract/nuclei /usr/local/bin/nuclei
   chmod +x /usr/local/bin/nuclei
@@ -106,7 +115,14 @@ echo "  nuclei: $(nuclei -version 2>&1 | head -1)"
 # (victim-ENI mirror alone won't see attacker->internet traffic).
 echo "=== Installing flightsim ==="
 if ! command -v flightsim >/dev/null 2>&1; then
-  FLIGHTSIM_URL="https://github.com/alphasoc/flightsim/releases/latest/download/flightsim_linux_x86_64.tar.gz"
+  # Same versioned-asset issue as nuclei — resolve via API.
+  FLIGHTSIM_URL=$(curl -fsSL https://api.github.com/repos/alphasoc/flightsim/releases/latest \
+    | jq -r '.assets[] | select(.name | test("linux_x86_64\\.tar\\.gz$")) | .browser_download_url' \
+    | head -1)
+  if [ -z "$FLIGHTSIM_URL" ]; then
+    echo "FAIL: could not resolve flightsim linux_x86_64.tar.gz asset URL from upstream release" >&2
+    exit 1
+  fi
   curl -fsSL "$FLIGHTSIM_URL" -o /tmp/flightsim.tgz
   tar -xzf /tmp/flightsim.tgz -C /tmp/
   # Archive layout is flightsim_<ver>_linux_x86_64/flightsim; find the binary.
@@ -115,7 +131,8 @@ if ! command -v flightsim >/dev/null 2>&1; then
     mv "$FLIGHTSIM_BIN" /usr/local/bin/flightsim
     chmod +x /usr/local/bin/flightsim
   else
-    echo "WARN: flightsim binary not found in tarball" >&2
+    echo "FAIL: flightsim binary not found in tarball at $FLIGHTSIM_URL" >&2
+    exit 1
   fi
   rm -rf /tmp/flightsim.tgz /tmp/flightsim_*
 fi
