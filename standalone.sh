@@ -3,6 +3,20 @@
 #
 # Usage:
 #   sudo bash standalone.sh [--force] [--preserve-config] [--iface <name>]
+#
+# Deliberately OUT OF SCOPE for this script (see audit at
+# C:\Users\matth\.claude\plans\sunny-mixing-kahn.md for rationale):
+#   - Off-box log shipping (Filebeat / Vector → S3 / OpenSearch / Wazuh)
+#   - Prometheus / telemetry endpoints
+#   - Dual-ENI split for mgmt vs. mirror capture
+#   - Migration off burstable t3.medium to c6i.large / Graviton
+#   - IMDSv2 enforcement + SSM-only management + close SSH SG (Terraform)
+#   - Narrowing HOME_NET from full RFC 1918 to the VPC CIDR
+#   - Gating etnetera/aggressive + tgreen/hunting behind a hunt-mode flag
+#   - zkg packages (FoxIO JA4 for Zeek, BZAR, long-connections, etc.)
+#   - Suricata datasets for URLhaus / Feodo IOC matching
+#   - File-store v2, conditional PCAP
+#   - systemd sandboxing (CapabilityBoundingSet, NoNewPrivileges, etc.)
 set -e
 
 FORCE=0
@@ -169,14 +183,14 @@ done
 suricata-update update-sources
 
 # Enable extra rule sources beyond ET Open (which is on by default):
-#   tgreen/hunting         — Travis Green's hunting pack (CVE-era exploit sigs)
-#   etnetera/aggressive    — Etnetera aggressive ruleset (high-FP, high-signal)
-#   abuse.ch/sslbl-blacklist — TLS certs from known-bad infra (was sslbl/ssl-fp-blacklist)
-#   abuse.ch/sslbl-ja3     — JA3 client fingerprints of malware families (was sslbl/ja3-fingerprints)
-# Previously enabled: ptresearch/attackdetection — removed, no longer exists upstream.
+#   tgreen/hunting       — Travis Green's hunting pack (CVE-era exploit sigs)
+#   etnetera/aggressive  — Etnetera aggressive ruleset (high-FP, high-signal)
+#   abuse.ch/sslbl-ja3   — JA3 client fingerprints of malware families
+# Previously enabled (removed):
+#   ptresearch/attackdetection — obsolete, no longer exists upstream
+#   abuse.ch/sslbl-blacklist — IP list retired by abuse.ch on 2025-01-03
 suricata-update enable-source tgreen/hunting
 suricata-update enable-source etnetera/aggressive
-suricata-update enable-source abuse.ch/sslbl-blacklist
 suricata-update enable-source abuse.ch/sslbl-ja3
 
 # Mute one high-volume low-value signature via suricata-update's disable.conf:
@@ -241,10 +255,24 @@ sed -i 's/spm-algo: auto/spm-algo: hs/' /etc/suricata/suricata.yaml
 #     flows it only sees one direction of. The OISF default yaml has
 #     this commented as `#   async-oneside: false` under the `stream:`
 #     block — we just uncomment and flip to true.
-# (b) max-pending-packets: docs recommend 10000+ for typical sensors;
-#     default 1024 can drop packets under attack-burst conditions.
+# (b) max-pending-packets: docs recommend 10000+ for 8+ core hosts;
+#     we use 5000 to right-size for the 2-vCPU t3.medium sensor
+#     (RAM-bound before queue-depth-bound at this size).
 sed -i 's/^#   async-oneside: false.*/  async-oneside: true/' /etc/suricata/suricata.yaml
-sed -i 's/^max-pending-packets: 1024/max-pending-packets: 10000/' /etc/suricata/suricata.yaml
+sed -i 's/^max-pending-packets: 1024/max-pending-packets: 5000/' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #10: JA4 TLS fingerprint ----------
+# JA4 (and JA4+) supersedes JA3 as the standard client TLS fingerprint
+# in 2026 — JA3 is widely evaded. Suricata 8.0 ships JA4 client support
+# natively. JA4S/H/X are not implemented upstream (patent policy).
+sed -i 's/#\s*ja4-fingerprints: .*/ja4-fingerprints: yes/' /etc/suricata/suricata.yaml
+grep -q "ja4-fingerprints: yes" /etc/suricata/suricata.yaml || \
+  sed -i '/^\s*ja3-fingerprints:/a\      ja4-fingerprints: yes' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #11: HASSH (SSH client fingerprint) ----------
+# SSH equivalent of JA3 — fingerprints the SSH client's algorithm
+# proposal. Cheap to compute, useful for lateral-movement detection.
+sed -i 's/#\s*hassh: .*/hassh: yes/' /etc/suricata/suricata.yaml
 
 # ---------- Enhancement #7: Anomaly Logging ----------
 # Logs protocol violations and malformed packets — catches things
@@ -320,7 +348,7 @@ else
 fi
 
 echo "Config updated with interface: ${PRIMARY_IF}"
-echo "Enhancements applied: community-id, tls/ja3, metadata, daily updates, log rotation (HUP), hyperscan, anomaly, non-root, async-oneside, max-pending-packets"
+echo "Enhancements applied: community-id, tls/ja3, ja4, hassh, metadata, daily updates, log rotation (HUP), hyperscan, anomaly, non-root, async-oneside, max-pending-packets=5000"
 
 # Validate config (as the suricata user so it doesn't create
 # root-owned log files in /var/log/suricata that block the daemon
@@ -379,6 +407,11 @@ EOF
 #   notices on real traffic patterns.
 cat >> /opt/zeek/share/zeek/site/local.zeek <<'EOF'
 
+# ---- Output format: JSON for SIEM-friendliness.
+# NOTE: zeek-cut only reads TSV; anything downstream that pipes through
+# zeek-cut must be updated. Nothing in this repo uses it today.
+@load policy/tuning/json-logs
+
 # Community ID hash on conn.log for SIEM correlation with Suricata
 @load policy/protocols/conn/community-id-logging
 
@@ -389,8 +422,36 @@ cat >> /opt/zeek/share/zeek/site/local.zeek <<'EOF'
 @load frameworks/files/detect-MHR
 @load frameworks/intel/seen
 
-# Lower SSH brute-force threshold to match short-burst test runs
-redef SSH::password_guesses_limit = 5;
+# ---- Capture-loss: emits capture_loss.log every 15 min + notices
+# (CaptureLoss::Too_Much_Loss / Too_Little_Traffic) on threshold.
+# Primary signal that the VPC mirror is delivering packets.
+@load policy/misc/capture-loss
+
+# ---- Intel hits become notices (currently only populate intel.log).
+# No-op until /opt/zeek/intel/intel.dat has meta.do_notice=T rows;
+# loading the policy script is free, and the row-level flag can
+# land in a follow-up.
+@load policy/frameworks/intel/do_notice
+
+# ---- SSL cert hygiene
+@load policy/protocols/ssl/validate-certs      # adds validation_status to ssl.log
+@load policy/protocols/ssl/log-hostcerts-only  # ~10x smaller x509.log (drop intermediates)
+@load policy/protocols/ssl/expiring-certs      # notice when a cert expires within 30d
+
+# ---- Behavioral fingerprinting of the VPC (new host / service as anomaly basis)
+@load policy/protocols/conn/known-hosts
+@load policy/protocols/conn/known-services
+
+# ---- Protocol discovery (catches services on non-standard ports,
+# e.g. shells on 443). Replaces deprecated dpd/detect-protocols.
+@load policy/frameworks/analyzer/detect-protocols
+
+# ---- Enable SHA256 on all files; detect-MHR (loaded above) benefits.
+@load policy/frameworks/files/hash-all-files
+
+# SSH brute-force threshold — 5 trips on ordinary DevOps automation.
+# Default is 30; 15 is a middle ground that still catches hydra bursts.
+redef SSH::password_guesses_limit = 15;
 
 # Iteration 8 — volumetric detection via stats framework. Stock
 # Zeek 8 doesn't ship misc/scan (that's a zkg package, separate
