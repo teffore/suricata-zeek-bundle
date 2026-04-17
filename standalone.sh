@@ -151,9 +151,26 @@ fi
 
 add-apt-repository -y ppa:oisf/suricata-stable
 apt-get update -y
+
+# Prevent Suricata's postinst from auto-starting the daemon. With the
+# shipped default config it tries interface=eth0 (NIC is ens5 on Nitro)
+# and rule-path=/var/lib/suricata/rules/suricata.rules (doesn't exist
+# yet — suricata-update hasn't run). Auto-start floods journalctl with
+# ~5 scary-but-transient errors per install. Block it with policy-rc.d
+# (invoke-rc.d respects 'exit 101' = action not allowed); we start the
+# daemon manually at the end of this block with the correct config.
+cat > /usr/sbin/policy-rc.d <<'PRC'
+#!/bin/sh
+exit 101
+PRC
+chmod +x /usr/sbin/policy-rc.d
+
 apt-get install -y suricata logrotate
 
-# Stop suricata (apt auto-starts it with eth0 which fails)
+rm -f /usr/sbin/policy-rc.d
+
+# Belt-and-suspenders: even with policy-rc.d, some edge cases can
+# leave the service running. Stop any stale instance before we edit.
 systemctl stop suricata || true
 
 # Fix /etc/default/suricata — older Ubuntu Suricata packages read IFACE from
