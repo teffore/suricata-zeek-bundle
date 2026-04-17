@@ -1,0 +1,199 @@
+# Validates standalone.sh on an ephemeral EC2 instance per run.
+#
+# Flow: OIDC -> assume IAM role -> launch fresh t3.medium Ubuntu 22.04 ->
+#       scp standalone.sh over SSH -> run it -> verify services ->
+#       terminate instance + delete key pair + delete security group.
+#
+# One-time AWS setup required before this works: see .github/AWS_SETUP.md.
+#
+# Notes:
+# - Fork PRs will fail at the OIDC step by design (they don't get secrets or
+#   a trusted OIDC token). Maintainer branches on the same repo do get them.
+# - SSH is opened only to the runner's public IP for the duration of the job.
+
+name: Validate standalone.sh on EC2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - standalone.sh
+      - .github/workflows/validate-standalone.yml
+  pull_request:
+    paths:
+      - standalone.sh
+      - .github/workflows/validate-standalone.yml
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_TYPE: t3.medium
+
+jobs:
+  ec2-install:
+    name: Install on ephemeral EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set run context
+        id: ctx
+        run: |
+          RUN_TAG="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          MY_IP=$(curl -fsSL https://checkip.amazonaws.com)
+          AMI_ID=$(aws ssm get-parameter \
+            --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+            --query Parameter.Value --output text)
+          echo "run_tag=${RUN_TAG}" >> "$GITHUB_OUTPUT"
+          echo "my_ip=${MY_IP}" >> "$GITHUB_OUTPUT"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve default VPC + subnet
+        id: net
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values=$VPC_ID Name=default-for-az,Values=true \
+            --query 'Subnets[0].SubnetId' --output text)
+          echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
+          echo "subnet_id=${SUBNET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate ephemeral SSH key + register pair
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/gha_id -N '' -q
+          chmod 600 ~/.ssh/gha_id
+          aws ec2 import-key-pair \
+            --key-name "${{ steps.ctx.outputs.run_tag }}" \
+            --public-key-material "fileb://$HOME/.ssh/gha_id.pub"
+
+      - name: Create security group (SSH from runner IP only)
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "${{ steps.ctx.outputs.run_tag }}" \
+            --description "ephemeral GHA test run" \
+            --vpc-id "${{ steps.net.outputs.vpc_id }}" \
+            --query GroupId --output text)
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp --port 22 \
+            --cidr "${{ steps.ctx.outputs.my_ip }}/32"
+          echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Launch EC2 instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ steps.ctx.outputs.ami_id }}" \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --key-name "${{ steps.ctx.outputs.run_tag }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
+            --subnet-id "${{ steps.net.outputs.subnet_id }}" \
+            --associate-public-ip-address \
+            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=20,VolumeType=gp3}' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for instance + resolve public IP
+        id: wait
+        run: |
+          aws ec2 wait instance-running --instance-ids "${{ steps.ec2.outputs.instance_id }}"
+          aws ec2 wait instance-status-ok --instance-ids "${{ steps.ec2.outputs.instance_id }}"
+          IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "public_ip=${IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 30); do
+            if nc -z -w 5 "${{ steps.wait.outputs.public_ip }}" 22; then
+              echo "SSH is up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "SSH never came up"; exit 1
+
+      - name: Wait for cloud-init
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.public_ip }} "cloud-init status --wait"
+
+      - name: Copy standalone.sh and run installer
+        run: |
+          scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            standalone.sh ubuntu@${{ steps.wait.outputs.public_ip }}:/tmp/standalone.sh
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.public_ip }} \
+            "sudo bash /tmp/standalone.sh --force"
+
+      - name: Verify Suricata is active and on 8.x
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.public_ip }} '
+              set -e
+              systemctl is-active suricata
+              suricata --build-info | head -1
+              suricata --build-info | grep -qE "This is Suricata version 8\." \
+                || { echo "Suricata is not 8.x"; exit 1; }
+              sudo -u suricata suricata -T
+            '
+
+      - name: Verify Zeek is running and on 8.x
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.public_ip }} '
+              set -e
+              /opt/zeek/bin/zeekctl status
+              /opt/zeek/bin/zeek --version
+              /opt/zeek/bin/zeek --version 2>&1 | grep -qE "version 8\." \
+                || { echo "Zeek is not 8.x"; exit 1; }
+            '
+
+      - name: Dump logs on failure
+        if: failure() && steps.wait.outputs.public_ip != ''
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.public_ip }} '
+              echo "=== /var/log/suricata-setup.log ==="
+              sudo tail -500 /var/log/suricata-setup.log 2>/dev/null || true
+              echo "=== journalctl -u suricata ==="
+              sudo journalctl -u suricata --no-pager -n 200 || true
+              echo "=== /var/log/suricata/suricata.log ==="
+              sudo tail -200 /var/log/suricata/suricata.log 2>/dev/null || true
+              echo "=== zeekctl diag ==="
+              sudo /opt/zeek/bin/zeekctl diag 2>/dev/null || true
+            ' || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          if [ -n "${{ steps.ec2.outputs.instance_id }}" ]; then
+            aws ec2 terminate-instances \
+              --instance-ids "${{ steps.ec2.outputs.instance_id }}" >/dev/null 2>&1 || true
+            aws ec2 wait instance-terminated \
+              --instance-ids "${{ steps.ec2.outputs.instance_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.sg.outputs.sg_id }}" ]; then
+            aws ec2 delete-security-group \
+              --group-id "${{ steps.sg.outputs.sg_id }}" 2>/dev/null || true
+          fi
+          aws ec2 delete-key-pair \
+            --key-name "${{ steps.ctx.outputs.run_tag }}" 2>/dev/null || true
