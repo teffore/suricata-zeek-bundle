@@ -139,15 +139,6 @@ add-apt-repository -y ppa:oisf/suricata-stable
 apt-get update -y
 apt-get install -y suricata jq logrotate
 
-# yq for path-targeted edits to suricata.yaml (replaces fragile string-replace).
-# Ubuntu's apt yq is a different tool (jq-wrapper); we want Mike Farah's Go yq.
-if ! command -v yq >/dev/null 2>&1; then
-  YQ_VERSION=v4.44.3
-  curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
-    -o /usr/local/bin/yq
-  chmod +x /usr/local/bin/yq
-fi
-
 # Stop suricata (apt auto-starts it with eth0 which fails)
 systemctl stop suricata || true
 
@@ -209,11 +200,12 @@ sed -i 's/#\s*ja3-fingerprints: auto/ja3-fingerprints: auto/' /etc/suricata/suri
 sed -i 's/ja3-fingerprints: no/ja3-fingerprints: yes/' /etc/suricata/suricata.yaml
 
 # ---------- Enhancement #3: Alert Metadata ----------
-# Adds CVE numbers, affected products, attack descriptions, and
-# rule references to alert output — gives full context instead of
-# just the rule name. yq walks the parsed yaml tree and flips any
-# 'metadata' key it finds to true; robust against layout drift.
-yq -i '(.. | select(has("metadata"))).metadata = true' /etc/suricata/suricata.yaml
+# Adds CVE numbers, affected products, attack descriptions, and rule
+# references to alert output — gives full context instead of just the
+# rule name. sed (both commented + uncommented forms) because the
+# target is a comment-hidden key in the shipped yaml.
+sed -i 's/# metadata: no/metadata: yes/' /etc/suricata/suricata.yaml
+sed -i 's/metadata: no/metadata: yes/' /etc/suricata/suricata.yaml
 
 # ---------- Enhancement #6: Hyperscan Pattern Matching ----------
 # Switches multi-pattern matching from default (AC) to Hyperscan,
@@ -240,7 +232,7 @@ sed -i 's/^max-pending-packets: 1024/max-pending-packets: 10000/' /etc/suricata/
 # headers, and protocol mismatches. Attackers often trigger these.
 # sed (not yq) because yq discards comments — and these edits are
 # uncommenting comment-hidden yaml entries.
-sed -i 's/^\(\s*\)# - anomaly$/\1- anomaly/' /etc/suricata/suricata.yaml
+sed -i 's/# - anomaly/- anomaly/g' /etc/suricata/suricata.yaml
 sed -i -z 's/#   enabled: yes\n          #   types:/  enabled: yes\n            types:/' /etc/suricata/suricata.yaml
 
 # ---------- Enhancement #8: Run as Non-Root ----------
