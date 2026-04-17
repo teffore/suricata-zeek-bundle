@@ -1,6 +1,5 @@
 #!/bin/bash
 # standalone.sh — single-file Suricata 8 + Zeek 8 installer for Ubuntu 22.04.
-# This is the source of truth. Edit directly; there is no generator.
 #
 # Usage:
 #   sudo bash standalone.sh [--force] [--preserve-config] [--iface <name>]
@@ -14,7 +13,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1; shift ;;
     --preserve-config) PRESERVE=1; shift ;;
     --iface) IFACE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -54,7 +53,7 @@ if [ -n "$IFACE" ] && ! ip link show "$IFACE" >/dev/null 2>&1; then
   echo "ERROR: interface '$IFACE' not found" >&2; exit 4
 fi
 
-# Helper the inlined scripts call instead of ip-link detection
+# ---------- Shared helpers ----------
 detect_iface() {
   if [ -n "${IFACE:-}" ]; then
     printf '%s\n' "$IFACE"
@@ -62,16 +61,434 @@ detect_iface() {
     ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -1
   fi
 }
-export -f detect_iface
-export IFACE
 
-# BUNDLE_DIR points at the extracted working dir so the inlined suricata
-# setup block can find custom.rules written by the heredoc below.
+wait_for_apt_lock() {
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    echo "Waiting for apt lock..."
+    sleep 5
+  done
+}
+
+apt_update_noninteractive() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+}
+
+# Rule content lives past the exit 0 at the bottom of this file; pulled out at
+# runtime via marker lines so the 600-line rule block doesn't dominate the
+# script's control flow.
+extract_custom_rules() {
+  sed -n '/^# ---BEGIN CUSTOM_RULES---$/,/^# ---END CUSTOM_RULES---$/{//!p}' "$0" > "$1"
+}
+
+PRIMARY_IF=$(detect_iface)
+export PRIMARY_IF IFACE
+echo "Primary interface: ${PRIMARY_IF}"
+
 BUNDLE_DIR="$WORK"
 export BUNDLE_DIR
 
-# ---------- Write custom.rules to work dir ----------
-cat > "$WORK/custom.rules" <<'CUSTOM_RULES_EOF'
+# ---------- Extract custom.rules to work dir (content at end of file) ----------
+extract_custom_rules "$WORK/custom.rules"
+
+# Preserve-config short path
+if [ "$PRESERVE" = 1 ]; then
+  install -d -m 0755 /var/lib/suricata/rules
+  cp "$WORK/custom.rules" /var/lib/suricata/rules/custom.rules
+  cat /var/lib/suricata/rules/custom.rules >> /var/lib/suricata/rules/suricata.rules
+  suricata-update || true
+  [ -x /opt/zeek/intel/build-intel.sh ] && /opt/zeek/intel/build-intel.sh || true
+  systemctl restart suricata || true
+  /opt/zeek/bin/zeekctl deploy 2>/dev/null || true
+  echo "=== preserve-config install complete ==="
+  exit 0
+fi
+
+
+# =============================================================
+#   Suricata setup
+# =============================================================
+echo "=== Suricata IDS Setup (Ubuntu) ==="
+wait_for_apt_lock
+
+# Install Suricata from the OISF stable PPA.
+# Ubuntu 22.04's default repo ships Suricata 6.0.x which reached EOL on
+# 2024-08-01. The OISF stable PPA tracks the latest supported major (8.0.x
+# as of 2026-03), which unblocks HTTP/2, QUIC/HTTP/3, and JA4.
+apt_update_noninteractive
+apt-get install -y software-properties-common
+
+# If a pre-8 Suricata is already installed (e.g. distro 6.0.x, or a leftover
+# from the OISF 7.0 LTS PPA), purge it before bringing in 8. The 7.0 PPA
+# ships an LSB init.d wrapper (not a native systemd unit) that leaves stale
+# pidfiles behind, which then break the 8.x systemd unit on first start.
+if command -v suricata >/dev/null 2>&1; then
+  CURRENT_VER=$(suricata --build-info 2>/dev/null | awk '/^This is Suricata version/ {print $5}' | head -1)
+  MAJOR=${CURRENT_VER%%.*}
+  if [ -n "$MAJOR" ] && [ "$MAJOR" -lt 8 ] 2>/dev/null; then
+    echo "Found Suricata ${CURRENT_VER} (< 8); purging before reinstall"
+    systemctl stop suricata 2>/dev/null || true
+    rm -f /run/suricata.pid /var/run/suricata.pid
+    apt-get purge -y suricata suricata-update 2>/dev/null || true
+    add-apt-repository -y --remove ppa:oisf/suricata-7.0 2>/dev/null || true
+    add-apt-repository -y --remove ppa:oisf/suricata-6.0 2>/dev/null || true
+  fi
+fi
+
+add-apt-repository -y ppa:oisf/suricata-stable
+apt-get update -y
+apt-get install -y suricata jq logrotate
+
+# yq for path-targeted edits to suricata.yaml (replaces fragile string-replace).
+# Ubuntu's apt yq is a different tool (jq-wrapper); we want Mike Farah's Go yq.
+if ! command -v yq >/dev/null 2>&1; then
+  YQ_VERSION=v4.44.3
+  curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+    -o /usr/local/bin/yq
+  chmod +x /usr/local/bin/yq
+fi
+
+# Stop suricata (apt auto-starts it with eth0 which fails)
+systemctl stop suricata || true
+
+# Fix /etc/default/suricata — older Ubuntu Suricata packages read IFACE from
+# here. The OISF stable PPA build of Suricata 8.0.4 no longer ships this file
+# (the systemd unit reads /etc/suricata/suricata.yaml directly), so guard the
+# edits.
+if [ -f /etc/default/suricata ]; then
+  sed -i "s/IFACE=eth0/IFACE=${PRIMARY_IF}/" /etc/default/suricata
+  sed -i "s/RUN=no/RUN=yes/" /etc/default/suricata
+fi
+
+# dpkg may have saved config as .dpkg-new if it detected conflicts
+if [ ! -f /etc/suricata/suricata.yaml ] && [ -f /etc/suricata/suricata.yaml.dpkg-new ]; then
+  cp /etc/suricata/suricata.yaml.dpkg-new /etc/suricata/suricata.yaml
+fi
+
+# Restore classification.config and reference.config if missing
+for f in classification.config reference.config threshold.config; do
+  if [ ! -f "/etc/suricata/${f}" ] && [ -f "/etc/suricata/${f}.dpkg-new" ]; then
+    cp "/etc/suricata/${f}.dpkg-new" "/etc/suricata/${f}"
+  fi
+done
+
+# Enable extra rule sources
+suricata-update enable-source tgreen/hunting
+suricata-update enable-source ptresearch/attackdetection
+suricata-update enable-source sslbl/ssl-fp-blacklist
+suricata-update enable-source sslbl/ja3-fingerprints
+suricata-update enable-source etnetera/aggressive
+
+# Update rules (puts them in /var/lib/suricata/rules/)
+suricata-update
+
+# Fix interface in suricata.yaml AFTER suricata-update
+sed -i "s/interface: eth0/interface: ${PRIMARY_IF}/g" /etc/suricata/suricata.yaml
+
+# Point rules to where suricata-update puts them
+sed -i 's|default-rule-path: /etc/suricata/rules|default-rule-path: /var/lib/suricata/rules|' /etc/suricata/suricata.yaml
+
+# Set HOME_NET to all RFC 1918 space (10/8, 172.16/12, 192.168/16). Suricata's
+# default already uses these; we reassert with an explicit value so rules can
+# reliably reference $HOME_NET regardless of downstream config drift.
+sed -i 's|HOME_NET: "\[192\.168\.0\.0/16.*\]"|HOME_NET: "[10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]"|' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #1: Community ID ----------
+# Adds a standardized flow hash (1:xxxxx) to every event so you can
+# correlate the same connection across Suricata, Zeek, and SIEM tools.
+sed -i 's/community-id: false/community-id: true/' /etc/suricata/suricata.yaml
+# If the line doesn't exist, add it under the eve-log outputs
+grep -q "community-id: true" /etc/suricata/suricata.yaml || \
+  sed -i '/^outputs:/,/eve-log:/{/eve-log:/a\      community-id: true}' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #2: TLS/JA3 Logging ----------
+# Logs every TLS handshake including certificate info and JA3 fingerprints.
+# JA3 fingerprints identify malware C2 even when traffic is encrypted.
+# Enable JA3 globally and add tls logging to eve-log
+sed -i 's/#\s*ja3-fingerprints: auto/ja3-fingerprints: auto/' /etc/suricata/suricata.yaml
+sed -i 's/ja3-fingerprints: no/ja3-fingerprints: yes/' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #3: Alert Metadata ----------
+# Adds CVE numbers, affected products, attack descriptions, and
+# rule references to alert output — gives full context instead of
+# just the rule name. yq walks the parsed yaml tree and flips any
+# 'metadata' key it finds to true; robust against layout drift.
+yq -i '(.. | select(has("metadata"))).metadata = true' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #6: Hyperscan Pattern Matching ----------
+# Switches multi-pattern matching from default (AC) to Hyperscan,
+# which is significantly faster for large rule sets (49k+ rules).
+# Hyperscan is already compiled into Ubuntu's Suricata package.
+sed -i 's/mpm-algo: auto/mpm-algo: hs/' /etc/suricata/suricata.yaml
+sed -i 's/spm-algo: auto/spm-algo: hs/' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #9: Tunings per Suricata 8.0 docs ----------
+# (a) async-oneside: AWS Traffic Mirroring delivers each direction as
+#     a separate session (we have two — victim, attacker), which is
+#     asymmetric by design. Without this, Suricata may drop alerts on
+#     flows it only sees one direction of. The OISF default yaml has
+#     this commented as `#   async-oneside: false` under the `stream:`
+#     block — we just uncomment and flip to true.
+# (b) max-pending-packets: docs recommend 10000+ for typical sensors;
+#     default 1024 can drop packets under attack-burst conditions.
+sed -i 's/^#   async-oneside: false.*/  async-oneside: true/' /etc/suricata/suricata.yaml
+sed -i 's/^max-pending-packets: 1024/max-pending-packets: 10000/' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #7: Anomaly Logging ----------
+# Logs protocol violations and malformed packets — catches things
+# that signature rules don't, like unusual TCP flags, truncated
+# headers, and protocol mismatches. Attackers often trigger these.
+# sed (not yq) because yq discards comments — and these edits are
+# uncommenting comment-hidden yaml entries.
+sed -i 's/^\(\s*\)# - anomaly$/\1- anomaly/' /etc/suricata/suricata.yaml
+sed -i -z 's/#   enabled: yes\n          #   types:/  enabled: yes\n            types:/' /etc/suricata/suricata.yaml
+
+# ---------- Enhancement #8: Run as Non-Root ----------
+# Drops privileges to the 'suricata' user after startup. Limits
+# the blast radius if Suricata itself has a vulnerability.
+# Create suricata user if it doesn't exist
+id suricata &>/dev/null || useradd -r -s /sbin/nologin -d /var/lib/suricata suricata
+mkdir -p /var/run/suricata /var/log/suricata /var/lib/suricata
+chown -R suricata:suricata /var/log/suricata /var/lib/suricata /var/run/suricata
+# Update systemd service to run as suricata user
+mkdir -p /etc/systemd/system/suricata.service.d
+cat > /etc/systemd/system/suricata.service.d/user.conf <<EOF
+[Service]
+# Enhancement #8: Drop privileges after startup
+ExecStart=
+ExecStart=/usr/bin/suricata -D --af-packet -c /etc/suricata/suricata.yaml --pidfile /run/suricata.pid --user=suricata --group=suricata
+EOF
+systemctl daemon-reload
+
+# ---------- Enhancement #4: Daily Rule Updates ----------
+# ET Open updates daily, abuse.ch updates every 5 minutes.
+# Without regular updates, detection degrades as new threats emerge.
+cat > /etc/cron.d/suricata-update <<'CRON'
+# Update Suricata rules daily at 3:00 AM UTC
+0 3 * * * root suricata-update && suricatasc -c reload-rules /var/run/suricata/suricata-command.socket 2>/dev/null || systemctl restart suricata
+CRON
+chmod 644 /etc/cron.d/suricata-update
+
+# ---------- Enhancement #5: Log Rotation ----------
+# Without rotation, eve.json fills the 10GB disk in days on a busy
+# network. Suricata keeps logging until the disk is full, then crashes.
+cat > /etc/logrotate.d/suricata <<'LOGROTATE'
+/var/log/suricata/*.log /var/log/suricata/*.json {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 suricata suricata
+    sharedscripts
+    postrotate
+        # Per Suricata 8.0 docs: send SIGHUP to reopen log files in
+        # append mode without restarting (avoids 49k-rule reload + downtime).
+        /bin/kill -HUP $(cat /run/suricata.pid 2>/dev/null) 2>/dev/null || true
+    endscript
+}
+LOGROTATE
+
+# Install custom rules from the bundle. BUNDLE_DIR is exported by install.sh;
+# fall back to the directory of this script if invoked standalone.
+: "${BUNDLE_DIR:=$(dirname "$(readlink -f "$0")")}"
+if [ -f "${BUNDLE_DIR}/custom.rules" ]; then
+  cp "${BUNDLE_DIR}/custom.rules" /var/lib/suricata/rules/custom.rules
+  cat /var/lib/suricata/rules/custom.rules >> /var/lib/suricata/rules/suricata.rules
+  echo "Custom rules installed from ${BUNDLE_DIR}/custom.rules"
+else
+  echo "WARN: custom.rules not found at ${BUNDLE_DIR}/custom.rules — skipping"
+fi
+
+echo "Config updated with interface: ${PRIMARY_IF}"
+echo "Enhancements applied: community-id, tls/ja3, metadata, daily updates, log rotation (HUP), hyperscan, anomaly, non-root, async-oneside, max-pending-packets"
+
+# Validate config (as the suricata user so it doesn't create
+# root-owned log files in /var/log/suricata that block the daemon
+# when it later drops privileges).
+sudo -u suricata suricata -T -c /etc/suricata/suricata.yaml
+
+# Re-chown one more time in case anything between the earlier chown
+# and now (suricata -T, package post-install hooks, etc.) recreated
+# files in /var/log/suricata as root.
+chown -R suricata:suricata /var/log/suricata /var/run/suricata /var/lib/suricata
+
+# Enable and start Suricata
+systemctl enable suricata
+systemctl start suricata
+
+echo "=== Suricata setup complete ==="
+
+# =============================================================
+#   Zeek setup
+# =============================================================
+# Wait for any apt locks (the Suricata install may still hold them)
+wait_for_apt_lock
+
+# ---------- Add OBS Zeek repo ----------
+export DEBIAN_FRONTEND=noninteractive
+curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key \
+  | gpg --batch --yes --dearmor -o /etc/apt/trusted.gpg.d/security_zeek.gpg
+echo "deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /" \
+  > /etc/apt/sources.list.d/security_zeek.list
+apt-get update -y
+
+# ---------- Install Zeek 8.0 ----------
+# zeek-8.0 is the versioned package name; pulls the latest 8.0.x patch.
+apt-get install -y zeek-8.0
+/opt/zeek/bin/zeek --version
+
+# ---------- node.cfg: standalone on primary interface ----------
+sed -i "s/interface=eth0/interface=${PRIMARY_IF}/" /opt/zeek/etc/node.cfg
+
+# ---------- networks.cfg: define HOME_NET (all RFC 1918) ----------
+# Zeek's Site::local_nets drives which connections are logged as local-vs-
+# external in conn.log and triggers some default heuristics. Use the full
+# RFC 1918 space so the sensor treats all private-address flows as internal.
+cat >> /opt/zeek/etc/networks.cfg <<'EOF'
+10.0.0.0/8       RFC 1918 / AWS lab VPC
+172.16.0.0/12    RFC 1918
+192.168.0.0/16   RFC 1918
+EOF
+
+# ---------- local.zeek: enable detection + correlation ----------
+# - VXLAN: Zeek 8 default PacketAnalyzer::VXLAN::vxlan_ports already
+#   includes 4789/udp, no redef needed.
+# - Community ID hash on conn.log lets us correlate Zeek records with
+#   Suricata alerts that share the same flow.
+# - Built-in detection scripts that cost nothing at idle and produce
+#   notices on real traffic patterns.
+cat >> /opt/zeek/share/zeek/site/local.zeek <<'EOF'
+
+# Community ID hash on conn.log for SIEM correlation with Suricata
+@load policy/protocols/conn/community-id-logging
+
+# Built-in detection scripts (free signal, no extra packages)
+@load protocols/ssh/detect-bruteforcing
+@load protocols/ftp/detect-bruteforcing
+@load protocols/http/detect-webapps
+@load frameworks/files/detect-MHR
+@load frameworks/intel/seen
+
+# Lower SSH brute-force threshold to match short-burst test runs
+redef SSH::password_guesses_limit = 5;
+
+# Iteration 8 — volumetric detection via stats framework. Stock
+# Zeek 8 doesn't ship misc/scan (that's a zkg package, separate
+# install). policy/misc/stats IS available and emits periodic
+# engine stats to stats.log; useful telemetry for offline
+# behavioral / rate-based analysis even though it doesn't emit
+# notices itself.
+@load misc/stats
+redef Stats::report_interval = 60 sec;
+
+# Intel Framework — load abuse.ch feeds from /opt/zeek/intel/intel.dat.
+# Assembled by build-intel.sh below from URLhaus (malware domains)
+# and Feodo Tracker (C2 IPs). Hits appear in intel.log with source
+# attribution. base/frameworks/intel is already loaded by Zeek by
+# default; we just point it at the feed file.
+redef Intel::read_files += { "/opt/zeek/intel/intel.dat" };
+EOF
+
+# ---------- Zeek Intel Framework feeds (Iteration 7) ----------
+# Fetch abuse.ch URLhaus (malware URLs, domains) and Feodo Tracker
+# (botnet C2 IPs) feeds. Convert them to Zeek's intel.dat format
+# (tab-separated: indicator, type, meta.source, meta.desc, meta.url).
+mkdir -p /opt/zeek/intel
+cat > /opt/zeek/intel/build-intel.sh <<'INTELSH'
+#!/bin/bash
+# Build /opt/zeek/intel/intel.dat from abuse.ch feeds.
+set +e
+DAT=/opt/zeek/intel/intel.dat
+TMP=$(mktemp)
+{
+  printf "#fields\tindicator\tindicator_type\tmeta.source\tmeta.desc\tmeta.url\n"
+
+  # URLhaus — hostfile format is "127.0.0.1 malicious-domain.com",
+  # so we want $2 (the domain), and we strip Windows line endings.
+  curl -fsSL --max-time 30 https://urlhaus.abuse.ch/downloads/hostfile/ 2>/dev/null \
+    | tr -d '\r' \
+    | awk '/^[^#]/ && NF>=2 {print $2 "\tIntel::DOMAIN\tabuse.ch/urlhaus\tMalware delivery host\t-"}'
+
+  # Feodo Tracker — botnet C2 IPs (one per line)
+  curl -fsSL --max-time 30 https://feodotracker.abuse.ch/downloads/ipblocklist.txt 2>/dev/null \
+    | tr -d '\r' \
+    | awk '/^[0-9]/ {print $1 "\tIntel::ADDR\tabuse.ch/feodo\tBotnet C2 IP\t-"}'
+} > "$TMP"
+
+# Only replace the live file if the build got more than just the header
+if [ "$(wc -l < "$TMP")" -gt 1 ]; then
+  mv "$TMP" "$DAT"
+  chown suricata:suricata "$DAT" 2>/dev/null || true
+else
+  rm -f "$TMP"
+fi
+INTELSH
+chmod +x /opt/zeek/intel/build-intel.sh
+/opt/zeek/intel/build-intel.sh
+
+# Refresh intel daily at 4:30am
+echo "30 4 * * * root /opt/zeek/intel/build-intel.sh >/dev/null 2>&1" \
+  > /etc/cron.d/zeek-intel
+chmod 644 /etc/cron.d/zeek-intel
+
+# ---------- Logrotate (zeekctl already rotates hourly; keep 7d compressed) ----------
+cat > /etc/logrotate.d/zeek <<'LOGROTATE'
+/opt/zeek/logs/*/*.log {
+    daily
+    rotate 7
+    missingok
+    compress
+    delaycompress
+    notifempty
+}
+LOGROTATE
+
+# ---------- zeekctl cron (rotation, restart on crash, daily checks) ----------
+echo "0 4 * * * root /opt/zeek/bin/zeekctl cron >/dev/null 2>&1" \
+  > /etc/cron.d/zeek-cron
+chmod 644 /etc/cron.d/zeek-cron
+
+# ---------- systemd unit (auto-start on boot, clean shutdown) ----------
+# zeekctl is the control surface; wrap it in a oneshot systemd unit so the
+# kernel no longer SIGKILLs Zeek at shutdown (which caused "crashed" state
+# on next boot) and so Zeek restarts with the host rather than waiting for
+# the 04:00 zeekctl-cron job.
+cat > /etc/systemd/system/zeek.service <<'UNIT'
+[Unit]
+Description=Zeek Network Security Monitor
+Documentation=https://docs.zeek.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/zeek/bin/zeekctl start
+ExecStop=/opt/zeek/bin/zeekctl stop
+ExecReload=/opt/zeek/bin/zeekctl restart
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable zeek.service
+
+# ---------- Deploy ----------
+/opt/zeek/bin/zeekctl deploy
+/opt/zeek/bin/zeekctl status
+
+echo "=== Zeek setup complete ==="
+
+echo ""
+echo "=== standalone install complete ==="
+echo "Log: /var/log/suricata-setup.log"
+
+exit 0
+: <<'CUSTOM_RULES_PAYLOAD'
+# ---BEGIN CUSTOM_RULES---
 
 # ========== Traffic mirror validation rules ==========
 # sid:9000001 (TEST - ICMP) removed — pure noise (447 alerts/run, top of the
@@ -711,425 +1128,5 @@ alert dcerpc any any -> $HOME_NET any (msg:"LATERAL - DCERPC bind to svcctl inte
 alert dcerpc any any -> $HOME_NET any (msg:"LATERAL - DCERPC bind to SAMR (account enum)"; \
   dcerpc.iface:12345778-1234-abcd-ef00-0123456789ac; \
   sid:9001021; rev:2; classtype:attempted-recon;)
-CUSTOM_RULES_EOF
-
-# Preserve-config short path
-if [ "$PRESERVE" = 1 ]; then
-  install -d -m 0755 /var/lib/suricata/rules
-  cp "$WORK/custom.rules" /var/lib/suricata/rules/custom.rules
-  cat /var/lib/suricata/rules/custom.rules >> /var/lib/suricata/rules/suricata.rules
-  suricata-update || true
-  [ -x /opt/zeek/intel/build-intel.sh ] && /opt/zeek/intel/build-intel.sh || true
-  systemctl restart suricata || true
-  /opt/zeek/bin/zeekctl deploy 2>/dev/null || true
-  echo "=== preserve-config install complete ==="
-  exit 0
-fi
-
-
-# =========================================================================
-# ============= INLINED: suricata_setup.sh ================================
-# =========================================================================
-(
-echo "=== Suricata IDS Setup (Ubuntu) ==="
-
-# Wait for any apt locks to release
-while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-  echo "Waiting for apt lock..."
-  sleep 5
-done
-
-# Detect the primary network interface BEFORE installing
-# (ens5 on Nitro-based instances)
-PRIMARY_IF=$(detect_iface)
-echo "Primary interface: ${PRIMARY_IF}"
-
-# Install Suricata from the OISF stable PPA.
-# Ubuntu 22.04's default repo ships Suricata 6.0.x which reached EOL on
-# 2024-08-01. The OISF stable PPA tracks the latest supported major (8.0.x
-# as of 2026-03), which unblocks HTTP/2, QUIC/HTTP/3, and JA4.
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y software-properties-common
-
-# If a pre-8 Suricata is already installed (e.g. distro 6.0.x, or a leftover
-# from the OISF 7.0 LTS PPA), purge it before bringing in 8. The 7.0 PPA
-# ships an LSB init.d wrapper (not a native systemd unit) that leaves stale
-# pidfiles behind, which then break the 8.x systemd unit on first start.
-if command -v suricata >/dev/null 2>&1; then
-  CURRENT_VER=$(suricata --build-info 2>/dev/null | awk '/^This is Suricata version/ {print $5}' | head -1)
-  MAJOR=${CURRENT_VER%%.*}
-  if [ -n "$MAJOR" ] && [ "$MAJOR" -lt 8 ] 2>/dev/null; then
-    echo "Found Suricata ${CURRENT_VER} (< 8); purging before reinstall"
-    systemctl stop suricata 2>/dev/null || true
-    rm -f /run/suricata.pid /var/run/suricata.pid
-    apt-get purge -y suricata suricata-update 2>/dev/null || true
-    add-apt-repository -y --remove ppa:oisf/suricata-7.0 2>/dev/null || true
-    add-apt-repository -y --remove ppa:oisf/suricata-6.0 2>/dev/null || true
-  fi
-fi
-
-add-apt-repository -y ppa:oisf/suricata-stable
-apt-get update -y
-apt-get install -y suricata jq logrotate
-
-# Stop suricata (apt auto-starts it with eth0 which fails)
-systemctl stop suricata || true
-
-# Fix /etc/default/suricata — older Ubuntu Suricata packages read IFACE from
-# here. The OISF stable PPA build of Suricata 8.0.4 no longer ships this file
-# (the systemd unit reads /etc/suricata/suricata.yaml directly), so guard the
-# edits.
-if [ -f /etc/default/suricata ]; then
-  sed -i "s/IFACE=eth0/IFACE=${PRIMARY_IF}/" /etc/default/suricata
-  sed -i "s/RUN=no/RUN=yes/" /etc/default/suricata
-fi
-
-# dpkg may have saved config as .dpkg-new if it detected conflicts
-if [ ! -f /etc/suricata/suricata.yaml ] && [ -f /etc/suricata/suricata.yaml.dpkg-new ]; then
-  cp /etc/suricata/suricata.yaml.dpkg-new /etc/suricata/suricata.yaml
-fi
-
-# Restore classification.config and reference.config if missing
-for f in classification.config reference.config threshold.config; do
-  if [ ! -f "/etc/suricata/${f}" ] && [ -f "/etc/suricata/${f}.dpkg-new" ]; then
-    cp "/etc/suricata/${f}.dpkg-new" "/etc/suricata/${f}"
-  fi
-done
-
-# Enable extra rule sources
-suricata-update enable-source tgreen/hunting
-suricata-update enable-source ptresearch/attackdetection
-suricata-update enable-source sslbl/ssl-fp-blacklist
-suricata-update enable-source sslbl/ja3-fingerprints
-suricata-update enable-source etnetera/aggressive
-
-# Update rules (puts them in /var/lib/suricata/rules/)
-suricata-update
-
-# Fix interface in suricata.yaml AFTER suricata-update
-sed -i "s/interface: eth0/interface: ${PRIMARY_IF}/g" /etc/suricata/suricata.yaml
-
-# Point rules to where suricata-update puts them
-sed -i 's|default-rule-path: /etc/suricata/rules|default-rule-path: /var/lib/suricata/rules|' /etc/suricata/suricata.yaml
-
-# Set HOME_NET to all RFC 1918 space (10/8, 172.16/12, 192.168/16). Suricata's
-# default already uses these; we reassert with an explicit value so rules can
-# reliably reference $HOME_NET regardless of downstream config drift.
-sed -i 's|HOME_NET: "\[192\.168\.0\.0/16.*\]"|HOME_NET: "[10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]"|' /etc/suricata/suricata.yaml
-
-# ---------- Enhancement #1: Community ID ----------
-# Adds a standardized flow hash (1:xxxxx) to every event so you can
-# correlate the same connection across Suricata, Zeek, and SIEM tools.
-sed -i 's/community-id: false/community-id: true/' /etc/suricata/suricata.yaml
-# If the line doesn't exist, add it under the eve-log outputs
-grep -q "community-id: true" /etc/suricata/suricata.yaml || \
-  sed -i '/^outputs:/,/eve-log:/{/eve-log:/a\      community-id: true}' /etc/suricata/suricata.yaml
-
-# ---------- Enhancement #2: TLS/JA3 Logging ----------
-# Logs every TLS handshake including certificate info and JA3 fingerprints.
-# JA3 fingerprints identify malware C2 even when traffic is encrypted.
-# Enable JA3 globally and add tls logging to eve-log
-sed -i 's/#\s*ja3-fingerprints: auto/ja3-fingerprints: auto/' /etc/suricata/suricata.yaml
-sed -i 's/ja3-fingerprints: no/ja3-fingerprints: yes/' /etc/suricata/suricata.yaml
-
-# ---------- Enhancement #3: Alert Metadata ----------
-# Adds CVE numbers, affected products, attack descriptions, and
-# rule references to alert output — gives full context instead of
-# just the rule name.
-# Enable metadata in eve-log alert section
-python3 -c "
-import sys
-data = open('/etc/suricata/suricata.yaml').read()
-# Enable metadata in alert output
-data = data.replace('# metadata: no', 'metadata: yes')
-data = data.replace('metadata: no', 'metadata: yes')
-open('/etc/suricata/suricata.yaml', 'w').write(data)
-"
-
-# ---------- Enhancement #6: Hyperscan Pattern Matching ----------
-# Switches multi-pattern matching from default (AC) to Hyperscan,
-# which is significantly faster for large rule sets (49k+ rules).
-# Hyperscan is already compiled into Ubuntu's Suricata package.
-sed -i 's/mpm-algo: auto/mpm-algo: hs/' /etc/suricata/suricata.yaml
-sed -i 's/spm-algo: auto/spm-algo: hs/' /etc/suricata/suricata.yaml
-
-# ---------- Enhancement #9: Tunings per Suricata 8.0 docs ----------
-# (a) async-oneside: AWS Traffic Mirroring delivers each direction as
-#     a separate session (we have two — victim, attacker), which is
-#     asymmetric by design. Without this, Suricata may drop alerts on
-#     flows it only sees one direction of. The OISF default yaml has
-#     this commented as `#   async-oneside: false` under the `stream:`
-#     block — we just uncomment and flip to true.
-# (b) max-pending-packets: docs recommend 10000+ for typical sensors;
-#     default 1024 can drop packets under attack-burst conditions.
-sed -i 's/^#   async-oneside: false.*/  async-oneside: true/' /etc/suricata/suricata.yaml
-sed -i 's/^max-pending-packets: 1024/max-pending-packets: 10000/' /etc/suricata/suricata.yaml
-
-# ---------- Enhancement #7: Anomaly Logging ----------
-# Logs protocol violations and malformed packets — catches things
-# that signature rules don't, like unusual TCP flags, truncated
-# headers, and protocol mismatches. Attackers often trigger these.
-python3 -c "
-import sys
-data = open('/etc/suricata/suricata.yaml').read()
-# Make sure anomaly is enabled in eve-log types
-if 'anomaly:' not in data or '# - anomaly' in data:
-    data = data.replace('# - anomaly', '- anomaly')
-# Enable anomaly logging with packet info
-data = data.replace('#   enabled: yes\n          #   types:', '  enabled: yes\n            types:')
-open('/etc/suricata/suricata.yaml', 'w').write(data)
-"
-
-# ---------- Enhancement #8: Run as Non-Root ----------
-# Drops privileges to the 'suricata' user after startup. Limits
-# the blast radius if Suricata itself has a vulnerability.
-# Create suricata user if it doesn't exist
-id suricata &>/dev/null || useradd -r -s /sbin/nologin -d /var/lib/suricata suricata
-mkdir -p /var/run/suricata /var/log/suricata /var/lib/suricata
-chown -R suricata:suricata /var/log/suricata /var/lib/suricata /var/run/suricata
-# Update systemd service to run as suricata user
-mkdir -p /etc/systemd/system/suricata.service.d
-cat > /etc/systemd/system/suricata.service.d/user.conf <<EOF
-[Service]
-# Enhancement #8: Drop privileges after startup
-ExecStart=
-ExecStart=/usr/bin/suricata -D --af-packet -c /etc/suricata/suricata.yaml --pidfile /run/suricata.pid --user=suricata --group=suricata
-EOF
-systemctl daemon-reload
-
-# ---------- Enhancement #4: Daily Rule Updates ----------
-# ET Open updates daily, abuse.ch updates every 5 minutes.
-# Without regular updates, detection degrades as new threats emerge.
-cat > /etc/cron.d/suricata-update <<'CRON'
-# Update Suricata rules daily at 3:00 AM UTC
-0 3 * * * root suricata-update && suricatasc -c reload-rules /var/run/suricata/suricata-command.socket 2>/dev/null || systemctl restart suricata
-CRON
-chmod 644 /etc/cron.d/suricata-update
-
-# ---------- Enhancement #5: Log Rotation ----------
-# Without rotation, eve.json fills the 10GB disk in days on a busy
-# network. Suricata keeps logging until the disk is full, then crashes.
-cat > /etc/logrotate.d/suricata <<'LOGROTATE'
-/var/log/suricata/*.log /var/log/suricata/*.json {
-    daily
-    rotate 7
-    missingok
-    notifempty
-    compress
-    delaycompress
-    create 0640 suricata suricata
-    sharedscripts
-    postrotate
-        # Per Suricata 8.0 docs: send SIGHUP to reopen log files in
-        # append mode without restarting (avoids 49k-rule reload + downtime).
-        /bin/kill -HUP $(cat /run/suricata.pid 2>/dev/null) 2>/dev/null || true
-    endscript
-}
-LOGROTATE
-
-# Install custom rules from the bundle. BUNDLE_DIR is exported by install.sh;
-# fall back to the directory of this script if invoked standalone.
-: "${BUNDLE_DIR:=$(dirname "$(readlink -f "$0")")}"
-if [ -f "${BUNDLE_DIR}/custom.rules" ]; then
-  cp "${BUNDLE_DIR}/custom.rules" /var/lib/suricata/rules/custom.rules
-  cat /var/lib/suricata/rules/custom.rules >> /var/lib/suricata/rules/suricata.rules
-  echo "Custom rules installed from ${BUNDLE_DIR}/custom.rules"
-else
-  echo "WARN: custom.rules not found at ${BUNDLE_DIR}/custom.rules — skipping"
-fi
-
-echo "Config updated with interface: ${PRIMARY_IF}"
-echo "Enhancements applied: community-id, tls/ja3, metadata, daily updates, log rotation (HUP), hyperscan, anomaly, non-root, async-oneside, max-pending-packets"
-
-# Validate config (as the suricata user so it doesn't create
-# root-owned log files in /var/log/suricata that block the daemon
-# when it later drops privileges).
-sudo -u suricata suricata -T -c /etc/suricata/suricata.yaml
-
-# Re-chown one more time in case anything between the earlier chown
-# and now (suricata -T, package post-install hooks, etc.) recreated
-# files in /var/log/suricata as root.
-chown -R suricata:suricata /var/log/suricata /var/run/suricata /var/lib/suricata
-
-# Enable and start Suricata
-systemctl enable suricata
-systemctl start suricata
-
-echo "=== Suricata setup complete ==="
-)
-
-# =========================================================================
-# ============= INLINED: zeek_setup.sh ====================================
-# =========================================================================
-(
-
-# Wait for any apt locks (the Suricata install may still hold them)
-while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-  echo "Waiting for apt lock (zeek)..."
-  sleep 5
-done
-
-PRIMARY_IF=$(detect_iface)
-echo "Primary interface: ${PRIMARY_IF}"
-
-# ---------- Add OBS Zeek repo ----------
-export DEBIAN_FRONTEND=noninteractive
-curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key \
-  | gpg --batch --yes --dearmor -o /etc/apt/trusted.gpg.d/security_zeek.gpg
-echo "deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /" \
-  > /etc/apt/sources.list.d/security_zeek.list
-apt-get update -y
-
-# ---------- Install Zeek 8.0 ----------
-# zeek-8.0 is the versioned package name; pulls the latest 8.0.x patch.
-apt-get install -y zeek-8.0
-/opt/zeek/bin/zeek --version
-
-# ---------- node.cfg: standalone on primary interface ----------
-sed -i "s/interface=eth0/interface=${PRIMARY_IF}/" /opt/zeek/etc/node.cfg
-
-# ---------- networks.cfg: define HOME_NET (all RFC 1918) ----------
-# Zeek's Site::local_nets drives which connections are logged as local-vs-
-# external in conn.log and triggers some default heuristics. Use the full
-# RFC 1918 space so the sensor treats all private-address flows as internal.
-cat >> /opt/zeek/etc/networks.cfg <<'EOF'
-10.0.0.0/8       RFC 1918 / AWS lab VPC
-172.16.0.0/12    RFC 1918
-192.168.0.0/16   RFC 1918
-EOF
-
-# ---------- local.zeek: enable detection + correlation ----------
-# - VXLAN: Zeek 8 default PacketAnalyzer::VXLAN::vxlan_ports already
-#   includes 4789/udp, no redef needed.
-# - Community ID hash on conn.log lets us correlate Zeek records with
-#   Suricata alerts that share the same flow.
-# - Built-in detection scripts that cost nothing at idle and produce
-#   notices on real traffic patterns.
-cat >> /opt/zeek/share/zeek/site/local.zeek <<'EOF'
-
-# Community ID hash on conn.log for SIEM correlation with Suricata
-@load policy/protocols/conn/community-id-logging
-
-# Built-in detection scripts (free signal, no extra packages)
-@load protocols/ssh/detect-bruteforcing
-@load protocols/ftp/detect-bruteforcing
-@load protocols/http/detect-webapps
-@load frameworks/files/detect-MHR
-@load frameworks/intel/seen
-
-# Lower SSH brute-force threshold to match short-burst test runs
-redef SSH::password_guesses_limit = 5;
-
-# Iteration 8 — volumetric detection via stats framework. Stock
-# Zeek 8 doesn't ship misc/scan (that's a zkg package, separate
-# install). policy/misc/stats IS available and emits periodic
-# engine stats to stats.log; useful telemetry for offline
-# behavioral / rate-based analysis even though it doesn't emit
-# notices itself.
-@load misc/stats
-redef Stats::report_interval = 60 sec;
-
-# Intel Framework — load abuse.ch feeds from /opt/zeek/intel/intel.dat.
-# Assembled by build-intel.sh below from URLhaus (malware domains)
-# and Feodo Tracker (C2 IPs). Hits appear in intel.log with source
-# attribution. base/frameworks/intel is already loaded by Zeek by
-# default; we just point it at the feed file.
-redef Intel::read_files += { "/opt/zeek/intel/intel.dat" };
-EOF
-
-# ---------- Zeek Intel Framework feeds (Iteration 7) ----------
-# Fetch abuse.ch URLhaus (malware URLs, domains) and Feodo Tracker
-# (botnet C2 IPs) feeds. Convert them to Zeek's intel.dat format
-# (tab-separated: indicator, type, meta.source, meta.desc, meta.url).
-mkdir -p /opt/zeek/intel
-cat > /opt/zeek/intel/build-intel.sh <<'INTELSH'
-#!/bin/bash
-# Build /opt/zeek/intel/intel.dat from abuse.ch feeds.
-set +e
-DAT=/opt/zeek/intel/intel.dat
-TMP=$(mktemp)
-{
-  printf "#fields\tindicator\tindicator_type\tmeta.source\tmeta.desc\tmeta.url\n"
-
-  # URLhaus — hostfile format is "127.0.0.1 malicious-domain.com",
-  # so we want $2 (the domain), and we strip Windows line endings.
-  curl -fsSL --max-time 30 https://urlhaus.abuse.ch/downloads/hostfile/ 2>/dev/null \
-    | tr -d '\r' \
-    | awk '/^[^#]/ && NF>=2 {print $2 "\tIntel::DOMAIN\tabuse.ch/urlhaus\tMalware delivery host\t-"}'
-
-  # Feodo Tracker — botnet C2 IPs (one per line)
-  curl -fsSL --max-time 30 https://feodotracker.abuse.ch/downloads/ipblocklist.txt 2>/dev/null \
-    | tr -d '\r' \
-    | awk '/^[0-9]/ {print $1 "\tIntel::ADDR\tabuse.ch/feodo\tBotnet C2 IP\t-"}'
-} > "$TMP"
-
-# Only replace the live file if the build got more than just the header
-if [ "$(wc -l < "$TMP")" -gt 1 ]; then
-  mv "$TMP" "$DAT"
-  chown suricata:suricata "$DAT" 2>/dev/null || true
-else
-  rm -f "$TMP"
-fi
-INTELSH
-chmod +x /opt/zeek/intel/build-intel.sh
-/opt/zeek/intel/build-intel.sh
-
-# Refresh intel daily at 4:30am
-echo "30 4 * * * root /opt/zeek/intel/build-intel.sh >/dev/null 2>&1" \
-  > /etc/cron.d/zeek-intel
-chmod 644 /etc/cron.d/zeek-intel
-
-# ---------- Logrotate (zeekctl already rotates hourly; keep 7d compressed) ----------
-cat > /etc/logrotate.d/zeek <<'LOGROTATE'
-/opt/zeek/logs/*/*.log {
-    daily
-    rotate 7
-    missingok
-    compress
-    delaycompress
-    notifempty
-}
-LOGROTATE
-
-# ---------- zeekctl cron (rotation, restart on crash, daily checks) ----------
-echo "0 4 * * * root /opt/zeek/bin/zeekctl cron >/dev/null 2>&1" \
-  > /etc/cron.d/zeek-cron
-chmod 644 /etc/cron.d/zeek-cron
-
-# ---------- systemd unit (auto-start on boot, clean shutdown) ----------
-# zeekctl is the control surface; wrap it in a oneshot systemd unit so the
-# kernel no longer SIGKILLs Zeek at shutdown (which caused "crashed" state
-# on next boot) and so Zeek restarts with the host rather than waiting for
-# the 04:00 zeekctl-cron job.
-cat > /etc/systemd/system/zeek.service <<'UNIT'
-[Unit]
-Description=Zeek Network Security Monitor
-Documentation=https://docs.zeek.org/
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/opt/zeek/bin/zeekctl start
-ExecStop=/opt/zeek/bin/zeekctl stop
-ExecReload=/opt/zeek/bin/zeekctl restart
-TimeoutStopSec=60
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-systemctl daemon-reload
-systemctl enable zeek.service
-
-# ---------- Deploy ----------
-/opt/zeek/bin/zeekctl deploy
-/opt/zeek/bin/zeekctl status
-
-echo "=== Zeek setup complete ==="
-)
-
-echo ""
-echo "=== standalone install complete ==="
-echo "Log: /var/log/suricata-setup.log"
+# ---END CUSTOM_RULES---
+CUSTOM_RULES_PAYLOAD

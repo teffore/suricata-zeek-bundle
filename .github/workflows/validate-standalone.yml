@@ -154,6 +154,12 @@ jobs:
               suricata --build-info | grep -qE "This is Suricata version 8\." \
                 || { echo "Suricata is not 8.x"; exit 1; }
               sudo -u suricata suricata -T
+              # Assertions on yq/sed-driven enhancements — catches silent
+              # no-op edits that would otherwise pass the active check.
+              sudo grep -qE "^\s*metadata:\s*(yes|true)" /etc/suricata/suricata.yaml \
+                || { echo "FAIL: metadata not enabled in suricata.yaml"; exit 1; }
+              sudo grep -qE "^\s*-\s*anomaly" /etc/suricata/suricata.yaml \
+                || { echo "FAIL: anomaly type not uncommented in suricata.yaml"; exit 1; }
             '
 
       - name: Verify Zeek is running and on 8.x
