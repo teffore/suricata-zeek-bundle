@@ -1,25 +1,27 @@
 # Validates that the sensor actually *detects* attacks — not just that it
 # installs. Provisions three ephemeral EC2 instances (attacker, victim,
-# sensor) plus a VPC Traffic Mirror session from the victim's ENI to a
-# secondary ENI on the sensor, runs the Kali-style attack battery from
-# testing/run_attacks.sh, and gates success on testing/verify_alerts.sh.
+# sensor) plus a VPC Traffic Mirror session from the victim's primary ENI
+# to the sensor's primary ENI (single-ENI design — both management and
+# mirror traffic share the one NIC). Runs the Kali-style attack battery
+# from testing/run_attacks.sh and gates success on testing/verify_alerts.sh.
 #
-# Trigger: workflow_dispatch only. Run time ~15 min, cost ~$0.05/run.
+# Trigger: workflow_dispatch only. Run time ~10 min, cost ~$0.05/run.
 #
 # Flow:
 #   1. OIDC -> assume IAM role (same role as validate-standalone.yml, with
 #      extra traffic-mirror + ENI permissions — see .github/AWS_SETUP.md)
 #   2. Launch 3x t3.medium Ubuntu 22.04 in the same default subnet (AZ)
-#   3. Attach secondary ENI to sensor for mirror-target duty
-#   4. Install nginx+sshd on victim; install standalone.sh --iface ens6 on
-#      sensor; install testing/kali_setup.sh on attacker
-#   5. Create traffic-mirror target / filter / session (victim ENI -> sensor ens6)
+#   3. Disable source/dest check on sensor primary ENI; set promisc + MTU 9001
+#   4. Install nginx+sshd on victim; install standalone.sh on sensor;
+#      install testing/kali_setup.sh on attacker
+#   5. Create traffic-mirror target / filter / session (victim ENI -> sensor
+#      primary ENI)
 #   6. Smoke-check that VXLAN frames reach the sensor
 #   7. Run testing/run_attacks.sh from attacker against victim private IP
 #   8. Run testing/verify_alerts.sh on sensor; gate on exit 0
 #   9. Upload fast.log, sig-breakdown.txt, zeek logs as artifacts
-#  10. Teardown (always): mirror session -> filter -> target -> ENI ->
-#      instances -> SG -> key pair. Reverse of create order.
+#  10. Teardown (always): mirror session -> filter -> target -> instances
+#      -> SG -> key pair. Reverse of create order.
 
 name: Validate detections (Kali + victim + mirror)
 
@@ -147,11 +149,17 @@ jobs:
           ATTACKER_IP=$(ip_of "${{ steps.ec2.outputs.attacker_id }}")
           VICTIM_PRIVATE=$(private_of "${{ steps.ec2.outputs.victim_id }}")
           VICTIM_ENI=$(primary_eni_of "${{ steps.ec2.outputs.victim_id }}")
+          SENSOR_ENI=$(primary_eni_of "${{ steps.ec2.outputs.sensor_id }}")
+          # Source/dest check must be off on the mirror-target ENI so mirrored
+          # frames with arbitrary inner IPs aren't dropped by the Nitro NIC.
+          aws ec2 modify-network-interface-attribute \
+            --network-interface-id "$SENSOR_ENI" --no-source-dest-check
           echo "sensor_ip=${SENSOR_IP}" >> "$GITHUB_OUTPUT"
           echo "victim_ip=${VICTIM_IP}" >> "$GITHUB_OUTPUT"
           echo "attacker_ip=${ATTACKER_IP}" >> "$GITHUB_OUTPUT"
           echo "victim_private=${VICTIM_PRIVATE}" >> "$GITHUB_OUTPUT"
           echo "victim_eni=${VICTIM_ENI}" >> "$GITHUB_OUTPUT"
+          echo "sensor_eni=${SENSOR_ENI}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for SSH on all three
         run: |
@@ -173,49 +181,31 @@ jobs:
               ubuntu@"$IP" "cloud-init status --wait"
           done
 
-      - name: Attach secondary ENI (ens6) to sensor
-        id: eni
+      - name: Prepare sensor NIC for mirror reception
         run: |
-          ENI_ID=$(aws ec2 create-network-interface \
-            --subnet-id "${{ steps.net.outputs.subnet_id }}" \
-            --groups "${{ steps.sg.outputs.sg_id }}" \
-            --description "${{ steps.ctx.outputs.run_tag }}-mirror-target" \
-            --tag-specifications "ResourceType=network-interface,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
-            --query 'NetworkInterface.NetworkInterfaceId' --output text)
-          aws ec2 modify-network-interface-attribute \
-            --network-interface-id "$ENI_ID" --no-source-dest-check
-          ATTACH_ID=$(aws ec2 attach-network-interface \
-            --network-interface-id "$ENI_ID" \
-            --instance-id "${{ steps.ec2.outputs.sensor_id }}" \
-            --device-index 1 \
-            --query AttachmentId --output text)
-          echo "eni_id=${ENI_ID}" >> "$GITHUB_OUTPUT"
-          echo "attach_id=${ATTACH_ID}" >> "$GITHUB_OUTPUT"
-          # Give the kernel a moment to see the new NIC
-          sleep 10
-
-      - name: Bring up ens6 on sensor
-        run: |
+          # Single-ENI mirror setup: mirror target is the sensor's *primary*
+          # ENI (ens5). Source/dest check is already disabled by the prior
+          # step. Bring the NIC into promiscuous mode + reassert jumbo MTU
+          # so VXLAN frames aren't dropped by hardware MAC filtering or
+          # truncated by a small MTU.
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.sensor_ip }} '
               set -e
-              # Secondary ENIs on Ubuntu 22.04 need manual up. No IP is
-              # required — Suricata/Zeek read packets off the NIC directly.
-              sudo ip link set ens6 up
-              sudo ip link set ens6 promisc on
-              # AWS mirror encapsulates each frame in VXLAN (+50 B overhead).
-              # Default MTU on t3 ENIs is 9001 already; reassert for safety.
-              sudo ip link set ens6 mtu 9001
-              ip -br link show ens6
+              IF=$(ip -o link show | awk -F": " "{print \$2}" | grep -v lo | head -1)
+              sudo ip link set "$IF" promisc on
+              sudo ip link set "$IF" mtu 9001
+              ip -br link show "$IF"
             '
 
-      - name: Install standalone.sh on sensor (bound to ens6)
+      - name: Install standalone.sh on sensor
         run: |
+          # Let standalone.sh auto-detect the primary NIC (ens5). No --iface
+          # flag needed in single-ENI mode.
           scp -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             standalone.sh ubuntu@${{ steps.wait.outputs.sensor_ip }}:/tmp/standalone.sh
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.sensor_ip }} \
-            "sudo bash /tmp/standalone.sh --force --iface ens6"
+            "sudo bash /tmp/standalone.sh --force"
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.sensor_ip }} '
               set -e
@@ -259,7 +249,7 @@ jobs:
         id: mirror
         run: |
           TGT_ID=$(aws ec2 create-traffic-mirror-target \
-            --network-interface-id "${{ steps.eni.outputs.eni_id }}" \
+            --network-interface-id "${{ steps.wait.outputs.sensor_eni }}" \
             --description "${{ steps.ctx.outputs.run_tag }}-tgt" \
             --tag-specifications "ResourceType=traffic-mirror-target,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
             --query 'TrafficMirrorTarget.TrafficMirrorTargetId' --output text)
@@ -293,7 +283,7 @@ jobs:
           # AWS takes a few seconds to program the mirror — don't race it.
           sleep 15
 
-      - name: Smoke-check mirror (VXLAN frames on sensor ens6)
+      - name: Smoke-check mirror (VXLAN frames on sensor primary NIC)
         run: |
           # Generate continuous traffic attacker -> victim for the duration
           # of the capture. `nohup` + detached I/O so sshd doesn't kill the
@@ -309,14 +299,14 @@ jobs:
           set +e
           PKTS=$(ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             ubuntu@${{ steps.wait.outputs.sensor_ip }} \
-            "sudo timeout 15 tcpdump -c 10 -nn -i ens6 'udp port 4789' 2>&1 | grep -Ec '^[0-9]{2}:[0-9]{2}:[0-9]{2}\\.'")
+            'IF=$(ip -o link show | awk -F": " "{print \$2}" | grep -v lo | head -1); sudo timeout 15 tcpdump -c 10 -nn -i "$IF" "udp port 4789" 2>&1 | grep -Ec "^[0-9]{2}:[0-9]{2}:[0-9]{2}\."')
           set -e
           echo "VXLAN frames captured in 15s: $PKTS"
           if [ "${PKTS:-0}" -lt 1 ]; then
-            echo "FAIL: no VXLAN traffic on sensor ens6 — mirror session is not delivering"
-            echo "--- diagnostic: ens6 link state ---"
+            echo "FAIL: no VXLAN traffic on sensor primary NIC — mirror session is not delivering"
+            echo "--- diagnostic: primary NIC link state ---"
             ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              ubuntu@${{ steps.wait.outputs.sensor_ip }} "ip -s link show ens6; ethtool -S ens6 2>/dev/null | grep -Ei 'drop|error' | head" || true
+              ubuntu@${{ steps.wait.outputs.sensor_ip }} 'IF=$(ip -o link show | awk -F": " "{print \$2}" | grep -v lo | head -1); ip -s link show "$IF"; ethtool -S "$IF" 2>/dev/null | grep -Ei "drop|error" | head' || true
             echo "--- diagnostic: mirror session state ---"
             aws ec2 describe-traffic-mirror-sessions \
               --traffic-mirror-session-ids "${{ steps.mirror.outputs.sess_id }}" \
@@ -405,23 +395,8 @@ jobs:
             aws ec2 delete-traffic-mirror-target \
               --traffic-mirror-target-id "${{ steps.mirror.outputs.tgt_id }}" 2>/dev/null || true
           fi
-          if [ -n "${{ steps.eni.outputs.attach_id }}" ]; then
-            aws ec2 detach-network-interface \
-              --attachment-id "${{ steps.eni.outputs.attach_id }}" --force 2>/dev/null || true
-            # ENI can't be deleted until detach completes
-            for i in $(seq 1 20); do
-              STATE=$(aws ec2 describe-network-interfaces \
-                --network-interface-ids "${{ steps.eni.outputs.eni_id }}" \
-                --query 'NetworkInterfaces[0].Status' --output text 2>/dev/null || echo gone)
-              [ "$STATE" = "available" ] && break
-              [ "$STATE" = "gone" ] && break
-              sleep 3
-            done
-          fi
-          if [ -n "${{ steps.eni.outputs.eni_id }}" ]; then
-            aws ec2 delete-network-interface \
-              --network-interface-id "${{ steps.eni.outputs.eni_id }}" 2>/dev/null || true
-          fi
+          # Single-ENI mode: no secondary ENI to detach/delete. The sensor's
+          # primary ENI is cleaned up when the instance terminates.
           for ID in \
             "${{ steps.ec2.outputs.sensor_id }}" \
             "${{ steps.ec2.outputs.victim_id }}" \
