@@ -30,7 +30,14 @@ apt-get update -y -qq
 #                      entry points, used by run_attacks.sh lateral-movement
 #                      section. (Kali's impacket-scripts is NOT available in
 #                      Ubuntu universe — do not install it.)
-REQUIRED=(nmap curl hydra nikto xxd hping3 dnsutils smbclient python3-impacket)
+# Recon-tooling additions (PR 9a):
+#   gobuster   — HTTP wordlist scan (T1595.003); also drops a known-bad
+#                User-Agent that several ET SCAN rules match on
+#   dnsenum    — DNS subdomain enumeration (T1590.002)
+#   whatweb    — passive web-tech fingerprinting (T1592.002 / T1595.002)
+#   dirb       — pulls in /usr/share/wordlists/dirb/* used by gobuster
+REQUIRED=(nmap curl hydra nikto xxd hping3 dnsutils smbclient python3-impacket \
+          gobuster dnsenum whatweb dirb)
 
 installed=()
 failed=()

@@ -109,14 +109,88 @@ run_flightsim_group() {
   fi
 }
 
+run_recon_group() {
+  echo "[BG/recon] [R1] gobuster directory wordlist scan"
+  # T1595.003 Wordlist Scanning. dirb's common.txt is short (~4600 entries),
+  # threads=30 keeps the burst inside the attack-battery budget. The default
+  # gobuster User-Agent ("gobuster/3.x") is what most ET SCAN rules match on
+  # — don't override it.
+  if command -v gobuster >/dev/null 2>&1 && [ -r /usr/share/wordlists/dirb/common.txt ]; then
+    timeout 60 gobuster dir \
+      -u "http://${VICTIM_IP}" \
+      -w /usr/share/wordlists/dirb/common.txt \
+      -t 30 -q --no-error \
+      -o /tmp/gobuster.txt 2>/dev/null || true
+    echo "  gobuster hits: $(wc -l < /tmp/gobuster.txt 2>/dev/null || echo 0)"
+  else
+    echo "  gobuster or wordlist not present; skipping"
+  fi
+
+  echo "[BG/recon] [R2] whatweb tech fingerprinting"
+  # T1592.002 Software Discovery. -a 3 = aggressive (probes plugins).
+  if command -v whatweb >/dev/null 2>&1; then
+    timeout 30 whatweb -a 3 "http://${VICTIM_IP}" 2>/dev/null || true
+  else
+    echo "  whatweb not installed; skipping"
+  fi
+
+  echo "[BG/recon] [R3] HTTP HEAD banner-grab burst"
+  # T1592.002 — 12× HEAD on root with a banner-probe UA. Bursty enough to
+  # trip rate-based recon rules; benign enough to be a clean signal.
+  for i in $(seq 1 12); do
+    curl -sI --max-time 2 -A "banner-probe/${i}" "http://${VICTIM_IP}/" >/dev/null 2>&1 || true
+  done
+
+  echo "[BG/recon] [R4] nmap stealth scans (NULL / FIN / Xmas)"
+  # T1595.001 stealth variants. -sN = null flags, -sF = FIN, -sX = Xmas
+  # (FIN+PSH+URG). Need root for raw sockets — run with sudo.
+  for f in N F X; do
+    sudo timeout 30 nmap -s${f} -p 22,80,445 "${VICTIM_IP}" 2>/dev/null || true
+  done
+
+  echo "[BG/recon] [R5] DNS subdomain enumeration"
+  # T1590.002 DNS. dnsenum hits public-resolver paths; the NXDOMAIN responses
+  # cross the attacker-ENI mirror (added in PR 5).
+  if command -v dnsenum >/dev/null 2>&1; then
+    timeout 30 dnsenum --noreverse --enum example.com 2>/dev/null | head -40 || true
+  else
+    echo "  dnsenum not installed; skipping"
+  fi
+  # Bursty NXDOMAIN traffic — random subdomains under example.com via
+  # 1.1.1.1, no real lookups so no impact on real DNS.
+  for i in $(seq 1 20); do
+    dig @1.1.1.1 "nx-${RANDOM}-${i}.test.example.com" +short +tries=1 +time=2 >/dev/null 2>&1 || true
+  done
+
+  echo "[BG/recon] [R6] DNS zone transfer attempt (AXFR)"
+  # T1590.002 — already covered by custom rule 9000109. The probe just
+  # gives the catalog a new scenario to map.
+  dig AXFR lab.local @"${VICTIM_IP}" +tries=1 +time=2 2>/dev/null | head -5 || true
+  dig AXFR zonetransfer.me @nsztm1.digi.ninja +tries=1 +time=3 2>/dev/null | head -5 || true
+
+  echo "[BG/recon] [R7] nuclei recon templates (exposure / tech-detect / fuzzing)"
+  # Extends the existing CVE-only nuclei sweep with recon-flavored templates.
+  if command -v nuclei >/dev/null 2>&1; then
+    timeout 90 nuclei \
+      -u "http://${VICTIM_IP}" \
+      -tags exposure,tech-detect \
+      -rate-limit 30 -timeout 5 -silent -stats=false \
+      -o /tmp/nuclei-recon.txt 2>/dev/null || true
+    echo "  nuclei recon hits: $(wc -l < /tmp/nuclei-recon.txt 2>/dev/null || echo 0)"
+  else
+    echo "  nuclei not installed; skipping"
+  fi
+}
+
 run_nmap_group        > "$LOGDIR/nmap.log"      2>&1 & NMAP_PID=$!
 run_hydra_group       > "$LOGDIR/hydra.log"     2>&1 & HYDRA_PID=$!
 run_nikto_group       > "$LOGDIR/nikto.log"     2>&1 & NIKTO_PID=$!
 run_lateral_smb_group > "$LOGDIR/lateral.log"   2>&1 & LATERAL_PID=$!
 run_nuclei_group      > "$LOGDIR/nuclei.log"    2>&1 & NUCLEI_PID=$!
 run_flightsim_group   > "$LOGDIR/flightsim.log" 2>&1 & FLIGHTSIM_PID=$!
+run_recon_group       > "$LOGDIR/recon.log"     2>&1 & RECON_PID=$!
 
-echo "=== 6 background probe groups launched; running fast serial probes inline ==="
+echo "=== 7 background probe groups launched; running fast serial probes inline ==="
 
 # ---------- Web Application Attacks ----------
 
@@ -1144,10 +1218,11 @@ wait "$NIKTO_PID"     2>/dev/null || true
 wait "$LATERAL_PID"   2>/dev/null || true
 wait "$NUCLEI_PID"    2>/dev/null || true
 wait "$FLIGHTSIM_PID" 2>/dev/null || true
+wait "$RECON_PID"     2>/dev/null || true
 
-# Dump the six background-group logs in a stable, named order so CI output
+# Dump the seven background-group logs in a stable, named order so CI output
 # is deterministic even though the groups finished in arbitrary order.
-for g in nmap hydra nikto lateral nuclei flightsim; do
+for g in nmap hydra nikto lateral nuclei flightsim recon; do
   echo "::group::bg-${g}"
   cat "$LOGDIR/${g}.log" 2>/dev/null || true
   echo "::endgroup::"
