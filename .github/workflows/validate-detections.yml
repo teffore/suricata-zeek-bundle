@@ -128,10 +128,24 @@ jobs:
       - name: Wait for all instances running
         id: wait
         run: |
-          aws ec2 wait instance-status-ok --instance-ids \
+          # `aws ec2 wait instance-status-ok` polls the Nitro system + instance
+          # reachability flags on a 15-30s cadence and typically sits for 3+ min
+          # before flipping. For this pipeline we only need SSH reachability,
+          # which is proved directly by the SSH + cloud-init loop below — so
+          # skip the reachability wait and short-poll describe-instances just
+          # until `running` state (usually <30 s after run-instances).
+          for ID in \
             "${{ steps.ec2.outputs.sensor_id }}" \
             "${{ steps.ec2.outputs.victim_id }}" \
-            "${{ steps.ec2.outputs.attacker_id }}"
+            "${{ steps.ec2.outputs.attacker_id }}"; do
+            for i in $(seq 1 30); do
+              STATE=$(aws ec2 describe-instances --instance-ids "$ID" \
+                --query 'Reservations[0].Instances[0].State.Name' --output text)
+              [ "$STATE" = "running" ] && break
+              sleep 2
+            done
+            [ "$STATE" = "running" ] || { echo "FAIL: $ID never reached running (last state: $STATE)"; exit 1; }
+          done
           ip_of() {
             aws ec2 describe-instances --instance-ids "$1" \
               --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
@@ -165,25 +179,31 @@ jobs:
           echo "attacker_eni=${ATTACKER_ENI}" >> "$GITHUB_OUTPUT"
           echo "sensor_eni=${SENSOR_ENI}" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for SSH on all three
+      - name: Wait for SSH + cloud-init on all three (parallel)
         run: |
-          for IP in "${{ steps.wait.outputs.sensor_ip }}" \
-                    "${{ steps.wait.outputs.victim_ip }}" \
-                    "${{ steps.wait.outputs.attacker_ip }}"; do
-            ok=0
+          # Fan out: each box polls SSH readiness, then waits on cloud-init
+          # in its own subshell. Wall-clock is now max(boxes) not sum(boxes).
+          wait_box() {
+            local IP="$1" NAME="$2"
             for i in $(seq 1 30); do
-              if nc -z -w 5 "$IP" 22; then ok=1; break; fi
+              nc -z -w 5 "$IP" 22 && break
               sleep 5
             done
-            [ "$ok" = 1 ] || { echo "SSH never came up on $IP"; exit 1; }
-          done
-          # Also wait for cloud-init on each so apt isn't racing with us
-          for IP in "${{ steps.wait.outputs.sensor_ip }}" \
-                    "${{ steps.wait.outputs.victim_ip }}" \
-                    "${{ steps.wait.outputs.attacker_ip }}"; do
+            nc -z -w 5 "$IP" 22 || { echo "SSH never came up on $NAME ($IP)"; exit 1; }
             ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               ubuntu@"$IP" "cloud-init status --wait"
-          done
+          }
+          wait_box "${{ steps.wait.outputs.sensor_ip }}"   sensor   &
+          SENSOR_PID=$!
+          wait_box "${{ steps.wait.outputs.victim_ip }}"   victim   &
+          VICTIM_PID=$!
+          wait_box "${{ steps.wait.outputs.attacker_ip }}" attacker &
+          ATTACKER_PID=$!
+          fail=0
+          wait $SENSOR_PID   || fail=1
+          wait $VICTIM_PID   || fail=1
+          wait $ATTACKER_PID || fail=1
+          [ "$fail" = 0 ] || exit 1
 
       - name: Prepare sensor NIC for mirror reception
         run: |
