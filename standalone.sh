@@ -405,16 +405,15 @@ apt-get install -y zeek-8.0
 #   corelight/zeek-long-connections — interim conn.log rows for still-
 #                                 open flows so C2 beacons show up in
 #                                 real time instead of on flow-close.
-#   corelight/ecs-mapping       — rewrite Zeek field names to Elastic
-#                                 Common Schema at write time; breaks
-#                                 any downstream consumer expecting
-#                                 native Zeek names (id.orig_h, etc.).
+# Note: ECS field normalization is NOT done at Zeek write time.
+# corelight/ecs-mapping is an Elasticsearch ingest-pipeline repo (not
+# a zkg package) — use it when off-box shipping to Elastic is wired
+# up later.
 /opt/zeek/bin/zkg autoconfig
 /opt/zeek/bin/zkg refresh
 /opt/zeek/bin/zkg install --force zeek/foxio/ja4
 /opt/zeek/bin/zkg install --force mitre-attack/bzar
 /opt/zeek/bin/zkg install --force corelight/zeek-long-connections
-/opt/zeek/bin/zkg install --force corelight/ecs-mapping
 /opt/zeek/bin/zkg list
 
 # ---------- node.cfg: standalone on primary interface ----------

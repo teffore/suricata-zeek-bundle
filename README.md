@@ -126,12 +126,13 @@ Loki, and any other SIEM can ingest natively without custom parsers.
 `zeek-cut` only reads TSV, so any downstream tool using it needs to move to
 `jq` / native JSON parsing.
 
-**Field names follow Elastic Common Schema (ECS)** — provided by the
-`corelight/ecs-mapping` zkg package (see zkg table below). Native Zeek
-names like `id.orig_h`, `id.resp_h`, `ssl.server_name` are rewritten to
-`source.ip`, `destination.ip`, `tls.server.name`, etc. at write time.
-Anything downstream expecting native Zeek field names will see nothing
-in those paths — point queries at the ECS names instead.
+Field names are **native Zeek** (`id.orig_h`, `id.resp_h`, `ssl.server_name`,
+etc.) — no ECS rewrite is done at source. When off-box shipping to Elastic
+is added later, Corelight publishes Elasticsearch ingest pipelines
+([`corelight/ecs-mapping`](https://github.com/corelight/ecs-mapping) +
+[`corelight/ecs-templates`](https://github.com/corelight/ecs-templates))
+that apply the ECS transform server-side at ingest — that's the right
+place for it, not at the Zeek writer.
 
 Loaded in `local.zeek`:
 
@@ -163,7 +164,6 @@ GitHub, auto-loaded via `/opt/zeek/share/zeek/site/packages/__load__.zeek`):
 | `zeek/foxio/ja4` | JA4+ family — **JA4S** (TLS server), **JA4H** (HTTP), **JA4SSH**, **JA4T/JA4L** (TCP/latency), **JA4D** (DHCP) across `ssl.log`, `http.log`, `ssh.log`, plus new `ja4ssh.log` and `ja4d.log` | Completes the fingerprint family; Suricata 8's native JA4 only ships the client-TLS variant due to patent policy / [github.com/FoxIO-LLC/ja4](https://github.com/FoxIO-LLC/ja4) |
 | `mitre-attack/bzar` | `ATTACK::*` notices tagged with MITRE ATT&CK technique IDs (T1021.002, T1047, T1003.006, …) when SMB / DCE-RPC / NTLM / Kerberos events match mapped patterns | Direct ATT&CK classification of Windows lateral-movement traffic; maintained by MITRE / [github.com/mitre-attack/bzar](https://github.com/mitre-attack/bzar) |
 | `corelight/zeek-long-connections` | Interim `conn.log` rows for flows that are still open (default every 60s) rather than only writing on flow-close | Makes C2 beacons, reverse shells, and data-exfil tunnels visible in real-time queries / [github.com/corelight/zeek-long-connections](https://github.com/corelight/zeek-long-connections) |
-| `corelight/ecs-mapping` | Rewrites every Zeek log field to the **Elastic Common Schema** (`id.orig_h` → `source.ip`, `ssl.server_name` → `tls.server.name`, etc.) at write time | Drop-in compatibility with Elastic Security, Kibana Zeek dashboards, and any SIEM that consumes ECS / [github.com/corelight/ecs-mapping](https://github.com/corelight/ecs-mapping) |
 
 **Intel Framework** (`/opt/zeek/intel/`):
 - `build-intel.sh` assembles `intel.dat` from:
