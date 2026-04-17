@@ -43,14 +43,20 @@ or `--preserve-config` to keep your tuning and only update rules.
 
 ## Post-install checks
 
-No verification script is bundled. Quick manual checks:
+Quick manual checks:
 
 ```bash
 systemctl is-active suricata
-/opt/zeek/bin/zeekctl status
+sudo systemctl is-active zeek           # new in this bundle (zeek.service)
+sudo /opt/zeek/bin/zeekctl status
 sudo -u suricata suricata -T
 tail -f /var/log/suricata/eve.json
 ```
+
+For a full summary — service state, interface / VXLAN diagnostics, top alert
+signatures, category breakdown, decoder stats, and Zeek notice / tunnel /
+conn.log summaries — use the bundled [`testing/verify_alerts.sh`](testing/verify_alerts.sh)
+(exit 0 if ≥3 alerts fired, 1 otherwise; suitable for CI gates).
 
 ## What the installer configures
 
@@ -59,29 +65,41 @@ tail -f /var/log/suricata/eve.json
 Installs Suricata from the **OISF stable PPA** (Ubuntu 22.04 ships 6.0.x, which
 is EOL; PPA tracks 8.0.x — required for HTTP/2, QUIC/HTTP/3, and JA4).
 
-Rule sources enabled via `suricata-update`:
-- ET Open (default)
-- `tgreen/hunting`
-- `ptresearch/attackdetection`
-- `sslbl/ssl-fp-blacklist`
-- `sslbl/ja3-fingerprints`
-- `etnetera/aggressive`
-- Bundled custom rules (SIDs 9000001–9001021)
+Rule sources enabled via `suricata-update` (catalog refreshed first so feed
+renames are picked up — silences 12+ "Source index does not exist" warnings):
+
+| Source | What it contributes | Reference |
+|---|---|---|
+| ET Open (default) | Community ETI signatures — base coverage | [rules.emergingthreats.net](https://rules.emergingthreats.net/open/) |
+| `tgreen/hunting` | Travis Green's CVE-era exploit hunting pack | [github.com/travisbgreen/hunting-rules](https://github.com/travisbgreen/hunting-rules) |
+| `etnetera/aggressive` | High-FP / high-signal aggressive ruleset | [etnetera.cz](https://security.etnetera.cz/feeds/) |
+| `abuse.ch/sslbl-ja3` | JA3 client fingerprints of known malware families | [sslbl.abuse.ch/ja3-fingerprints/](https://sslbl.abuse.ch/ja3-fingerprints/) |
+| Bundled custom rules | ~130 signatures in the 9000000 SID range (see below) | in-repo |
+
+Removed vs. earlier revisions: `ptresearch/attackdetection` (obsolete upstream),
+`abuse.ch/sslbl-blacklist` (IP list retired 2025-01-03 by abuse.ch).
+
+A `/etc/suricata/disable.conf` mutes one high-volume noise signature
+(`SURICATA HTTP Response excessive header repetition`) which was producing
+~67% of alert volume with zero detection value.
 
 Tunings applied to `/etc/suricata/suricata.yaml`:
 
-| Setting | Value | Why |
-|---|---|---|
-| `HOME_NET` | `[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]` | Full RFC 1918 space |
-| `default-rule-path` | `/var/lib/suricata/rules` | Where `suricata-update` writes |
-| `community-id` | `true` | Standard flow hash for SIEM correlation with Zeek |
-| `ja3-fingerprints` | `yes` | TLS client fingerprints (identifies malware C2 under TLS) |
-| `metadata` in alerts | `yes` | Adds CVE / product / description to alert output |
-| `mpm-algo` / `spm-algo` | `hs` (Hyperscan) | Faster pattern matching on 49k+ rule sets |
-| `stream.async-oneside` | `true` | Handle asymmetric flows (e.g. SPAN/mirror sessions) |
-| `max-pending-packets` | `10000` | Avoid drops under burst (OISF recommendation) |
-| `anomaly` logging | enabled | Catches protocol violations signatures miss |
-| Runtime user | `suricata` (non-root) | Drops privileges after startup |
+| Setting | Value | Why | Reference |
+|---|---|---|---|
+| `HOME_NET` | `[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]` | Full RFC 1918 — treats all private-IP flows as internal | [HOME_NET best practice](https://forum.suricata.io/t/home-net-and-multiple-interfaces-plus-deployment-best-practices/374) |
+| `default-rule-path` | `/var/lib/suricata/rules` | Where `suricata-update` writes rule sets | [suricata-update docs](https://suricata-update.readthedocs.io/) |
+| `community-id` | `true` | Standard flow hash — correlates the same flow across Suricata, Zeek, and any SIEM | [community-id-spec](https://github.com/corelight/community-id-spec) |
+| `ja3-fingerprints` | `yes` | TLS client fingerprints — identify malware C2 behind encryption | [sslbl.abuse.ch/ja3](https://sslbl.abuse.ch/ja3-fingerprints/) |
+| **`ja4-fingerprints`** | `yes` | JA4 supersedes JA3 as the 2026 standard; JA3 widely evaded by modern malware | [FoxIO JA4 spec](https://github.com/FoxIO-LLC/ja4) |
+| **`hassh`** | `yes` | SSH client fingerprint — cheap, high-signal for lateral-movement detection | [salesforce/hassh](https://github.com/salesforce/hassh) |
+| `metadata` in alerts | `yes` | Adds CVE / product / description / ATT&CK tags to eve.json alert output | [ET metadata](https://www.proofpoint.com/us/blog/threat-insight/emerging-threats-updates-improve-metadata-including-mitre-attck-tags) |
+| `mpm-algo` / `spm-algo` | `hs` (Hyperscan) | Faster multi-pattern matching on 75k+ rule sets | [Suricata Hyperscan docs](https://docs.suricata.io/en/latest/performance/hyperscan.html) |
+| `stream.async-oneside` | `true` | Handle asymmetric flows (AWS Traffic Mirror / SPAN sessions deliver directions separately) | [Suricata tuning](https://docs.suricata.io/en/latest/performance/tuning-considerations.html) |
+| `max-pending-packets` | `5000` | Right-sized for 2-vCPU sensor; docs' 10000+ guidance assumes 8+ cores | [Suricata tuning](https://docs.suricata.io/en/suricata-7.0.12/performance/tuning-considerations.html) |
+| `anomaly` logging | enabled | Catches protocol violations that signature rules miss (TCP flag anomalies, protocol mismatch) | [eve-output anomaly](https://docs.suricata.io/en/suricata-8.0.0/output/eve/eve-json-output.html) |
+| Runtime user | `suricata` (non-root) | Drops privileges after startup via systemd drop-in; limits blast radius of any Suricata CVE | [Suricata drop-privs docs](https://docs.suricata.io/en/suricata-7.0.11/configuration/dropping-privileges.html) |
+| Pre-8 purge | automatic | Detects pre-v8 Suricata + purges before install so stale pidfiles from the 7.0 LTS PPA don't break the 8.x systemd unit | bundle-specific |
 
 Operational bits installed:
 - **Daily rule updates** via `/etc/cron.d/suricata-update` (03:00 UTC) with
@@ -101,14 +119,33 @@ Configured in `/opt/zeek/etc/`:
 - `node.cfg` — standalone deployment, capture on primary interface
 - `networks.cfg` — full RFC 1918 as `Site::local_nets`
 
+Log output format: **JSON** (one object per line, `_path` field identifies the
+log source). Switched from Zeek's default TSV so Filebeat, Elastic, Splunk,
+Loki, and any other SIEM can ingest natively without custom parsers.
+`zeek-cut` only reads TSV, so any downstream tool using it needs to move to
+`jq` / native JSON parsing.
+
 Loaded in `local.zeek`:
-- `policy/protocols/conn/community-id-logging` — adds community-id to `conn.log` for Suricata↔Zeek correlation
-- `protocols/ssh/detect-bruteforcing` (threshold lowered to 5 guesses)
-- `protocols/ftp/detect-bruteforcing`
-- `protocols/http/detect-webapps`
-- `frameworks/files/detect-MHR` — Team Cymru malware hash registry lookups
-- `frameworks/intel/seen`
-- `misc/stats` — 60-second engine stats to `stats.log`
+
+| `@load` | What it does | Why / Reference |
+|---|---|---|
+| `policy/tuning/json-logs` | Switches every log from TSV to JSON | [Book of Zeek: log formats](https://docs.zeek.org/en/master/log-formats.html) |
+| `policy/protocols/conn/community-id-logging` | Adds `community_id` hash to `conn.log` | Correlates flows with Suricata eve.json / [community-id-spec](https://github.com/corelight/community-id-spec) |
+| `protocols/ssh/detect-bruteforcing` | Notices on SSH password brute force (threshold **15**) | Default is 30; 15 catches hydra bursts without tripping on ordinary DevOps automation |
+| `protocols/ftp/detect-bruteforcing` | Notices on FTP password brute force | [Book of Zeek: FTP](https://docs.zeek.org/en/lts/scripts/policy/protocols/ftp/detect-bruteforcing.zeek.html) |
+| `protocols/http/detect-webapps` | Identifies web apps from HTTP traffic, logs to `software.log` | [policy/protocols/http/detect-webapps](https://docs.zeek.org/en/lts/scripts/policy/protocols/http/detect-webapps.zeek.html) |
+| `frameworks/files/detect-MHR` | Team Cymru MalHash Registry lookups against file hashes | [policy/frameworks/files/detect-MHR](https://docs.zeek.org/en/lts/scripts/policy/frameworks/files/detect-MHR.zeek.html) |
+| `frameworks/files/hash-all-files` | Enables SHA256 on every file (default is MD5/SHA1 only) — prerequisite for most file-hash intel | [policy/frameworks/files/hash-all-files](https://docs.zeek.org/en/lts/scripts/policy/frameworks/files/hash-all-files.zeek.html) |
+| `frameworks/intel/seen` | Matches seen indicators (hosts, URLs, hashes) against the intel framework | [Intel framework docs](https://docs.zeek.org/en/lts/frameworks/intel.html) |
+| `policy/frameworks/intel/do_notice` | Promotes intel hits to notices (visible in `notice.log`) for rows with `meta.do_notice=T` | [policy/frameworks/intel/do_notice](https://docs.zeek.org/en/lts/scripts/policy/frameworks/intel/do_notice.zeek.html) |
+| `policy/misc/capture-loss` | Emits `capture_loss.log` every 15 min + `CaptureLoss::Too_Much_Loss` notices — primary signal that the mirror is delivering | [policy/misc/capture-loss](https://docs.zeek.org/en/lts/scripts/policy/misc/capture-loss.zeek.html) |
+| `policy/protocols/ssl/validate-certs` | X.509 chain validation; flags expired / self-signed / bad-chain certs in `ssl.log` | [ssl/validate-certs](https://docs.zeek.org/en/lts/scripts/policy/protocols/ssl/validate-certs.zeek.html) |
+| `policy/protocols/ssl/log-hostcerts-only` | Cuts `x509.log` volume ~10× by dropping intermediate/root cert rows | [ssl/log-hostcerts-only](https://docs.zeek.org/en/master/scripts/policy/protocols/ssl/log-hostcerts-only.zeek.html) |
+| `policy/protocols/ssl/expiring-certs` | Notices for certs expiring within 30 days — cert hygiene | [ssl/expiring-certs](https://docs.zeek.org/en/lts/scripts/policy/protocols/ssl/validate-certs.zeek.html) |
+| `policy/protocols/conn/known-hosts` | Tracks first-seen hosts in the VPC — anomaly baseline | [known logs](https://docs.zeek.org/en/current/logs/known-and-software.html) |
+| `policy/protocols/conn/known-services` | Tracks first-seen (host, port, proto) tuples — new-service alerting basis | same |
+| `policy/frameworks/analyzer/detect-protocols` | Logs services running on non-standard ports (shells on 443, HTTP on 22, etc.) | [frameworks/analyzer/detect-protocols](https://docs.zeek.org/en/lts/scripts/policy/frameworks/analyzer/detect-protocols.zeek.html) |
+| `misc/stats` | 60-second engine stats to `stats.log` — rate / memory / queue telemetry | [policy/misc/stats](https://docs.zeek.org/en/lts/scripts/policy/misc/stats.zeek.html) |
 
 **Intel Framework** (`/opt/zeek/intel/`):
 - `build-intel.sh` assembles `intel.dat` from:
@@ -120,12 +157,23 @@ Loaded in `local.zeek`:
 **Operational:**
 - `zeekctl cron` daily at 04:00 (rotation + crash recovery checks)
 - Logrotate: `/opt/zeek/logs/*/*.log`, 7 days compressed
+- **`zeek.service` systemd unit** — Zeek auto-starts on boot via a oneshot
+  wrapper around `zeekctl start/stop`. Replaces the prior cron-only lifecycle,
+  which left Zeek in `crashed` state on reboot until 04:00 UTC.
 
 ### Custom rules
 
 ~130 signatures in the `9000000` SID range, embedded directly in `standalone.sh`
 and appended to `/var/lib/suricata/rules/suricata.rules` after `suricata-update`
-so they survive rule refreshes. Coverage:
+so they survive rule refreshes.
+
+The install-time append filters out **SID 9000002** (`TEST - SSH connection
+to HOME_NET`) — in single-ENI mirror-target mode the sensor sees its own
+management SSH traffic, which would trip that canary rule. The full rule
+still exists in the custom-rules source on disk, so you can manually re-add
+it if you want the canary in a dual-ENI setup.
+
+Coverage:
 
 - **Traffic mirror validation** (SSH, TCP SYN scan canaries)
 - **DNS tunneling** — long subdomain labels, entropy patterns (iodine, dnscat2)
@@ -246,11 +294,27 @@ iteration reports in the source CDK repo (`reports/iteration-*.html`,
 `reports/attack-vs-detection-*.html`) document how coverage evolved across
 8 tuning iterations.
 
+## Continuous integration
+
+Two GitHub Actions workflows validate the bundle end-to-end. Both use OIDC
+federation to AWS (no long-lived access keys), provision ephemeral EC2
+instances, and tear everything down on completion — see
+[`.github/AWS_SETUP.md`](.github/AWS_SETUP.md) for the one-time IAM role setup.
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| [`validate-standalone.yml`](.github/workflows/validate-standalone.yml) | Push / PR touching `standalone.sh` | Spins up one t3.medium Ubuntu 22.04, runs `standalone.sh --force`, asserts Suricata + Zeek are on 8.x and configs validate |
+| [`validate-detections.yml`](.github/workflows/validate-detections.yml) | `workflow_dispatch` (manual) | Spins up **three** t3.medium instances (sensor / victim / attacker), wires an **AWS VPC Traffic Mirror** session (VXLAN/4789) from victim ENI → sensor primary ENI, installs the bundle, runs [`testing/run_attacks.sh`](testing/run_attacks.sh) from the attacker, gates on [`testing/verify_alerts.sh`](testing/verify_alerts.sh), uploads the resulting `sig-breakdown.txt` + `fast.log` + Zeek logs as artifacts, and tears down in reverse order. ~$0.05 / 8-minute run. |
+
+The detection workflow verifies that every link in the chain is actually
+working end-to-end — install succeeds, mirror delivers packets, attacks
+produce alerts, both Suricata and Zeek log them.
+
 ## Logs
 
 - Install log: `/var/log/suricata-setup.log`
 - Suricata: `/var/log/suricata/{eve.json,fast.log,suricata.log}`
-- Zeek: `/opt/zeek/logs/current/*.log`
+- Zeek: `/opt/zeek/logs/current/*.log` (JSON format, one object per line)
 
 ## Uninstall / rollback
 
