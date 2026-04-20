@@ -37,10 +37,23 @@ apt-get install -y -qq curl jq tar
 id -u cribl >/dev/null 2>&1 || useradd -m -d /opt/cribl -s /bin/bash cribl
 
 # ---------- Download + extract ----------
-# Cribl publishes /dl/latest as a stable redirect to the current stream
-# GA tarball. No auth / account required for the Free Edition.
+# Cribl's documented download URL for Stream Linux x64. No auth / account
+# required for the Free Edition. Earlier URL had a duplicate "latest" and
+# returned 404; this is the form Cribl's official docs publish.
 cd /opt
-curl -fsSL https://cdn.cribl.io/dl/latest/cribl-latest-linux-x64.tgz -o /tmp/cribl.tgz
+CRIBL_URL="https://cdn.cribl.io/dl/latest/cribl-linux-x64.tgz"
+if ! curl -fsSL "$CRIBL_URL" -o /tmp/cribl.tgz; then
+  # Fallback: resolve the current version via Cribl's JSON metadata and
+  # build the versioned tarball URL. Catches edge cases where /latest/
+  # is temporarily out of sync with the CDN.
+  echo "primary download failed; trying versioned URL"
+  VER=$(curl -fsSL https://cdn.cribl.io/dl/versions | jq -r '.versions.stream[0].version // empty')
+  if [ -z "$VER" ]; then
+    echo "FAIL: could not resolve Cribl Stream version from $CRIBL_URL or /dl/versions" >&2
+    exit 1
+  fi
+  curl -fsSL "https://cdn.cribl.io/dl/${VER}/cribl-${VER}-linux-x64.tgz" -o /tmp/cribl.tgz
+fi
 rm -rf /opt/cribl
 tar -xzf /tmp/cribl.tgz -C /opt
 rm -f /tmp/cribl.tgz
