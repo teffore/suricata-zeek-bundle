@@ -443,6 +443,17 @@
       "expected_suricata_sids": [2033967, 2030702, 2034634, 2047767, 2049202, 2058175, 2060250, 2066057, 2066106, 2067056, 2067060],
       "expected_zeek_notices": [],
       "mitre_technique": "T1567"
+    },
+    {
+      "id": "cryptominer-live",
+      "category": "c2",
+      "attacks": [
+        "TLS SNI to supportxmr.com CoinMiner pool",
+        "XMRig-agent stratum login JSON to :3333"
+      ],
+      "expected_suricata_sids": [2047929, 2024792],
+      "expected_zeek_notices": ["ProtocolDetector::Protocol_Found", "SSL::Invalid_Server_Cert"],
+      "mitre_technique": "T1496"
     }
   ]
 }

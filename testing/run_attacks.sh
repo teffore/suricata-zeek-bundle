@@ -173,6 +173,20 @@ run_http2_evasion_group() {
     --data 'SMUGGLED_BODY_GET /admin HTTP/1.1' >/dev/null 2>&1 || true
 }
 
+run_cryptominer_live_group() {
+  # Live cryptominer fingerprints: (a) TLS SNI to a pool that ET flags as a
+  # CoinMiner domain (supportxmr.com), (b) a stratum-protocol login JSON
+  # to the pool's stratum port 3333 which fires ET INFO Cryptocurrency
+  # Miner Checkin. Neither needs auth or an account — both fire on the
+  # shape of the traffic alone. Added after live-lab validation in wave 2.
+  echo "[BG/cryptominer] [45] Cryptominer pool SNI + stratum login JSON"
+  # (a) SNI hit — ET MALWARE CoinMiner supportxmr SNI
+  curl -sS --max-time 5 "https://pool.supportxmr.com/" -k -o /dev/null -w "" 2>&1 || true
+  # (b) stratum login JSON to :3333 — ET INFO Cryptocurrency Miner Checkin
+  printf '{"id":1,"jsonrpc":"2.0","method":"login","params":{"login":"41ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdefghijklmnopqrstuv","pass":"x","agent":"XMRig/6.21.0","algo":["rx/0"]}}\n' \
+    | timeout 3 nc pool.supportxmr.com 3333 2>/dev/null | head -1 || true
+}
+
 run_saas_c2_exfil_group() {
   # TLS-SNI-based exfil/C2 destinations. Each host has at least one ET
   # INFO/HUNTING rule that matches on SNI alone, so we don't need the
@@ -204,8 +218,9 @@ run_doh_tunnel_group       > "$LOGDIR/doh.log"         2>&1 & DOH_PID=$!
 run_cve_2024_sigbank_group > "$LOGDIR/cve2024.log"     2>&1 & CVE2024_PID=$!
 run_http2_evasion_group    > "$LOGDIR/http2.log"       2>&1 & HTTP2_PID=$!
 run_saas_c2_exfil_group    > "$LOGDIR/saas-c2.log"     2>&1 & SAAS_C2_PID=$!
+run_cryptominer_live_group > "$LOGDIR/cryptominer.log" 2>&1 & CRYPTOMINER_PID=$!
 
-echo "=== 11 background probe groups launched; running fast serial probes inline ==="
+echo "=== 12 background probe groups launched; running fast serial probes inline ==="
 
 # ---------- Web Application Attacks ----------
 
@@ -1238,10 +1253,11 @@ wait "$DOH_PID"          2>/dev/null || true
 wait "$CVE2024_PID"      2>/dev/null || true
 wait "$HTTP2_PID"        2>/dev/null || true
 wait "$SAAS_C2_PID"      2>/dev/null || true
+wait "$CRYPTOMINER_PID"  2>/dev/null || true
 
 # Dump the background-group logs in a stable, named order so CI output
 # is deterministic even though the groups finished in arbitrary order.
-for g in nmap hydra nikto lateral nuclei flightsim impacket-ad doh cve2024 http2 saas-c2; do
+for g in nmap hydra nikto lateral nuclei flightsim impacket-ad doh cve2024 http2 saas-c2 cryptominer; do
   echo "::group::bg-${g}"
   cat "$LOGDIR/${g}.log" 2>/dev/null || true
   echo "::endgroup::"
