@@ -11,11 +11,15 @@
 
 outputs:
   default:
-    type: elasticsearch
+    type: logstash
     hosts:
-      - "http://${CRIBL_PRIVATE}:9200"
-    # No auth against Cribl — its elastic-bulk source is open intra-SG.
-    # Real deployments would put API key auth here.
+      - "${CRIBL_PRIVATE}:5044"
+    # Logstash/lumberjack protocol into Cribl's elastic_beats input.
+    # This is the designed EA → Cribl path: Cribl's elastic_beats source
+    # accepts Beats / EA data without needing to mimic a full ES API
+    # surface (the ES output type's health checks were why the earlier
+    # elasticsearch→elastic-bulk attempt never shipped).
+    ssl.enabled: false
 
 # The agent's monitoring logs are noisy for a POC — send them to files
 # instead of the output, otherwise Cribl relays a stream of agent

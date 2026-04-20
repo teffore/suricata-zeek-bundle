@@ -116,25 +116,28 @@ EOF
 
 echo "  destination created: elastic-out"
 
-# ---------- Configure source: Elastic Bulk API listener on :9200 ----------
-# Elastic Agent's elasticsearch output will POST /_bulk to this port,
-# thinking it's talking to a real ES cluster. Cribl accepts the bulk
-# payload, splits it into events, and routes them.
+# ---------- Configure source: Elastic Beats listener on :5044 ----------
+# Elastic Agent's `logstash` output speaks the lumberjack/beats protocol
+# to this port. This is the designed EA → Cribl path: Cribl's
+# elastic_beats source is specifically for receiving Beats / Elastic
+# Agent data without having to mimic a full Elasticsearch API surface.
+# Previous attempt used Cribl's "elastic" (bulk API) source — EA's
+# elasticsearch output refused to ship because it couldn't health-check
+# Cribl as a real ES cluster.
 curl -fsS -X POST http://127.0.0.1:9000/m/default/lib/inputs \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d @- <<'EOF'
 {
-  "id": "elastic-in",
-  "type": "elastic",
+  "id": "beats-in",
+  "type": "elastic_beats",
   "disabled": false,
   "host": "0.0.0.0",
-  "port": 9200,
-  "authTokens": [],
+  "port": 5044,
   "tls": { "disabled": true }
 }
 EOF
 
-echo "  source created: elastic-in (listening on :9200)"
+echo "  source created: beats-in (listening on :5044, elastic_beats / lumberjack)"
 
 # ---------- Configure route: send everything from elastic-in to elastic-out ----------
 # The default "passthru" pipeline is a no-op; good enough for the POC.
@@ -152,7 +155,7 @@ curl -fsS -X PUT http://127.0.0.1:9000/m/default/system/routes \
       "filter": "true",
       "pipeline": "passthru",
       "output": "elastic-out",
-      "description": "Send all events from elastic-in to elastic-out (POC passthru)",
+      "description": "Send all events from beats-in to elastic-out (POC passthru)",
       "final": true
     }
   ]
@@ -176,7 +179,7 @@ echo "  config committed and deployed"
 
 # ---------- Wait for source listener to bind ----------
 for i in $(seq 1 30); do
-  if (echo > /dev/tcp/127.0.0.1/9200) 2>/dev/null; then
+  if (echo > /dev/tcp/127.0.0.1/5044) 2>/dev/null; then
     break
   fi
   sleep 2
@@ -184,5 +187,5 @@ done
 
 echo "=== Cribl Stream install complete ==="
 echo "  UI:      http://<cribl_public_ip>:9000  (admin / admin)"
-echo "  Source:  elastic-in on :9200"
-echo "  Dest:    elastic-out → http://${ELASTIC_PRIVATE}:9200"
+echo "  Source:  beats-in on :5044 (elastic_beats)"
+echo "  Dest:    elastic-out → https://${ELASTIC_PRIVATE}:9200"

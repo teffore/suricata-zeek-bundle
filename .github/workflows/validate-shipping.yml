@@ -429,15 +429,51 @@ jobs:
           # /tmp/shipping-artifacts/*.json already).
           cp /tmp/shipping-artifacts/*.json . 2>/dev/null || true
 
-          # Elastic Agent status + last 200 log lines from the sensor
-          ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.sensor_ip }} \
-            "sudo elastic-agent status 2>&1; echo '---'; sudo tail -200 /opt/Elastic/Agent/data/elastic-agent-*/logs/elastic-agent-json.log 2>/dev/null" \
-            > /tmp/shipping-artifacts/elastic-agent-status.log 2>&1 || true
+          # Elastic Agent status + log tail + sensor log dirs + port check
+          # EA's log path varies by install layout; find it instead of guessing.
+          ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.sensor_ip }} '
+            echo "=== elastic-agent status ==="
+            sudo elastic-agent status 2>&1
+            echo ""
+            echo "=== /var/log/suricata/ ==="
+            sudo ls -la /var/log/suricata/ 2>&1
+            echo ""
+            echo "=== /opt/zeek/logs/current/ ==="
+            sudo ls -la /opt/zeek/logs/current/ 2>&1
+            echo ""
+            echo "=== EA log file tail (auto-located) ==="
+            EA_LOG=$(sudo find /opt/Elastic /var/log/elastic-agent /var/lib/elastic-agent -type f \( -name "*.ndjson" -o -name "elastic-agent*.log" \) 2>/dev/null | head -1)
+            echo "path: $EA_LOG"
+            [ -n "$EA_LOG" ] && sudo tail -200 "$EA_LOG"
+            echo ""
+            echo "=== nc to cribl:5044 from sensor ==="
+            nc -zv '"${{ steps.wait.outputs.cribl_private }}"' 5044 2>&1
+          ' > /tmp/shipping-artifacts/elastic-agent-status.log 2>&1 || true
 
-          # Cribl running config + last 200 log lines
-          ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.cribl_ip }} \
-            "curl -fsS -u admin:admin http://127.0.0.1:9000/api/v1/system/info 2>&1; echo '---'; sudo tail -200 /opt/cribl/log/cribl.log 2>/dev/null" \
-            > /tmp/shipping-artifacts/cribl-status.log 2>&1 || true
+          # Cribl: metrics endpoint for actual event counts (bearer token
+          # login), plus config listing so we can see what sources/dests
+          # are wired up, plus log tail.
+          ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.cribl_ip }} '
+            TOKEN=$(curl -fsS -X POST http://127.0.0.1:9000/api/v1/auth/login \
+              -H "Content-Type: application/json" \
+              -d "{\"username\":\"admin\",\"password\":\"admin\"}" | jq -r ".token" 2>/dev/null)
+            echo "=== Cribl inputs ==="
+            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/m/default/lib/inputs 2>&1 | head -c 4000
+            echo ""
+            echo "=== Cribl outputs ==="
+            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/m/default/lib/outputs 2>&1 | head -c 2000
+            echo ""
+            echo "=== Cribl routes ==="
+            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/m/default/system/routes 2>&1 | head -c 2000
+            echo ""
+            echo "=== Cribl metrics (events in/out last 15 min) ==="
+            curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+              http://127.0.0.1:9000/api/v1/system/metrics/query \
+              -d "{\"filterExp\":\"__worker_group==\\\"default\\\" && (name==\\\"total.in_events\\\" || name==\\\"total.out_events\\\")\",\"earliest\":\"-15m\"}" 2>&1 | head -c 4000
+            echo ""
+            echo "=== cribl.log tail ==="
+            sudo tail -200 /opt/cribl/log/cribl.log 2>/dev/null
+          ' > /tmp/shipping-artifacts/cribl-status.log 2>&1 || true
 
           # Elasticsearch indices + health
           ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.elastic_ip }} \
