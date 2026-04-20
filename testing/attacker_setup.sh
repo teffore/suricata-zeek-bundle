@@ -30,7 +30,12 @@ apt-get update -y -qq
 #                      entry points, used by run_attacks.sh lateral-movement
 #                      section. (Kali's impacket-scripts is NOT available in
 #                      Ubuntu universe — do not install it.)
-REQUIRED=(nmap curl hydra nikto xxd hping3 dnsutils smbclient python3-impacket)
+#   python3-paramiko — SSH attribution probes (HASSH fingerprint via
+#                      SSH-2.0-paramiko_* client banner, exercised by the
+#                      impacket-ad-chain group)
+#   nghttp2-client — nghttp/nghttpx for HTTP/2 prior-knowledge evasion probes
+#                    (triggers Suricata 2260000/2290006 + Zeek weird)
+REQUIRED=(nmap curl hydra nikto xxd hping3 dnsutils smbclient python3-impacket python3-paramiko nghttp2-client)
 
 installed=()
 failed=()

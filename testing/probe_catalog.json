@@ -382,6 +382,67 @@
       "expected_suricata_sids": [],
       "expected_zeek_notices": ["Intel::Notice"],
       "mitre_technique": "T1071.001"
+    },
+    {
+      "id": "impacket-ad-enum-live",
+      "category": "ad",
+      "attacks": [
+        "impacket-GetNPUsers AS-REP-roast pattern (TCP 88)",
+        "impacket-GetUserSPNs Kerberoast pattern",
+        "impacket-secretsdump DCSync DRSUAPI request",
+        "impacket-lookupsid SID enumeration via lsarpc pipe"
+      ],
+      "expected_suricata_sids": [9000430, 9000431, 9001014, 9001015, 9001021, 2067085, 2067086, 2067087],
+      "expected_zeek_notices": ["ProtocolDetector::Protocol_Found"],
+      "mitre_technique": "T1558.003"
+    },
+    {
+      "id": "doh-tunneling",
+      "category": "exfil",
+      "attacks": [
+        "Cloudflare DoH JSON API (cloudflare-dns.com)",
+        "Google DoH JSON API (dns.google)",
+        "Quad9 wire-format DoH (dns.quad9.net, application/dns-message)"
+      ],
+      "expected_suricata_sids": [2027695, 2047866, 2048911],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1572"
+    },
+    {
+      "id": "cve-2024-edge-device-sigbank",
+      "category": "cve-2024",
+      "attacks": [
+        "JetBrains TeamCity CVE-2024-27198 /hax?jsp= path-traversal auth bypass",
+        "ConnectWise ScreenConnect CVE-2024-1709 SetupWizard auth bypass"
+      ],
+      "expected_suricata_sids": [2051505, 2050988],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1190"
+    },
+    {
+      "id": "http2-evasion",
+      "category": "evasion",
+      "attacks": [
+        "HTTP/2 h2c prior-knowledge with JNDI header to HTTP/1 nginx",
+        "HTTP/2 CL.0 smuggling shape"
+      ],
+      "expected_suricata_sids": [2260000, 2290006],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1090"
+    },
+    {
+      "id": "saas-c2-exfil-2024",
+      "category": "c2",
+      "attacks": [
+        "Telegram Bot API SNI",
+        "Dropbox API upload SNI",
+        "webhook.site / beeceptor / pipedream inspection-service SNIs",
+        "ngrok-free.app / trycloudflare.com / serveo.net tunneling-service SNIs",
+        "files.pythonhosted.org package download SNI"
+      ],
+      "expected_suricata_sids": [2033967, 2030702, 2034634, 2047767, 2049202, 2058175, 2060250, 2066057, 2066106, 2067056, 2067060],
+      "expected_zeek_notices": [],
+      "mitre_technique": "T1567"
     }
   ]
 }
