@@ -95,7 +95,9 @@ auth() { echo "Authorization: Bearer $TOKEN"; }
 # ---------- Configure destination: Elasticsearch ----------
 # Cribl's elastic destination talks the bulk API. We use the api_key
 # auth mode so the superuser password never leaves the elastic box.
-curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/lib/outputs \
+# Single-instance mode: API paths are /api/v1/lib/... (no /m/default/
+# prefix; that's for distributed leader-worker deployments).
+curl -fsS -X POST http://127.0.0.1:9000/api/v1/lib/outputs \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d @- <<EOF
 {
@@ -124,7 +126,7 @@ echo "  destination created: elastic-out"
 # Previous attempt used Cribl's "elastic" (bulk API) source — EA's
 # elasticsearch output refused to ship because it couldn't health-check
 # Cribl as a real ES cluster.
-curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/lib/inputs \
+curl -fsS -X POST http://127.0.0.1:9000/api/v1/lib/inputs \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d @- <<'EOF'
 {
@@ -143,7 +145,7 @@ echo "  source created: beats-in (listening on :5044, elastic_beats / lumberjack
 # The default "passthru" pipeline is a no-op; good enough for the POC.
 # Future work: add a Cribl pipeline that enriches ECS fields or drops
 # the high-volume zeek conn.log events before shipping.
-curl -fsS -X PUT http://127.0.0.1:9000/api/v1/m/default/system/routes \
+curl -fsS -X PUT http://127.0.0.1:9000/api/v1/system/routes \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d @- <<'EOF'
 {
@@ -164,18 +166,11 @@ EOF
 
 echo "  route created: shipping-lab-all (filter=true → passthru → elastic-out)"
 
-# ---------- Commit + deploy the config ----------
-# Cribl stages config changes in the "default" workspace; this call
-# applies them so the listener actually starts.
-curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/version/commit \
-  -H "$(auth)" -H 'Content-Type: application/json' \
-  -d '{"message":"shipping-lab initial config"}' >/dev/null
-
-curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/version/deploy \
-  -H "$(auth)" -H 'Content-Type: application/json' \
-  -d '{}' >/dev/null
-
-echo "  config committed and deployed"
+# ---------- Apply the config ----------
+# Single-instance mode applies config changes immediately via the
+# resource POSTs above — no commit/deploy pair needed. Those endpoints
+# only exist for distributed (leader-worker) deployments.
+echo "  single-instance: config applied in-place by the POSTs above"
 
 # ---------- Wait for source listener to bind ----------
 for i in $(seq 1 30); do
