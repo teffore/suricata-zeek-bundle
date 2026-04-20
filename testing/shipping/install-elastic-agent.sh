@@ -51,13 +51,18 @@ fi
 
 # ---------- Install as a systemd service ----------
 # `elastic-agent install` copies the binary to /opt/Elastic/Agent and
-# wires up the systemd unit. -f = non-interactive. --non-interactive
-# suppresses the Fleet enrollment prompt.
+# wires up the systemd unit. The `-c` flag is IGNORED by install — it
+# writes the shipped elastic-agent.yml template regardless. Install
+# first, then overwrite the config and restart. This behavior was
+# confirmed in a hands-on lab (8.15.3).
 ./elastic-agent install \
   --non-interactive \
   --force \
-  --unprivileged=false \
-  -c /tmp/elastic-agent.yml
+  --unprivileged=false
+
+# Overwrite with our template and restart so the real config takes effect
+cp /tmp/elastic-agent.yml /opt/Elastic/Agent/elastic-agent.yml
+systemctl restart elastic-agent
 
 # ---------- Wait for it to start shipping ----------
 # elastic-agent service reports its state via `status`. We gate on

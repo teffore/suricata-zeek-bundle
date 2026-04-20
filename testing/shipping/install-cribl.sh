@@ -77,19 +77,40 @@ YAML
 
 # Destination: the real Elasticsearch cluster provisioned by
 # install-elastic.sh, authenticated with the scoped api_key it created.
+#
+# ⚠️ This exact schema was captured from a hands-on lab where the UI
+# was used to configure the destination end-to-end. Several earlier
+# guesses (authType: apiKey, flat username/password, single url field)
+# all silently failed. The working shape is:
+#
+#   - urls: list of {weight, url} objects (NOT a single `url:` field)
+#   - auth: NESTED block (NOT flat authType at top level)
+#   - auth.authType: "manualAPIKey"
+#   - auth.manualAPIKey: plaintext base64(id:key) (Cribl accepts
+#     plaintext; it's stored plaintext on first boot and encrypted on
+#     next UI save, but plaintext keeps working)
+#   - tls.rejectUnauthorized: false  (for the self-signed cert)
+#   - rejectUnauthorized: false (top-level — Cribl needs both)
 cat >/opt/cribl/local/cribl/outputs.yml <<EOF
 outputs:
   elastic-out:
     type: elastic
-    url: https://${ELASTIC_PRIVATE}:9200/_bulk
+    urls:
+      - url: https://${ELASTIC_PRIVATE}:9200/_bulk
+        weight: 1
     index: logs-suricata-zeek-shipping-lab
-    authType: apiKey
-    apiKey: ${ELASTIC_API_KEY}
-    onBackpressure: block
-    compress: false
+    auth:
+      disabled: false
+      authType: manualAPIKey
+      manualAPIKey: ${ELASTIC_API_KEY}
     tls:
       disabled: false
       rejectUnauthorized: false
+    rejectUnauthorized: false
+    onBackpressure: block
+    compress: false
+    loadBalanced: true
+    elasticVersion: auto
 EOF
 
 # Route: everything from in_elastic → passthru → elastic-out. The
