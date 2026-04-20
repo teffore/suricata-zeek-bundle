@@ -1,0 +1,492 @@
+# Validates the log-shipping pipeline: sensor's Suricata + Zeek logs
+# flow through Elastic Agent (standalone) → Cribl Stream → Elasticsearch.
+#
+# SEPARATE from validate-detections.yml. That workflow is the fast (~8m)
+# coverage gate for every change. THIS workflow is the heavy (~18m)
+# end-to-end pipeline smoke test, run on demand. No shared state, no
+# shared step dependencies.
+#
+# Trigger: workflow_dispatch only. Run time ~15-20 min, cost ~$0.06/run.
+#
+# Topology (5 × t3.medium, all in one default-VPC subnet + SG):
+#   attacker ── attacks ── victim  ── mirror ──▶ sensor (Suri+Zeek+ElasticAgent)
+#                                                          │
+#                                                          ▼ http :9200
+#                                                       cribl  (Stream single-instance)
+#                                                          │
+#                                                          ▼ _bulk
+#                                                       elastic (ES 8 + Kibana 8)
+#
+# Gate: ≥10 Suricata events + ≥10 Zeek events landed in Elasticsearch
+# within 5 min after the attack battery completes.
+
+name: Validate log-shipping pipeline (Elastic Agent + Cribl + Elasticsearch)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_TYPE: t3.medium
+
+jobs:
+  ship:
+    name: End-to-end shipping pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set run context
+        id: ctx
+        run: |
+          RUN_TAG="gha-ship-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          MY_IP=$(curl -fsSL https://checkip.amazonaws.com)
+          AMI_ID=$(aws ssm get-parameter \
+            --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+            --query Parameter.Value --output text)
+          echo "run_tag=${RUN_TAG}" >> "$GITHUB_OUTPUT"
+          echo "my_ip=${MY_IP}" >> "$GITHUB_OUTPUT"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve default VPC + subnet
+        id: net
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values=$VPC_ID Name=default-for-az,Values=true \
+            --query 'Subnets[0].SubnetId' --output text)
+          echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
+          echo "subnet_id=${SUBNET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate ephemeral SSH key + register pair
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/gha_id -N '' -q
+          chmod 600 ~/.ssh/gha_id
+          aws ec2 import-key-pair \
+            --key-name "${{ steps.ctx.outputs.run_tag }}" \
+            --public-key-material "fileb://$HOME/.ssh/gha_id.pub"
+
+      - name: Create security group
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "${{ steps.ctx.outputs.run_tag }}" \
+            --description "ephemeral GHA shipping run" \
+            --vpc-id "${{ steps.net.outputs.vpc_id }}" \
+            --query GroupId --output text)
+          # SSH from runner
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 \
+            --cidr "${{ steps.ctx.outputs.my_ip }}/32"
+          # Elasticsearch :9200 from runner — verify-shipping.sh queries it
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 9200 \
+            --cidr "${{ steps.ctx.outputs.my_ip }}/32"
+          # Intra-SG any-to-any — mirror VXLAN (UDP/4789), Elastic Agent
+          # → Cribl (:9200), Cribl → ES (:9200), etc. all flow on this.
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol -1 --source-group "$SG_ID"
+          echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Launch 5 instances (sensor, victim, attacker, cribl, elastic)
+        id: ec2
+        run: |
+          launch() {
+            local role="$1"
+            aws ec2 run-instances \
+              --image-id "${{ steps.ctx.outputs.ami_id }}" \
+              --instance-type "${{ env.INSTANCE_TYPE }}" \
+              --key-name "${{ steps.ctx.outputs.run_tag }}" \
+              --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
+              --subnet-id "${{ steps.net.outputs.subnet_id }}" \
+              --associate-public-ip-address \
+              --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=20,VolumeType=gp3}' \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ steps.ctx.outputs.run_tag }}-${role}},{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}},{Key=Role,Value=${role}}]" \
+              --query 'Instances[0].InstanceId' --output text
+          }
+          SENSOR_ID=$(launch sensor)
+          VICTIM_ID=$(launch victim)
+          ATTACKER_ID=$(launch attacker)
+          CRIBL_ID=$(launch cribl)
+          ELASTIC_ID=$(launch elastic)
+          echo "sensor_id=${SENSOR_ID}"     >> "$GITHUB_OUTPUT"
+          echo "victim_id=${VICTIM_ID}"     >> "$GITHUB_OUTPUT"
+          echo "attacker_id=${ATTACKER_ID}" >> "$GITHUB_OUTPUT"
+          echo "cribl_id=${CRIBL_ID}"       >> "$GITHUB_OUTPUT"
+          echo "elastic_id=${ELASTIC_ID}"   >> "$GITHUB_OUTPUT"
+
+      - name: Wait for instances + capture IPs
+        id: wait
+        run: |
+          # Short poll for the `running` state (~30s), skip the slow
+          # Nitro instance-status-ok wait (pattern from PR 8).
+          for ID in \
+            "${{ steps.ec2.outputs.sensor_id }}" \
+            "${{ steps.ec2.outputs.victim_id }}" \
+            "${{ steps.ec2.outputs.attacker_id }}" \
+            "${{ steps.ec2.outputs.cribl_id }}" \
+            "${{ steps.ec2.outputs.elastic_id }}"; do
+            for i in $(seq 1 30); do
+              STATE=$(aws ec2 describe-instances --instance-ids "$ID" \
+                --query 'Reservations[0].Instances[0].State.Name' --output text)
+              [ "$STATE" = "running" ] && break
+              sleep 2
+            done
+            [ "$STATE" = "running" ] || { echo "FAIL: $ID never reached running"; exit 1; }
+          done
+
+          ip_of() {
+            aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+          }
+          private_of() {
+            aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text
+          }
+          primary_eni_of() {
+            aws ec2 describe-instances --instance-ids "$1" \
+              --query 'Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId' --output text
+          }
+
+          SENSOR_IP=$(ip_of       "${{ steps.ec2.outputs.sensor_id }}")
+          VICTIM_IP=$(ip_of       "${{ steps.ec2.outputs.victim_id }}")
+          ATTACKER_IP=$(ip_of     "${{ steps.ec2.outputs.attacker_id }}")
+          CRIBL_IP=$(ip_of        "${{ steps.ec2.outputs.cribl_id }}")
+          ELASTIC_IP=$(ip_of      "${{ steps.ec2.outputs.elastic_id }}")
+
+          VICTIM_PRIVATE=$(private_of   "${{ steps.ec2.outputs.victim_id }}")
+          ATTACKER_PRIVATE=$(private_of "${{ steps.ec2.outputs.attacker_id }}")
+          CRIBL_PRIVATE=$(private_of    "${{ steps.ec2.outputs.cribl_id }}")
+          ELASTIC_PRIVATE=$(private_of  "${{ steps.ec2.outputs.elastic_id }}")
+
+          VICTIM_ENI=$(primary_eni_of   "${{ steps.ec2.outputs.victim_id }}")
+          ATTACKER_ENI=$(primary_eni_of "${{ steps.ec2.outputs.attacker_id }}")
+          SENSOR_ENI=$(primary_eni_of   "${{ steps.ec2.outputs.sensor_id }}")
+
+          aws ec2 modify-network-interface-attribute \
+            --network-interface-id "$SENSOR_ENI" --no-source-dest-check
+
+          echo "sensor_ip=${SENSOR_IP}"         >> "$GITHUB_OUTPUT"
+          echo "victim_ip=${VICTIM_IP}"         >> "$GITHUB_OUTPUT"
+          echo "attacker_ip=${ATTACKER_IP}"     >> "$GITHUB_OUTPUT"
+          echo "cribl_ip=${CRIBL_IP}"           >> "$GITHUB_OUTPUT"
+          echo "elastic_ip=${ELASTIC_IP}"       >> "$GITHUB_OUTPUT"
+          echo "victim_private=${VICTIM_PRIVATE}"     >> "$GITHUB_OUTPUT"
+          echo "attacker_private=${ATTACKER_PRIVATE}" >> "$GITHUB_OUTPUT"
+          echo "cribl_private=${CRIBL_PRIVATE}"       >> "$GITHUB_OUTPUT"
+          echo "elastic_private=${ELASTIC_PRIVATE}"   >> "$GITHUB_OUTPUT"
+          echo "victim_eni=${VICTIM_ENI}"       >> "$GITHUB_OUTPUT"
+          echo "attacker_eni=${ATTACKER_ENI}"   >> "$GITHUB_OUTPUT"
+          echo "sensor_eni=${SENSOR_ENI}"       >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH + cloud-init on all five (parallel)
+        run: |
+          wait_box() {
+            local IP="$1" NAME="$2"
+            for i in $(seq 1 30); do nc -z -w 5 "$IP" 22 && break; sleep 5; done
+            nc -z -w 5 "$IP" 22 || { echo "SSH never came up on $NAME ($IP)"; exit 1; }
+            ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              ubuntu@"$IP" "cloud-init status --wait"
+          }
+          wait_box "${{ steps.wait.outputs.sensor_ip }}"   sensor   & P1=$!
+          wait_box "${{ steps.wait.outputs.victim_ip }}"   victim   & P2=$!
+          wait_box "${{ steps.wait.outputs.attacker_ip }}" attacker & P3=$!
+          wait_box "${{ steps.wait.outputs.cribl_ip }}"    cribl    & P4=$!
+          wait_box "${{ steps.wait.outputs.elastic_ip }}"  elastic  & P5=$!
+          fail=0
+          wait $P1 || fail=1
+          wait $P2 || fail=1
+          wait $P3 || fail=1
+          wait $P4 || fail=1
+          wait $P5 || fail=1
+          [ "$fail" = 0 ] || exit 1
+
+      - name: Prepare sensor NIC for mirror reception
+        run: |
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.sensor_ip }} '
+              set -e
+              IF=$(ip -o link show | awk -F": " "{print \$2}" | grep -v lo | head -1)
+              sudo ip link set "$IF" promisc on
+              sudo ip link set "$IF" mtu 9001
+            '
+
+      - name: Install elastic + cribl in parallel (sensor / victim / attacker installs follow)
+        id: infra
+        run: |
+          # Elastic must come up BEFORE Cribl so Cribl's install can
+          # bake the ES api_key into its destination config. Sensor /
+          # victim / attacker have no dependency on elastic or cribl,
+          # so they run in parallel after this step.
+          SSH_OPTS="-i $HOME/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          ELASTIC_IP="${{ steps.wait.outputs.elastic_ip }}"
+          ELASTIC_PRIVATE="${{ steps.wait.outputs.elastic_private }}"
+
+          scp $SSH_OPTS testing/shipping/install-elastic.sh ubuntu@"$ELASTIC_IP":/tmp/install-elastic.sh
+          ssh $SSH_OPTS ubuntu@"$ELASTIC_IP" "sudo bash /tmp/install-elastic.sh" \
+            2>&1 | tee /tmp/elastic-install.log
+
+          # Parse the two ELASTIC_OUTPUT: lines into step outputs. Mask
+          # the password so it doesn't show up in raw workflow logs.
+          ELASTIC_PASSWORD=$(grep '^ELASTIC_OUTPUT:password=' /tmp/elastic-install.log | cut -d= -f2-)
+          ELASTIC_API_KEY=$(grep '^ELASTIC_OUTPUT:api_key=' /tmp/elastic-install.log | cut -d= -f2-)
+
+          if [ -z "$ELASTIC_PASSWORD" ] || [ -z "$ELASTIC_API_KEY" ]; then
+            echo "FAIL: couldn't capture elastic password or api_key from install log" >&2
+            tail -40 /tmp/elastic-install.log >&2
+            exit 1
+          fi
+          echo "::add-mask::$ELASTIC_PASSWORD"
+          echo "::add-mask::$ELASTIC_API_KEY"
+          echo "elastic_password=$ELASTIC_PASSWORD" >> "$GITHUB_OUTPUT"
+          echo "elastic_api_key=$ELASTIC_API_KEY"   >> "$GITHUB_OUTPUT"
+
+      - name: Install sensor + victim + attacker + cribl (parallel)
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SENSOR_IP="${{ steps.wait.outputs.sensor_ip }}"
+          VICTIM_IP="${{ steps.wait.outputs.victim_ip }}"
+          ATTACKER_IP="${{ steps.wait.outputs.attacker_ip }}"
+          CRIBL_IP="${{ steps.wait.outputs.cribl_ip }}"
+          ELASTIC_PRIVATE="${{ steps.wait.outputs.elastic_private }}"
+          ELASTIC_API_KEY="${{ steps.infra.outputs.elastic_api_key }}"
+
+          (
+            echo "--- SENSOR install ---"
+            scp $SSH_OPTS standalone.sh ubuntu@"$SENSOR_IP":/tmp/standalone.sh
+            ssh $SSH_OPTS ubuntu@"$SENSOR_IP" "sudo bash /tmp/standalone.sh --force"
+            ssh $SSH_OPTS ubuntu@"$SENSOR_IP" '
+              set -e
+              systemctl is-active suricata
+              sudo /opt/zeek/bin/zeekctl status
+            '
+          ) > /tmp/sensor-install.log 2>&1 &
+          SENSOR_PID=$!
+
+          (
+            echo "--- VICTIM install ---"
+            scp $SSH_OPTS testing/victim_setup.sh ubuntu@"$VICTIM_IP":/tmp/victim_setup.sh
+            ssh $SSH_OPTS ubuntu@"$VICTIM_IP" "sudo bash /tmp/victim_setup.sh"
+          ) > /tmp/victim-install.log 2>&1 &
+          VICTIM_PID=$!
+
+          (
+            echo "--- ATTACKER install ---"
+            scp $SSH_OPTS testing/attacker_setup.sh ubuntu@"$ATTACKER_IP":/tmp/attacker_setup.sh
+            scp $SSH_OPTS testing/run_attacks.sh   ubuntu@"$ATTACKER_IP":/tmp/run_attacks.sh
+            ssh $SSH_OPTS ubuntu@"$ATTACKER_IP" "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
+          ) > /tmp/attacker-install.log 2>&1 &
+          ATTACKER_PID=$!
+
+          (
+            echo "--- CRIBL install ---"
+            scp $SSH_OPTS testing/shipping/install-cribl.sh ubuntu@"$CRIBL_IP":/tmp/install-cribl.sh
+            ssh $SSH_OPTS ubuntu@"$CRIBL_IP" "sudo bash /tmp/install-cribl.sh '$ELASTIC_PRIVATE' '$ELASTIC_API_KEY'"
+          ) > /tmp/cribl-install.log 2>&1 &
+          CRIBL_PID=$!
+
+          fail=0
+          wait $SENSOR_PID   || { echo "SENSOR install failed";   fail=1; }
+          wait $VICTIM_PID   || { echo "VICTIM install failed";   fail=1; }
+          wait $ATTACKER_PID || { echo "ATTACKER install failed"; fail=1; }
+          wait $CRIBL_PID    || { echo "CRIBL install failed";    fail=1; }
+
+          echo "::group::sensor-install.log";   cat /tmp/sensor-install.log;   echo "::endgroup::"
+          echo "::group::victim-install.log";   cat /tmp/victim-install.log;   echo "::endgroup::"
+          echo "::group::attacker-install.log"; cat /tmp/attacker-install.log; echo "::endgroup::"
+          echo "::group::cribl-install.log";    cat /tmp/cribl-install.log;    echo "::endgroup::"
+
+          [ "$fail" = 0 ] || exit 1
+
+      - name: Install Elastic Agent on sensor
+        run: |
+          # Can't run in parallel with the sensor's standalone.sh install
+          # — EA needs /var/log/suricata and /opt/zeek/logs/current to
+          # exist before the filestream inputs can attach.
+          SSH_OPTS="-i $HOME/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SENSOR_IP="${{ steps.wait.outputs.sensor_ip }}"
+          CRIBL_PRIVATE="${{ steps.wait.outputs.cribl_private }}"
+
+          scp $SSH_OPTS testing/shipping/install-elastic-agent.sh ubuntu@"$SENSOR_IP":/tmp/install-elastic-agent.sh
+          scp $SSH_OPTS testing/shipping/elastic-agent.yml.tmpl   ubuntu@"$SENSOR_IP":/tmp/elastic-agent.yml.tmpl
+          ssh $SSH_OPTS ubuntu@"$SENSOR_IP" \
+            "sudo bash /tmp/install-elastic-agent.sh '$CRIBL_PRIVATE' /tmp/elastic-agent.yml.tmpl"
+
+      - name: Create traffic-mirror plumbing (dual-source, PR 5 pattern)
+        id: mirror
+        run: |
+          TGT_ID=$(aws ec2 create-traffic-mirror-target \
+            --network-interface-id "${{ steps.wait.outputs.sensor_eni }}" \
+            --description "${{ steps.ctx.outputs.run_tag }}-tgt" \
+            --tag-specifications "ResourceType=traffic-mirror-target,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorTarget.TrafficMirrorTargetId' --output text)
+          FILTER_ID=$(aws ec2 create-traffic-mirror-filter \
+            --description "${{ steps.ctx.outputs.run_tag }}-flt" \
+            --tag-specifications "ResourceType=traffic-mirror-filter,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorFilter.TrafficMirrorFilterId' --output text)
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ID" \
+            --traffic-direction ingress --rule-number 100 \
+            --rule-action accept \
+            --destination-cidr-block 0.0.0.0/0 --source-cidr-block 0.0.0.0/0 >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ID" \
+            --traffic-direction egress --rule-number 100 \
+            --rule-action accept \
+            --destination-cidr-block 0.0.0.0/0 --source-cidr-block 0.0.0.0/0 >/dev/null
+          SESS_ID=$(aws ec2 create-traffic-mirror-session \
+            --network-interface-id "${{ steps.wait.outputs.victim_eni }}" \
+            --traffic-mirror-target-id "$TGT_ID" \
+            --traffic-mirror-filter-id "$FILTER_ID" \
+            --session-number 1 --virtual-network-id 1 \
+            --description "${{ steps.ctx.outputs.run_tag }}-sess" \
+            --tag-specifications "ResourceType=traffic-mirror-session,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorSession.TrafficMirrorSessionId' --output text)
+
+          FILTER_ATTACKER_ID=$(aws ec2 create-traffic-mirror-filter \
+            --description "${{ steps.ctx.outputs.run_tag }}-flt-attacker" \
+            --tag-specifications "ResourceType=traffic-mirror-filter,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorFilter.TrafficMirrorFilterId' --output text)
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction egress --rule-number 50 --rule-action reject \
+            --source-cidr-block 0.0.0.0/0 \
+            --destination-cidr-block "${{ steps.wait.outputs.victim_private }}/32" >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction ingress --rule-number 50 --rule-action reject \
+            --destination-cidr-block 0.0.0.0/0 \
+            --source-cidr-block "${{ steps.wait.outputs.victim_private }}/32" >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction egress --rule-number 100 --rule-action accept \
+            --source-cidr-block 0.0.0.0/0 --destination-cidr-block 0.0.0.0/0 >/dev/null
+          aws ec2 create-traffic-mirror-filter-rule \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --traffic-direction ingress --rule-number 100 --rule-action accept \
+            --source-cidr-block 0.0.0.0/0 --destination-cidr-block 0.0.0.0/0 >/dev/null
+          SESS_ATTACKER_ID=$(aws ec2 create-traffic-mirror-session \
+            --network-interface-id "${{ steps.wait.outputs.attacker_eni }}" \
+            --traffic-mirror-target-id "$TGT_ID" \
+            --traffic-mirror-filter-id "$FILTER_ATTACKER_ID" \
+            --session-number 2 --virtual-network-id 2 \
+            --description "${{ steps.ctx.outputs.run_tag }}-sess-attacker" \
+            --tag-specifications "ResourceType=traffic-mirror-session,Tags=[{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}}]" \
+            --query 'TrafficMirrorSession.TrafficMirrorSessionId' --output text)
+
+          echo "tgt_id=${TGT_ID}"                          >> "$GITHUB_OUTPUT"
+          echo "filter_id=${FILTER_ID}"                    >> "$GITHUB_OUTPUT"
+          echo "filter_attacker_id=${FILTER_ATTACKER_ID}"  >> "$GITHUB_OUTPUT"
+          echo "sess_id=${SESS_ID}"                        >> "$GITHUB_OUTPUT"
+          echo "sess_attacker_id=${SESS_ATTACKER_ID}"      >> "$GITHUB_OUTPUT"
+          sleep 15
+
+      - name: Run attack battery
+        # Same attack-battery used by validate-detections.yml — that's
+        # the traffic we want to observe landing in Elastic.
+        run: |
+          set +e
+          ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
+            "sudo timeout 900 bash /tmp/run_attacks.sh ${{ steps.wait.outputs.victim_private }}"
+          rc=$?
+          if [ "$rc" -eq 124 ]; then
+            echo "::warning::attack battery hit 900s timeout; continuing to verify on partial traffic"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Verify events landed in Elasticsearch
+        id: verify
+        run: |
+          chmod +x testing/shipping/verify-shipping.sh
+          testing/shipping/verify-shipping.sh \
+            "${{ steps.wait.outputs.elastic_ip }}" \
+            "${{ steps.infra.outputs.elastic_password }}"
+
+      - name: Collect shipping artifacts
+        if: always()
+        run: |
+          mkdir -p /tmp/shipping-artifacts
+          SSH_OPTS="-i $HOME/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+          # Pull verify-shipping.sh samples off the runner (it wrote
+          # /tmp/shipping-artifacts/*.json already).
+          cp /tmp/shipping-artifacts/*.json . 2>/dev/null || true
+
+          # Elastic Agent status + last 200 log lines from the sensor
+          ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.sensor_ip }} \
+            "sudo elastic-agent status 2>&1; echo '---'; sudo tail -200 /opt/Elastic/Agent/data/elastic-agent-*/logs/elastic-agent-json.log 2>/dev/null" \
+            > /tmp/shipping-artifacts/elastic-agent-status.log 2>&1 || true
+
+          # Cribl running config + last 200 log lines
+          ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.cribl_ip }} \
+            "curl -fsS -u admin:admin http://127.0.0.1:9000/api/v1/system/info 2>&1; echo '---'; sudo tail -200 /opt/cribl/log/cribl.log 2>/dev/null" \
+            > /tmp/shipping-artifacts/cribl-status.log 2>&1 || true
+
+          # Elasticsearch indices + health
+          ssh $SSH_OPTS ubuntu@${{ steps.wait.outputs.elastic_ip }} \
+            "sudo tail -200 /var/log/elasticsearch/elasticsearch.log 2>/dev/null" \
+            > /tmp/shipping-artifacts/elasticsearch.log 2>&1 || true
+
+      - name: Upload shipping artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shipping-logs-${{ github.run_id }}
+          path: /tmp/shipping-artifacts/
+          if-no-files-found: warn
+
+      - name: Teardown
+        if: always()
+        run: |
+          if [ -n "${{ steps.mirror.outputs.sess_attacker_id }}" ]; then
+            aws ec2 delete-traffic-mirror-session --traffic-mirror-session-id "${{ steps.mirror.outputs.sess_attacker_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.mirror.outputs.sess_id }}" ]; then
+            aws ec2 delete-traffic-mirror-session --traffic-mirror-session-id "${{ steps.mirror.outputs.sess_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.mirror.outputs.filter_attacker_id }}" ]; then
+            aws ec2 delete-traffic-mirror-filter --traffic-mirror-filter-id "${{ steps.mirror.outputs.filter_attacker_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.mirror.outputs.filter_id }}" ]; then
+            aws ec2 delete-traffic-mirror-filter --traffic-mirror-filter-id "${{ steps.mirror.outputs.filter_id }}" 2>/dev/null || true
+          fi
+          if [ -n "${{ steps.mirror.outputs.tgt_id }}" ]; then
+            aws ec2 delete-traffic-mirror-target --traffic-mirror-target-id "${{ steps.mirror.outputs.tgt_id }}" 2>/dev/null || true
+          fi
+          for ID in \
+            "${{ steps.ec2.outputs.sensor_id }}" \
+            "${{ steps.ec2.outputs.victim_id }}" \
+            "${{ steps.ec2.outputs.attacker_id }}" \
+            "${{ steps.ec2.outputs.cribl_id }}" \
+            "${{ steps.ec2.outputs.elastic_id }}"; do
+            [ -n "$ID" ] && aws ec2 terminate-instances --instance-ids "$ID" >/dev/null 2>&1 || true
+          done
+          for ID in \
+            "${{ steps.ec2.outputs.sensor_id }}" \
+            "${{ steps.ec2.outputs.victim_id }}" \
+            "${{ steps.ec2.outputs.attacker_id }}" \
+            "${{ steps.ec2.outputs.cribl_id }}" \
+            "${{ steps.ec2.outputs.elastic_id }}"; do
+            [ -n "$ID" ] && aws ec2 wait instance-terminated --instance-ids "$ID" 2>/dev/null || true
+          done
+          if [ -n "${{ steps.sg.outputs.sg_id }}" ]; then
+            aws ec2 delete-security-group --group-id "${{ steps.sg.outputs.sg_id }}" 2>/dev/null || true
+          fi
+          aws ec2 delete-key-pair --key-name "${{ steps.ctx.outputs.run_tag }}" 2>/dev/null || true
