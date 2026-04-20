@@ -62,7 +62,11 @@ add_key_if_absent() {
   fi
 }
 add_key_if_absent "network.host"   "0.0.0.0"
-add_key_if_absent "discovery.type" "single-node"
+# Do NOT add `discovery.type: single-node`. ES 8's postinst auto-config
+# already writes `cluster.initial_master_nodes: ["<hostname>"]`, and
+# those two settings are mutually exclusive — ES refuses to boot with
+# both set. The single-entry master-nodes list already gives us effective
+# single-node behavior.
 
 # No heap override: ES 8 auto-sizes to half of /proc/meminfo RAM. On
 # t3.medium that's ~2 GB, which is plenty for the POC and leaves room
