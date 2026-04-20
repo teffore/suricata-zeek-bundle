@@ -88,12 +88,16 @@ curl -fsS -X POST http://127.0.0.1:9000/m/default/lib/outputs \
 {
   "id": "elastic-out",
   "type": "elastic",
-  "url": "http://${ELASTIC_PRIVATE}:9200/_bulk",
+  "url": "https://${ELASTIC_PRIVATE}:9200/_bulk",
   "index": "logs-suricata-zeek-shipping-lab",
   "authType": "apiKey",
   "apiKey": "${ELASTIC_API_KEY}",
   "onBackpressure": "block",
-  "compress": false
+  "compress": false,
+  "tls": {
+    "disabled": false,
+    "rejectUnauthorized": false
+  }
 }
 EOF
 

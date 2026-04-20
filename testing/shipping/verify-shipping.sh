@@ -22,8 +22,12 @@ SURICATA_MIN="${SURICATA_MIN:-10}"
 ZEEK_MIN="${ZEEK_MIN:-10}"
 WINDOW="${WINDOW:-now-5m}"
 
-ES="http://${ELASTIC_IP}:9200"
+ES="https://${ELASTIC_IP}:9200"
+# -k skips TLS verification (auto-config cert is signed for localhost +
+# the box's private IP; GHA runner hits the public IP). Realistic
+# deployments would trust the CA; POC scope doesn't.
 AUTH="-u elastic:${ELASTIC_PASS}"
+CURL_OPTS="-k"
 
 echo "=== Verifying events landed in Elasticsearch ==="
 echo "  target:       ${ES}"
@@ -40,7 +44,7 @@ sleep 30
 # Using `logs-*` as the datastream-style pattern + `.ds-logs-*` for
 # hidden datastream backing indices covers both Cribl's direct-write
 # and Elastic's auto-datastream behavior.
-SURICATA_COUNT=$(curl -fsS $AUTH \
+SURICATA_COUNT=$(curl -fsS $CURL_OPTS $AUTH \
   -H 'Content-Type: application/json' \
   -X POST "${ES}/logs-*,.ds-logs-*/_count" \
   -d '{
@@ -56,7 +60,7 @@ SURICATA_COUNT=$(curl -fsS $AUTH \
 SURICATA_COUNT="${SURICATA_COUNT:-0}"
 
 # ---------- Count Zeek events ----------
-ZEEK_COUNT=$(curl -fsS $AUTH \
+ZEEK_COUNT=$(curl -fsS $CURL_OPTS $AUTH \
   -H 'Content-Type: application/json' \
   -X POST "${ES}/logs-*,.ds-logs-*/_count" \
   -d '{
@@ -78,7 +82,7 @@ echo "Zeek events shipped:     ${ZEEK_COUNT} (gate=${ZEEK_MIN})"
 # ---------- Dump a sample so failures are diagnosable ----------
 # Keep the output file path stable so the workflow can scp it as an artifact.
 mkdir -p /tmp/shipping-artifacts
-curl -fsS $AUTH \
+curl -fsS $CURL_OPTS $AUTH \
   -H 'Content-Type: application/json' \
   -X POST "${ES}/logs-*,.ds-logs-*/_search?size=5" \
   -d '{
@@ -86,7 +90,7 @@ curl -fsS $AUTH \
     "query": { "bool": { "filter": [ { "term": { "event.module": "suricata" } } ] } }
   }' > /tmp/shipping-artifacts/suricata-sample.json 2>/dev/null
 
-curl -fsS $AUTH \
+curl -fsS $CURL_OPTS $AUTH \
   -H 'Content-Type: application/json' \
   -X POST "${ES}/logs-*,.ds-logs-*/_search?size=5" \
   -d '{
@@ -96,8 +100,8 @@ curl -fsS $AUTH \
 
 # Cluster health snapshot — useful when counts look wrong and we need
 # to check if ES itself is wedged.
-curl -fsS $AUTH "${ES}/_cluster/health" > /tmp/shipping-artifacts/cluster-health.json 2>/dev/null
-curl -fsS $AUTH "${ES}/_cat/indices?format=json" > /tmp/shipping-artifacts/indices.json 2>/dev/null
+curl -fsS $CURL_OPTS $AUTH "${ES}/_cluster/health" > /tmp/shipping-artifacts/cluster-health.json 2>/dev/null
+curl -fsS $CURL_OPTS $AUTH "${ES}/_cat/indices?format=json" > /tmp/shipping-artifacts/indices.json 2>/dev/null
 
 # ---------- Gate ----------
 fail=0
