@@ -51,31 +51,36 @@ rm -f /tmp/cribl.tgz
 mkdir -p /opt/cribl/local/cribl /opt/cribl/local/cribl/pipelines
 
 # ---------- Introspect supported input types ----------
-# Cribl ships one JSON schema per supported source under
-# /opt/cribl/default/cribl/input/ — filename (without .json) is the
-# value that goes into inputs.yml's `type:` field. We enumerate them
-# so the workflow log shows every supported type, then auto-pick a
-# beats-compatible one. This removes the guess at whether it's
-# "elastic_beats", "beats", "lumberjack" etc. that burned runs 5-10.
-echo "=== Cribl input schema directory ==="
-ls /opt/cribl/default/cribl/input/ 2>&1 | head -40
+# Cribl ships schemas that enumerate valid type values. The exact path
+# varies by version (run 11 showed /opt/cribl/default/cribl/input/
+# doesn't exist), so search instead of guess.
+echo "=== Searching Cribl install for input schemas ==="
+find /opt/cribl/default -maxdepth 5 -type d 2>/dev/null | grep -iE '(input|source)' | head -10
+echo
+echo "=== Looking for any file mentioning 'beats' or 'lumberjack' ==="
+find /opt/cribl -maxdepth 6 -type f \( -name '*.json' -o -name '*.yml' -o -name '*.yaml' \) 2>/dev/null \
+  | xargs grep -lEi 'elastic[-_]?beats|lumberjack' 2>/dev/null | head -10
 
-BEATS_TYPE=$(ls /opt/cribl/default/cribl/input/ 2>/dev/null \
-             | grep -iE '^(elastic[-_]?beats|beats|lumberjack)\.json$' \
-             | head -1 \
-             | sed 's/\.json$//')
+# Try several candidate type names in descending likelihood. Cribl
+# docs reference "elastic_beats" most commonly; fall back to hyphenated
+# and bare forms. If none match a schema file on disk, default to
+# "elastic_beats" and let the port-binding gate fail with a diagnostic.
+BEATS_TYPE=""
+for candidate in elastic_beats elastic-beats beats lumberjack; do
+  if find /opt/cribl/default -maxdepth 6 \( -name "${candidate}.json" -o -name "${candidate}" -type d \) 2>/dev/null | grep -q .; then
+    BEATS_TYPE="$candidate"
+    break
+  fi
+done
 
+# Fallback: if nothing matched, still try elastic_beats — this is what
+# Cribl's community docs most often cite.
 if [ -z "$BEATS_TYPE" ]; then
-  echo "FAIL: no beats-compatible input schema under /opt/cribl/default/cribl/input/" >&2
-  ls /opt/cribl/default/cribl/input/ >&2 || true
-  exit 1
+  echo "  no matching schema file found on disk; defaulting to elastic_beats"
+  BEATS_TYPE="elastic_beats"
+else
+  echo "  auto-selected source type: ${BEATS_TYPE}"
 fi
-echo "  auto-selected source type: ${BEATS_TYPE}"
-
-# Similarly enumerate outputs for visibility (elastic is well-known
-# so we hard-code that, but the ls output will prove it exists).
-echo "=== Cribl output schema directory (informational) ==="
-ls /opt/cribl/default/cribl/output/ 2>&1 | head -20
 
 # ---------- Destination: Elasticsearch via api_key ----------
 cat >/opt/cribl/local/cribl/outputs.yml <<EOF
