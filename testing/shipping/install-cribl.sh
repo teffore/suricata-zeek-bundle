@@ -3,19 +3,12 @@
 # Ubuntu 22.04 box for the shipping validation lab.
 #
 # Usage: install-cribl.sh <ELASTIC_PRIVATE_IP> <ELASTIC_API_KEY>
-#   ELASTIC_API_KEY is the base64 id:api_key string that install-elastic.sh
-#   emits (Cribl's elasticsearch destination accepts this as the "api_key"
-#   auth type).
 #
-# On success, starts the Cribl Stream daemon on :9000 (UI/admin) and
-# configures:
-#   - Source:       Elastic Bulk API on :9200 (what Elastic Agent will ship to)
-#   - Destination:  Elasticsearch at http://ELASTIC_PRIVATE:9200 using the api_key
-#   - Route:        catch-all → passthru pipeline → elastic destination
-#
-# Default admin creds are admin/admin. Workflow changes the password
-# only if it needs to hand the creds to a browsing operator; for the
-# ephemeral POC they stay at admin/admin.
+# Configures Cribl via config files on disk rather than REST API calls.
+# Earlier attempts guessed at Cribl's single-instance vs distributed
+# API path conventions and kept hitting 404s; writing the YAML files
+# directly removes that whole class of failure. Cribl reads the config
+# at startup, the same way it does when you edit via the UI.
 
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -26,30 +19,20 @@ ELASTIC_API_KEY="${2:?Usage: $0 <ELASTIC_PRIVATE_IP> <ELASTIC_API_KEY>}"
 echo "=== Cribl Stream install ==="
 
 # ---------- Prereqs ----------
-# Cribl ships its own bundled runtime (Node), so no Java or OpenJDK
-# required despite older docs. Just curl + tar.
 apt-get update -y -qq
 apt-get install -y -qq curl jq tar
 
-# ---------- Create cribl user + directories ----------
-# Running as root is supported but the Cribl docs recommend a
-# dedicated service user for single-instance mode.
+# ---------- Create cribl user ----------
 id -u cribl >/dev/null 2>&1 || useradd -m -d /opt/cribl -s /bin/bash cribl
 
 # ---------- Download + extract ----------
-# Cribl's documented download URL for Stream Linux x64. No auth / account
-# required for the Free Edition. Earlier URL had a duplicate "latest" and
-# returned 404; this is the form Cribl's official docs publish.
 cd /opt
 CRIBL_URL="https://cdn.cribl.io/dl/latest/cribl-linux-x64.tgz"
 if ! curl -fsSL "$CRIBL_URL" -o /tmp/cribl.tgz; then
-  # Fallback: resolve the current version via Cribl's JSON metadata and
-  # build the versioned tarball URL. Catches edge cases where /latest/
-  # is temporarily out of sync with the CDN.
   echo "primary download failed; trying versioned URL"
   VER=$(curl -fsSL https://cdn.cribl.io/dl/versions | jq -r '.versions.stream[0].version // empty')
   if [ -z "$VER" ]; then
-    echo "FAIL: could not resolve Cribl Stream version from $CRIBL_URL or /dl/versions" >&2
+    echo "FAIL: could not resolve Cribl Stream version" >&2
     exit 1
   fi
   curl -fsSL "https://cdn.cribl.io/dl/${VER}/cribl-${VER}-linux-x64.tgz" -o /tmp/cribl.tgz
@@ -57,18 +40,74 @@ fi
 rm -rf /opt/cribl
 tar -xzf /tmp/cribl.tgz -C /opt
 rm -f /tmp/cribl.tgz
+
+# ---------- Write config files directly ----------
+# Cribl reads YAML config from /opt/cribl/local/cribl/ at startup.
+# Writing these directly sidesteps the REST API path uncertainty that
+# burned runs 7-9 (UI HTML was served for wrong paths; single-instance
+# vs distributed API shape differences). The file layout here matches
+# what Cribl's own UI writes when you configure via the web UI.
+
+mkdir -p /opt/cribl/local/cribl
+
+# Destination: Elasticsearch via the api_key created by install-elastic.sh
+cat >/opt/cribl/local/cribl/outputs.yml <<EOF
+outputs:
+  elastic-out:
+    type: elastic
+    url: https://${ELASTIC_PRIVATE}:9200/_bulk
+    index: logs-suricata-zeek-shipping-lab
+    authType: apiKey
+    apiKey: ${ELASTIC_API_KEY}
+    onBackpressure: block
+    compress: false
+    tls:
+      disabled: false
+      rejectUnauthorized: false
+EOF
+
+# Source: Elastic Beats listener on :5044 (lumberjack protocol).
+# EA's `logstash` output connects here. Cribl's elastic_beats input is
+# the designed receiver for Beats/Elastic Agent data and doesn't need
+# to mimic a full ES API surface (the earlier "elastic" bulk source
+# attempt failed because EA's elasticsearch output couldn't health-
+# check Cribl as a real ES cluster).
+cat >/opt/cribl/local/cribl/inputs.yml <<'EOF'
+inputs:
+  beats-in:
+    type: elastic_beats
+    disabled: false
+    host: 0.0.0.0
+    port: 5044
+    tls:
+      disabled: true
+EOF
+
+# Route: everything from beats-in through the default passthru pipeline
+# to elastic-out. Passthru is a no-op pipeline shipped with Cribl.
+cat >/opt/cribl/local/cribl/routes.yml <<'EOF'
+routes:
+  - id: shipping-lab-all
+    name: shipping-lab-all
+    filter: "true"
+    pipeline: passthru
+    output: elastic-out
+    description: Send all events from beats-in to elastic-out (POC passthru)
+    final: true
+EOF
+
 chown -R cribl:cribl /opt/cribl
 
-# ---------- Start as a systemd service ----------
-# Cribl ships a helper that generates /etc/systemd/system/cribl.service
-# pointing at the right user + install path.
-/opt/cribl/bin/cribl boot-start enable -m systemd -u cribl
+# ---------- Start as systemd service ----------
+# boot-start enable wires up /etc/systemd/system/cribl.service. It emits
+# a "needs root privileges" line in some versions even when invoked as
+# root; the exit status is still 0 so the rest of the script proceeds.
+/opt/cribl/bin/cribl boot-start enable -m systemd -u cribl || true
 systemctl daemon-reload
 systemctl enable cribl.service
 systemctl start cribl.service
 
-echo "=== Waiting for Cribl API to accept connections ==="
-# First boot takes 30-60s while Cribl generates its default config.
+echo "=== Waiting for Cribl API on :9000 ==="
 for i in $(seq 1 60); do
   if curl -fsS -o /dev/null http://127.0.0.1:9000/api/v1/health 2>/dev/null; then
     break
@@ -76,109 +115,25 @@ for i in $(seq 1 60); do
   sleep 2
 done
 
-# ---------- Log in and grab an auth token ----------
-# Default creds: admin/admin. The login endpoint returns a bearer token
-# valid for subsequent /api/v1/ calls.
-TOKEN=$(curl -fsS -X POST http://127.0.0.1:9000/api/v1/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin"}' \
-  | jq -r '.token')
-
-if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-  echo "FAIL: could not obtain Cribl API token" >&2
-  exit 1
-fi
-echo "  Cribl API token acquired"
-
-auth() { echo "Authorization: Bearer $TOKEN"; }
-
-# ---------- Configure destination: Elasticsearch ----------
-# Cribl's elastic destination talks the bulk API. We use the api_key
-# auth mode so the superuser password never leaves the elastic box.
-# Single-instance mode: API paths are /api/v1/lib/... (no /m/default/
-# prefix; that's for distributed leader-worker deployments).
-curl -fsS -X POST http://127.0.0.1:9000/api/v1/lib/outputs \
-  -H "$(auth)" -H 'Content-Type: application/json' \
-  -d @- <<EOF
-{
-  "id": "elastic-out",
-  "type": "elastic",
-  "url": "https://${ELASTIC_PRIVATE}:9200/_bulk",
-  "index": "logs-suricata-zeek-shipping-lab",
-  "authType": "apiKey",
-  "apiKey": "${ELASTIC_API_KEY}",
-  "onBackpressure": "block",
-  "compress": false,
-  "tls": {
-    "disabled": false,
-    "rejectUnauthorized": false
-  }
-}
-EOF
-
-echo "  destination created: elastic-out"
-
-# ---------- Configure source: Elastic Beats listener on :5044 ----------
-# Elastic Agent's `logstash` output speaks the lumberjack/beats protocol
-# to this port. This is the designed EA → Cribl path: Cribl's
-# elastic_beats source is specifically for receiving Beats / Elastic
-# Agent data without having to mimic a full Elasticsearch API surface.
-# Previous attempt used Cribl's "elastic" (bulk API) source — EA's
-# elasticsearch output refused to ship because it couldn't health-check
-# Cribl as a real ES cluster.
-curl -fsS -X POST http://127.0.0.1:9000/api/v1/lib/inputs \
-  -H "$(auth)" -H 'Content-Type: application/json' \
-  -d @- <<'EOF'
-{
-  "id": "beats-in",
-  "type": "elastic_beats",
-  "disabled": false,
-  "host": "0.0.0.0",
-  "port": 5044,
-  "tls": { "disabled": true }
-}
-EOF
-
-echo "  source created: beats-in (listening on :5044, elastic_beats / lumberjack)"
-
-# ---------- Configure route: send everything from elastic-in to elastic-out ----------
-# The default "passthru" pipeline is a no-op; good enough for the POC.
-# Future work: add a Cribl pipeline that enriches ECS fields or drops
-# the high-volume zeek conn.log events before shipping.
-curl -fsS -X PUT http://127.0.0.1:9000/api/v1/system/routes \
-  -H "$(auth)" -H 'Content-Type: application/json' \
-  -d @- <<'EOF'
-{
-  "id": "default",
-  "routes": [
-    {
-      "id": "shipping-lab-all",
-      "name": "shipping-lab-all",
-      "filter": "true",
-      "pipeline": "passthru",
-      "output": "elastic-out",
-      "description": "Send all events from beats-in to elastic-out (POC passthru)",
-      "final": true
-    }
-  ]
-}
-EOF
-
-echo "  route created: shipping-lab-all (filter=true → passthru → elastic-out)"
-
-# ---------- Apply the config ----------
-# Single-instance mode applies config changes immediately via the
-# resource POSTs above — no commit/deploy pair needed. Those endpoints
-# only exist for distributed (leader-worker) deployments.
-echo "  single-instance: config applied in-place by the POSTs above"
-
-# ---------- Wait for source listener to bind ----------
+echo "=== Waiting for beats-in listener on :5044 ==="
+# If our inputs.yml was read correctly, port 5044 binds within a few
+# seconds of Cribl coming up on :9000.
 for i in $(seq 1 30); do
   if (echo > /dev/tcp/127.0.0.1/5044) 2>/dev/null; then
+    echo "  :5044 bound — inputs.yml was read"
     break
   fi
   sleep 2
 done
+
+if ! (echo > /dev/tcp/127.0.0.1/5044) 2>/dev/null; then
+  echo "FAIL: Cribl didn't bind :5044 — inputs.yml may be malformed" >&2
+  echo "--- /opt/cribl/local/cribl/inputs.yml ---" >&2
+  cat /opt/cribl/local/cribl/inputs.yml >&2
+  echo "--- /opt/cribl/log/cribl.log tail ---" >&2
+  tail -50 /opt/cribl/log/cribl.log >&2
+  exit 1
+fi
 
 echo "=== Cribl Stream install complete ==="
 echo "  UI:      http://<cribl_public_ip>:9000  (admin / admin)"
