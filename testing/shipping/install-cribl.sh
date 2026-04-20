@@ -48,43 +48,63 @@ rm -f /tmp/cribl.tgz
 # vs distributed API shape differences). The file layout here matches
 # what Cribl's own UI writes when you configure via the web UI.
 
-mkdir -p /opt/cribl/local/cribl /opt/cribl/local/cribl/pipelines
-
-# ---------- Introspect supported input types ----------
-# Cribl ships schemas that enumerate valid type values. The exact path
-# varies by version (run 11 showed /opt/cribl/default/cribl/input/
-# doesn't exist), so search instead of guess.
-echo "=== Searching Cribl install for input schemas ==="
-find /opt/cribl/default -maxdepth 5 -type d 2>/dev/null | grep -iE '(input|source)' | head -10
+# ---------- Introspect Cribl's on-disk config layout ----------
+# Run 12's cribl.log showed our inputs.yml was never mentioned — not
+# rejected, just ignored. The write path is wrong. Find out where
+# Cribl actually reads config from by locating any shipped inputs.yml
+# / outputs.yml / routes.yml files.
+echo "=== /opt/cribl/ top-level ==="
+ls -la /opt/cribl/ 2>&1
 echo
-echo "=== Looking for any file mentioning 'beats' or 'lumberjack' ==="
-find /opt/cribl -maxdepth 6 -type f \( -name '*.json' -o -name '*.yml' -o -name '*.yaml' \) 2>/dev/null \
-  | xargs grep -lEi 'elastic[-_]?beats|lumberjack' 2>/dev/null | head -10
+echo "=== /opt/cribl/local/ ==="
+ls -la /opt/cribl/local/ 2>&1 || echo "  (no /opt/cribl/local/)"
+echo
+echo "=== /opt/cribl/groups/ (distributed/worker-group layout?) ==="
+ls -la /opt/cribl/groups/ 2>&1 || echo "  (no /opt/cribl/groups/)"
+echo
+echo "=== locations of inputs.yml / outputs.yml / routes.yml under /opt/cribl/ ==="
+find /opt/cribl -name 'inputs.yml' -o -name 'outputs.yml' -o -name 'routes.yml' 2>/dev/null | head -20
+echo
+echo "=== any default config file that references a known type (e.g. syslog) ==="
+grep -rlE 'type:\s*(syslog|http|tcp|elastic)' /opt/cribl/default/ 2>/dev/null | head -10
+echo
+echo "=== any file on disk mentioning elastic_beats / beats / lumberjack ==="
+grep -rlE 'elastic[-_]?beats|lumberjack' /opt/cribl/ 2>/dev/null | head -10
+echo
 
-# Try several candidate type names in descending likelihood. Cribl
-# docs reference "elastic_beats" most commonly; fall back to hyphenated
-# and bare forms. If none match a schema file on disk, default to
-# "elastic_beats" and let the port-binding gate fail with a diagnostic.
-BEATS_TYPE=""
-for candidate in elastic_beats elastic-beats beats lumberjack; do
-  if find /opt/cribl/default -maxdepth 6 \( -name "${candidate}.json" -o -name "${candidate}" -type d \) 2>/dev/null | grep -q .; then
-    BEATS_TYPE="$candidate"
-    break
-  fi
-done
-
-# Fallback: if nothing matched, still try elastic_beats — this is what
-# Cribl's community docs most often cite.
-if [ -z "$BEATS_TYPE" ]; then
-  echo "  no matching schema file found on disk; defaulting to elastic_beats"
-  BEATS_TYPE="elastic_beats"
+# Determine the correct config dir for single-instance mode by looking
+# for an existing inputs.yml or outputs.yml. Cribl ships defaults
+# somewhere; the mirror-image local dir is where we should write overrides.
+SHIPPED_INPUTS=$(find /opt/cribl/default -name 'inputs.yml' 2>/dev/null | head -1)
+if [ -n "$SHIPPED_INPUTS" ]; then
+  # Default lives at .../default/cribl/inputs.yml → override at .../local/cribl/inputs.yml
+  # (replace /default/ with /local/ in the path).
+  CONFIG_DIR=$(echo "$SHIPPED_INPUTS" | sed 's|/default/|/local/|' | xargs dirname)
+  echo "=== discovered config dir: $CONFIG_DIR (mirrors shipped default $SHIPPED_INPUTS) ==="
 else
-  echo "  auto-selected source type: ${BEATS_TYPE}"
+  # Fallback to the documented /opt/cribl/local/cribl/ path
+  CONFIG_DIR=/opt/cribl/local/cribl
+  echo "=== no shipped inputs.yml found; defaulting to $CONFIG_DIR ==="
 fi
 
-# ---------- Destination: Elasticsearch via api_key ----------
-cat >/opt/cribl/local/cribl/outputs.yml <<EOF
-outputs:
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/pipelines"
+
+# Also write to /opt/cribl/groups/default/local/cribl/ as a
+# belt-and-suspenders measure if that directory exists. Cribl 4.x
+# introduced a groups layout even for single-instance.
+ALT_DIRS=()
+if [ -d /opt/cribl/groups/default ]; then
+  ALT_DIRS+=(/opt/cribl/groups/default/local/cribl)
+  mkdir -p /opt/cribl/groups/default/local/cribl /opt/cribl/groups/default/local/cribl/pipelines
+fi
+
+# Default to elastic_beats; the port-binding gate + cribl.log grep will
+# name the issue if this is wrong.
+BEATS_TYPE="elastic_beats"
+echo "  source type: ${BEATS_TYPE}"
+
+# Prepare content once; write to discovered dir + any alt dirs.
+OUTPUTS_YML="outputs:
   elastic-out:
     type: elastic
     url: https://${ELASTIC_PRIVATE}:9200/_bulk
@@ -96,13 +116,9 @@ outputs:
     tls:
       disabled: false
       rejectUnauthorized: false
-EOF
+"
 
-# ---------- Source: Beats listener on :5044 ----------
-# Type value auto-resolved from /opt/cribl/default/cribl/input/ above.
-# EA's `logstash` output speaks lumberjack to this port.
-cat >/opt/cribl/local/cribl/inputs.yml <<EOF
-inputs:
+INPUTS_YML="inputs:
   beats-in:
     type: ${BEATS_TYPE}
     disabled: false
@@ -110,14 +126,9 @@ inputs:
     port: 5044
     tls:
       disabled: true
-EOF
+"
 
-# ---------- Route: beats-in → passthru → elastic-out ----------
-# Routes file lives under local/cribl/pipelines/, NOT local/cribl/
-# directly. Writing to the wrong path is silent — Cribl ignores unknown
-# files — so the route simply wouldn't register.
-cat >/opt/cribl/local/cribl/pipelines/routes.yml <<'EOF'
-routes:
+ROUTES_YML='routes:
   - id: shipping-lab-all
     name: shipping-lab-all
     filter: "true"
@@ -125,7 +136,19 @@ routes:
     output: elastic-out
     description: Send all events from beats-in to elastic-out (POC passthru)
     final: true
-EOF
+'
+
+for DIR in "$CONFIG_DIR" "${ALT_DIRS[@]}"; do
+  [ -z "$DIR" ] && continue
+  echo "  writing config under: $DIR"
+  printf '%s' "$OUTPUTS_YML" > "$DIR/outputs.yml"
+  printf '%s' "$INPUTS_YML"  > "$DIR/inputs.yml"
+  # Try both locations for routes.yml: directly under the config dir
+  # AND under pipelines/. Cribl will read whichever one is correct and
+  # silently ignore the other.
+  printf '%s' "$ROUTES_YML" > "$DIR/routes.yml"
+  printf '%s' "$ROUTES_YML" > "$DIR/pipelines/routes.yml"
+done
 
 chown -R cribl:cribl /opt/cribl
 
