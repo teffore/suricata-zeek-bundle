@@ -41,9 +41,9 @@ apt-get install -y -qq gettext-base
 export CRIBL_PRIVATE
 envsubst '$CRIBL_PRIVATE' < "$TEMPLATE" > /tmp/elastic-agent.yml
 
-# Spot-check the rendered output (template now uses Beats protocol on
-# port 5044, not the earlier http://...:9200 Elasticsearch-output form).
-if ! grep -q "${CRIBL_PRIVATE}:5044" /tmp/elastic-agent.yml; then
+# Spot-check the rendered output (template posts to Cribl's `in_elastic`
+# source on :9200 which mimics the ES bulk API).
+if ! grep -q "http://${CRIBL_PRIVATE}:9200" /tmp/elastic-agent.yml; then
   echo "FAIL: CRIBL_PRIVATE substitution didn't take effect" >&2
   cat /tmp/elastic-agent.yml >&2
   exit 1
