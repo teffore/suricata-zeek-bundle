@@ -48,9 +48,36 @@ rm -f /tmp/cribl.tgz
 # vs distributed API shape differences). The file layout here matches
 # what Cribl's own UI writes when you configure via the web UI.
 
-mkdir -p /opt/cribl/local/cribl
+mkdir -p /opt/cribl/local/cribl /opt/cribl/local/cribl/pipelines
 
-# Destination: Elasticsearch via the api_key created by install-elastic.sh
+# ---------- Introspect supported input types ----------
+# Cribl ships one JSON schema per supported source under
+# /opt/cribl/default/cribl/input/ — filename (without .json) is the
+# value that goes into inputs.yml's `type:` field. We enumerate them
+# so the workflow log shows every supported type, then auto-pick a
+# beats-compatible one. This removes the guess at whether it's
+# "elastic_beats", "beats", "lumberjack" etc. that burned runs 5-10.
+echo "=== Cribl input schema directory ==="
+ls /opt/cribl/default/cribl/input/ 2>&1 | head -40
+
+BEATS_TYPE=$(ls /opt/cribl/default/cribl/input/ 2>/dev/null \
+             | grep -iE '^(elastic[-_]?beats|beats|lumberjack)\.json$' \
+             | head -1 \
+             | sed 's/\.json$//')
+
+if [ -z "$BEATS_TYPE" ]; then
+  echo "FAIL: no beats-compatible input schema under /opt/cribl/default/cribl/input/" >&2
+  ls /opt/cribl/default/cribl/input/ >&2 || true
+  exit 1
+fi
+echo "  auto-selected source type: ${BEATS_TYPE}"
+
+# Similarly enumerate outputs for visibility (elastic is well-known
+# so we hard-code that, but the ls output will prove it exists).
+echo "=== Cribl output schema directory (informational) ==="
+ls /opt/cribl/default/cribl/output/ 2>&1 | head -20
+
+# ---------- Destination: Elasticsearch via api_key ----------
 cat >/opt/cribl/local/cribl/outputs.yml <<EOF
 outputs:
   elastic-out:
@@ -66,16 +93,13 @@ outputs:
       rejectUnauthorized: false
 EOF
 
-# Source: Elastic Beats listener on :5044 (lumberjack protocol).
-# EA's `logstash` output connects here. Cribl's elastic_beats input is
-# the designed receiver for Beats/Elastic Agent data and doesn't need
-# to mimic a full ES API surface (the earlier "elastic" bulk source
-# attempt failed because EA's elasticsearch output couldn't health-
-# check Cribl as a real ES cluster).
-cat >/opt/cribl/local/cribl/inputs.yml <<'EOF'
+# ---------- Source: Beats listener on :5044 ----------
+# Type value auto-resolved from /opt/cribl/default/cribl/input/ above.
+# EA's `logstash` output speaks lumberjack to this port.
+cat >/opt/cribl/local/cribl/inputs.yml <<EOF
 inputs:
   beats-in:
-    type: elastic_beats
+    type: ${BEATS_TYPE}
     disabled: false
     host: 0.0.0.0
     port: 5044
@@ -83,9 +107,11 @@ inputs:
       disabled: true
 EOF
 
-# Route: everything from beats-in through the default passthru pipeline
-# to elastic-out. Passthru is a no-op pipeline shipped with Cribl.
-cat >/opt/cribl/local/cribl/routes.yml <<'EOF'
+# ---------- Route: beats-in → passthru → elastic-out ----------
+# Routes file lives under local/cribl/pipelines/, NOT local/cribl/
+# directly. Writing to the wrong path is silent — Cribl ignores unknown
+# files — so the route simply wouldn't register.
+cat >/opt/cribl/local/cribl/pipelines/routes.yml <<'EOF'
 routes:
   - id: shipping-lab-all
     name: shipping-lab-all
@@ -127,11 +153,15 @@ for i in $(seq 1 30); do
 done
 
 if ! (echo > /dev/tcp/127.0.0.1/5044) 2>/dev/null; then
-  echo "FAIL: Cribl didn't bind :5044 — inputs.yml may be malformed" >&2
+  echo "FAIL: Cribl didn't bind :5044 — config not loaded" >&2
   echo "--- /opt/cribl/local/cribl/inputs.yml ---" >&2
   cat /opt/cribl/local/cribl/inputs.yml >&2
-  echo "--- /opt/cribl/log/cribl.log tail ---" >&2
-  tail -50 /opt/cribl/log/cribl.log >&2
+  echo "--- /opt/cribl/local/cribl/pipelines/routes.yml ---" >&2
+  cat /opt/cribl/local/cribl/pipelines/routes.yml 2>&1 >&2
+  echo "--- cribl.log: lines matching error/fail/invalid/reject/schema ---" >&2
+  grep -iE 'error|fail|invalid|reject|schema|parse|bad input' /opt/cribl/log/cribl.log 2>&1 | head -80 >&2
+  echo "--- cribl.log tail (last 80 lines) ---" >&2
+  tail -80 /opt/cribl/log/cribl.log 2>&1 >&2
   exit 1
 fi
 
