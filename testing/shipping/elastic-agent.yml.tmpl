@@ -1,0 +1,101 @@
+# Elastic Agent standalone-mode config for the shipping validation lab.
+# install-elastic-agent.sh substitutes ${CRIBL_PRIVATE} at deploy time.
+#
+# Standalone mode (no Fleet server): inputs and outputs are declared
+# directly here instead of being pushed from a Fleet policy. Simpler
+# for ephemeral CI — no enrollment token, no re-enroll on each run.
+#
+# Output goes to Cribl's elastic-bulk listener, which speaks the same
+# _bulk API that a real Elasticsearch cluster does. Cribl re-routes
+# to the actual Elasticsearch in the `elastic` box.
+
+outputs:
+  default:
+    type: elasticsearch
+    hosts:
+      - "http://${CRIBL_PRIVATE}:9200"
+    # No auth against Cribl — its elastic-bulk source is open intra-SG.
+    # Real deployments would put API key auth here.
+
+# The agent's monitoring logs are noisy for a POC — send them to files
+# instead of the output, otherwise Cribl relays a stream of agent
+# heartbeats that swamp the actual Suricata/Zeek signal.
+agent:
+  monitoring:
+    enabled: false
+    logs: false
+    metrics: false
+
+inputs:
+  # ---------- Suricata: eve.json (primary signal) ----------
+  # eve.json is NDJSON with event.type ∈ {alert, flow, http, tls, dns, stats, ...}.
+  # We read it raw and hand-stamp event.module so downstream queries
+  # against `event.module:suricata` match.
+  - type: filestream
+    id: suricata-eve
+    enabled: true
+    paths:
+      - /var/log/suricata/eve.json
+    parsers:
+      - ndjson:
+          target: ""
+          overwrite_keys: true
+          add_error_key: true
+    processors:
+      - add_fields:
+          target: event
+          fields:
+            module: suricata
+            dataset: suricata.eve
+
+  # ---------- Zeek: the logs operators actually query ----------
+  # Zeek emits JSON thanks to standalone.sh loading policy/tuning/json-logs.
+  # Split one filestream per log file so we can tag event.dataset
+  # correctly for each without writing a processor with conditionals.
+  - type: filestream
+    id: zeek-conn
+    enabled: true
+    paths: [/opt/zeek/logs/current/conn.log]
+    parsers: [{ ndjson: { target: "", overwrite_keys: true, add_error_key: true } }]
+    processors:
+      - add_fields: { target: event, fields: { module: zeek, dataset: zeek.connection } }
+
+  - type: filestream
+    id: zeek-notice
+    enabled: true
+    paths: [/opt/zeek/logs/current/notice.log]
+    parsers: [{ ndjson: { target: "", overwrite_keys: true, add_error_key: true } }]
+    processors:
+      - add_fields: { target: event, fields: { module: zeek, dataset: zeek.notice } }
+
+  - type: filestream
+    id: zeek-dns
+    enabled: true
+    paths: [/opt/zeek/logs/current/dns.log]
+    parsers: [{ ndjson: { target: "", overwrite_keys: true, add_error_key: true } }]
+    processors:
+      - add_fields: { target: event, fields: { module: zeek, dataset: zeek.dns } }
+
+  - type: filestream
+    id: zeek-http
+    enabled: true
+    paths: [/opt/zeek/logs/current/http.log]
+    parsers: [{ ndjson: { target: "", overwrite_keys: true, add_error_key: true } }]
+    processors:
+      - add_fields: { target: event, fields: { module: zeek, dataset: zeek.http } }
+
+  - type: filestream
+    id: zeek-ssl
+    enabled: true
+    paths: [/opt/zeek/logs/current/ssl.log]
+    parsers: [{ ndjson: { target: "", overwrite_keys: true, add_error_key: true } }]
+    processors:
+      - add_fields: { target: event, fields: { module: zeek, dataset: zeek.ssl } }
+
+  - type: filestream
+    id: zeek-weird
+    enabled: true
+    paths: [/opt/zeek/logs/current/weird.log]
+    parsers: [{ ndjson: { target: "", overwrite_keys: true, add_error_key: true } }]
+    processors:
+      - add_fields: { target: event, fields: { module: zeek, dataset: zeek.weird } }
