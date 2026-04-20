@@ -50,23 +50,23 @@ apt-get install -y elasticsearch kibana 2>&1 | tee "$APT_LOG"
 
 # ---------- Minimal config ----------
 # Single-node so discovery doesn't wait on peers. Bind to all ifaces so
-# Cribl can reach us. Do NOT override xpack.security.* — the postinst's
-# auto-config already set those keys (with real certs it generated) and
-# re-setting them to "disabled" creates conflicting YAML that prevents
-# ES from starting.
-cat >>/etc/elasticsearch/elasticsearch.yml <<'EOF'
+# Cribl can reach us.
+#
+# Only add keys that aren't already set by the auto-config — duplicate
+# keys in elasticsearch.yml crash the daemon on start. Leave all the
+# xpack.security.* lines auto-config wrote (they match the keystore).
+add_key_if_absent() {
+  local key="$1" value="$2"
+  if ! grep -qE "^[[:space:]]*${key}[[:space:]]*:" /etc/elasticsearch/elasticsearch.yml; then
+    echo "${key}: ${value}" >> /etc/elasticsearch/elasticsearch.yml
+  fi
+}
+add_key_if_absent "network.host"   "0.0.0.0"
+add_key_if_absent "discovery.type" "single-node"
 
-# --- shipping-lab tuning ---
-network.host: 0.0.0.0
-discovery.type: single-node
-EOF
-
-# t3.medium has 4 GB RAM; give ES a conservative heap so Kibana can
-# still start. Default heap is auto-sized but can overshoot.
-cat >/etc/elasticsearch/jvm.options.d/heap.options <<'EOF'
--Xms1g
--Xmx1g
-EOF
+# No heap override: ES 8 auto-sizes to half of /proc/meminfo RAM. On
+# t3.medium that's ~2 GB, which is plenty for the POC and leaves room
+# for Kibana on the same box.
 
 # Kibana: point at local ES over HTTPS (auto-config made that mandatory),
 # skip cert verification for the POC. Bind wide for optional browser
@@ -83,7 +83,19 @@ EOF
 # ---------- Start ES ----------
 systemctl daemon-reload
 systemctl enable elasticsearch.service
-systemctl start elasticsearch.service
+if ! systemctl start elasticsearch.service; then
+  echo "=== ES failed to start — dumping diagnostic ==="
+  echo "--- journalctl -xeu elasticsearch.service ---"
+  journalctl -xeu elasticsearch.service --no-pager -n 120 || true
+  echo "--- /etc/elasticsearch/elasticsearch.yml ---"
+  cat /etc/elasticsearch/elasticsearch.yml || true
+  echo "--- /var/log/elasticsearch/ ---"
+  ls -la /var/log/elasticsearch/ 2>&1 || true
+  for f in /var/log/elasticsearch/*.log; do
+    [ -f "$f" ] && { echo "--- $f ---"; tail -60 "$f"; }
+  done
+  exit 1
+fi
 
 # ---------- Capture the postinst-generated password ----------
 # Auto-config line looks like:
