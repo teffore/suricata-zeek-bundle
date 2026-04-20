@@ -95,7 +95,7 @@ auth() { echo "Authorization: Bearer $TOKEN"; }
 # ---------- Configure destination: Elasticsearch ----------
 # Cribl's elastic destination talks the bulk API. We use the api_key
 # auth mode so the superuser password never leaves the elastic box.
-curl -fsS -X POST http://127.0.0.1:9000/m/default/lib/outputs \
+curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/lib/outputs \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d @- <<EOF
 {
@@ -124,7 +124,7 @@ echo "  destination created: elastic-out"
 # Previous attempt used Cribl's "elastic" (bulk API) source — EA's
 # elasticsearch output refused to ship because it couldn't health-check
 # Cribl as a real ES cluster.
-curl -fsS -X POST http://127.0.0.1:9000/m/default/lib/inputs \
+curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/lib/inputs \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d @- <<'EOF'
 {
@@ -143,7 +143,7 @@ echo "  source created: beats-in (listening on :5044, elastic_beats / lumberjack
 # The default "passthru" pipeline is a no-op; good enough for the POC.
 # Future work: add a Cribl pipeline that enriches ECS fields or drops
 # the high-volume zeek conn.log events before shipping.
-curl -fsS -X PUT http://127.0.0.1:9000/m/default/system/routes \
+curl -fsS -X PUT http://127.0.0.1:9000/api/v1/m/default/system/routes \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d @- <<'EOF'
 {
@@ -167,11 +167,11 @@ echo "  route created: shipping-lab-all (filter=true → passthru → elastic-ou
 # ---------- Commit + deploy the config ----------
 # Cribl stages config changes in the "default" workspace; this call
 # applies them so the listener actually starts.
-curl -fsS -X POST http://127.0.0.1:9000/m/default/version/commit \
+curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/version/commit \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d '{"message":"shipping-lab initial config"}' >/dev/null
 
-curl -fsS -X POST http://127.0.0.1:9000/m/default/version/deploy \
+curl -fsS -X POST http://127.0.0.1:9000/api/v1/m/default/version/deploy \
   -H "$(auth)" -H 'Content-Type: application/json' \
   -d '{}' >/dev/null
 

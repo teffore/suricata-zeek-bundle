@@ -458,13 +458,13 @@ jobs:
               -H "Content-Type: application/json" \
               -d "{\"username\":\"admin\",\"password\":\"admin\"}" | jq -r ".token" 2>/dev/null)
             echo "=== Cribl inputs ==="
-            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/m/default/lib/inputs 2>&1 | head -c 4000
+            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/api/v1/m/default/lib/inputs 2>&1 | head -c 4000
             echo ""
             echo "=== Cribl outputs ==="
-            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/m/default/lib/outputs 2>&1 | head -c 2000
+            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/api/v1/m/default/lib/outputs 2>&1 | head -c 2000
             echo ""
             echo "=== Cribl routes ==="
-            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/m/default/system/routes 2>&1 | head -c 2000
+            curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9000/api/v1/m/default/system/routes 2>&1 | head -c 2000
             echo ""
             echo "=== Cribl metrics (events in/out last 15 min) ==="
             curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
