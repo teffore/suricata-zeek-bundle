@@ -814,7 +814,90 @@ async def run_agent(args):
         print(f"\n[purple-agent] error: {type(e).__name__}: {e}")
 
     print("=" * 72)
-    write_html_report(REPORTS_DIR, ts, _ledger_path, args, probes_yaml_path=probes_path)
+
+    # End-of-run sensor sweep: Zeek's SumStats-based detections (Scan::Port_Scan,
+    # SSH::Password_Guessing, etc.) aggregate over 2-minute buckets. Per-probe
+    # checks can't see them because the bucket hasn't flushed. Wait out the
+    # bucket window, then harvest every notice the sensor wrote during the run
+    # window. Saved as a sidecar; rendered in its own report section.
+    sweep_path = _end_of_run_zeek_sweep(args, ts)
+
+    write_html_report(REPORTS_DIR, ts, _ledger_path, args, probes_yaml_path=probes_path, sweep_path=sweep_path)
+
+
+def _end_of_run_zeek_sweep(args, ts):
+    """Sleep for the SumStats bucket window, then harvest sensor notice.log.
+
+    Returns the sidecar JSON path (or None on failure / --no-sweep).
+    Keeps attribution loose -- doesn't try to map notices to probes;
+    the report renders them as an aggregate view with timestamps.
+    """
+    if getattr(args, "no_sweep", False):
+        return None
+    sweep_wait = 180  # 3 min — covers SSH::guessing_timeout (2m) and Scan::scan_timeout (2m)
+    print(f"[purple-agent] post-run sensor sweep: waiting {sweep_wait}s for Zeek SumStats buckets to flush...")
+    import time
+    time.sleep(sweep_wait)
+
+    sweep_path = REPORTS_DIR / f"sweep-{ts}.json"
+    # Derive the run-start epoch from ts ("20260421T211421Z").
+    try:
+        run_start = int(datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        run_start = 0
+    window_sec = max(1, int(datetime.now(timezone.utc).timestamp() - run_start) + 60)
+
+    key_path = args.key
+    ssh_opts = (
+        f"-i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+    )
+    # One compound sensor query: notice.log + intel.log + weird.log for the run window.
+    remote_cmd = (
+        f"echo '=== NOTICES ==='; "
+        f"sudo tail -c 2000000 /opt/zeek/logs/current/notice.log 2>/dev/null "
+        f'| jq -c "select((.ts|tonumber) > (now - {window_sec})) | '
+        f'{{ts, note, src: (.src // .\\"id.orig_h\\"), dst: .\\"id.resp_h\\", msg: (.msg // \\"\\"), sub: (.sub // \\"\\")}}"'
+        f" 2>/dev/null; "
+        f"echo '=== INTEL ==='; "
+        f"sudo tail -c 500000 /opt/zeek/logs/current/intel.log 2>/dev/null "
+        f'| jq -c "select((.ts|tonumber) > (now - {window_sec})) | '
+        f'{{ts, indicator: .\\"seen.indicator\\", type: .\\"seen.indicator_type\\", src: (.src // .\\"id.orig_h\\"), dst: .\\"id.resp_h\\", source: .sources[0]}}"'
+        f" 2>/dev/null"
+    )
+    import subprocess, shlex
+    try:
+        result = subprocess.run(
+            ["bash", "-c", f"ssh {ssh_opts} ubuntu@{args.sensor_ip} {shlex.quote(remote_cmd)}"],
+            capture_output=True, text=True, timeout=60,
+        )
+        raw = result.stdout
+    except Exception as e:
+        print(f"[purple-agent] sweep ssh failed: {e}")
+        return None
+
+    notices, intel = [], []
+    section = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if line == "=== NOTICES ===":
+            section = "n"; continue
+        if line == "=== INTEL ===":
+            section = "i"; continue
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if section == "n":
+            notices.append(entry)
+        elif section == "i":
+            intel.append(entry)
+
+    sweep = {"run_start_epoch": run_start, "window_sec": window_sec, "notices": notices, "intel_hits": intel}
+    sweep_path.write_text(json.dumps(sweep, indent=2), encoding="utf-8")
+    print(f"[purple-agent] sweep written: {sweep_path} ({len(notices)} notices, {len(intel)} intel hits)")
+    return sweep_path
 
 
 # ============================================================================
@@ -1193,7 +1276,7 @@ def _classify_by_layer(enriched):
     return suricata_alert, zeek_alert_only, visibility_only, no_visibility
 
 
-def _build_exec_summary(enriched, buckets):
+def _build_exec_summary(enriched, buckets, sweep_data=None):
     total = len(enriched)
     n_error = len(buckets.get("ERROR", []))
     n_fp = sum(1 for f in enriched if f.get("fp"))
@@ -1345,7 +1428,9 @@ def _build_exec_summary(enriched, buckets):
 
     # Assemble with explicit paragraph breaks. Context: {narrative} gets wrapped
     # in <p>...</p> by the summary-text div, so internal paragraph boundaries
-    # need </p><p> markers.
+    # need </p><p> markers. Sweep data is deliberately kept out of the exec
+    # summary — it has its own dedicated section below and mixing it in muddles
+    # per-attack attribution.
     narrative = para_methodology
     if para_detection:
         narrative += "</p><p>" + para_detection
@@ -1372,7 +1457,7 @@ def _build_exec_summary(enriched, buckets):
     <div class="stat-boxes">
         <div class="stat-box" style="background:#1a1a2e;"><div class="num">{total}</div><div class="label">Attacks Conducted</div></div>
         <div class="stat-box stat-promote"><div class="num">{n_suri}</div><div class="label">Suricata Alerts</div></div>
-        <div class="stat-box" style="background:#17a2b8;"><div class="num">{n_zeek_total}</div><div class="label" title="Probes where Zeek notice.log fired (may overlap with Suricata)">Zeek Alerts</div></div>
+        <div class="stat-box" style="background:#17a2b8;"><div class="num">{n_zeek_total}</div><div class="label" title="Probes where Zeek notice.log fired during per-probe check. Attributed to specific attacks.">Zeek Alerts</div></div>
         <div class="stat-box stat-gap"><div class="num">{n_true_undetected}</div><div class="label" title="Probes with no Suricata SID and no Zeek notice. Excludes ERROR and FP probes.">No Detection</div></div>
     </div>
     <div class="detection-rates">
@@ -1608,130 +1693,6 @@ def _build_findings_section(enriched):
     return "\n".join(parts)
 
 
-def _build_detection_layers(enriched):
-    """Build a Suricata vs Zeek dual-layer detection comparison.
-
-    Uses the same _classify_by_layer buckets as the executive summary so the
-    two sections agree on what counts as a Zeek alert vs Zeek visibility.
-    """
-    parts = ['<h2>Detection Layer Analysis: Suricata vs Zeek</h2>',
-             '<p>Each attack is evaluated against both detection layers. '
-             '"Zeek notice" means an entry in notice.log (actual Zeek alert). '
-             '"Zeek visibility" means protocol-log metadata (ssl/http/dns/conn) '
-             'with no matching notice -- hunting-grade signal, not an alert.</p>']
-
-    suricata_alert, zeek_alert_only, visibility_only, no_visibility = _classify_by_layer(enriched)
-
-    # Split suricata_alert into those that ALSO have a Zeek notice vs those
-    # where only Suricata fired (no Zeek notice, regardless of visibility).
-    both_layers = [f for f in suricata_alert if f.get("zeek_notices")]
-    suricata_only = [f for f in suricata_alert if not f.get("zeek_notices")]
-    zeek_only = zeek_alert_only  # notice.log only, no SID -- Suricata missed
-    visibility_only_list = visibility_only  # protocol logs only, no alerts
-    neither = no_visibility
-
-    total = len(enriched)
-    parts.append(f"""
-    <div class="stat-boxes">
-        <div class="stat-box" style="background:#155724;"><div class="num">{len(both_layers)}</div><div class="label" title="Suricata SID fired AND Zeek notice.log fired">Both Layers</div></div>
-        <div class="stat-box" style="background:#28a745;"><div class="num">{len(suricata_only)}</div><div class="label" title="Suricata SID fired, no Zeek notice">Suricata Only</div></div>
-        <div class="stat-box" style="background:#17a2b8;"><div class="num">{len(zeek_only)}</div><div class="label" title="Zeek notice.log fired but Suricata missed">Zeek Only</div></div>
-        <div class="stat-box" style="background:#ffc107; color:#212529;"><div class="num">{len(visibility_only_list)}</div><div class="label" title="Zeek protocol logs saw the traffic but neither layer alerted">Visibility Only</div></div>
-        <div class="stat-box" style="background:#dc3545;"><div class="num">{len(neither)}</div><div class="label" title="Sensor observed nothing">Neither Layer</div></div>
-    </div>
-    """)
-
-    suri_coverage = len(suricata_alert)
-    zeek_notice_coverage = len(both_layers) + len(zeek_only)
-    alert_coverage = suri_coverage + len(zeek_only)  # probes with any alert
-    parts.append('<div class="summary-text">')
-    parts.append(
-        f'<p>Suricata alerted on <strong>{suri_coverage}/{total}</strong> attacks. '
-        f'Zeek notice.log fired on <strong>{zeek_notice_coverage}/{total}</strong>. '
-        f'Combined, <strong>{alert_coverage}/{total}</strong> attacks triggered at '
-        f'least one alert. '
-    )
-    if visibility_only_list:
-        parts.append(
-            f'Zeek protocol logs captured metadata for <strong>{len(visibility_only_list)} '
-            f'additional attacks</strong> with no alert on either layer -- hunting context, '
-            f'not detection.')
-    if zeek_only:
-        parts.append(
-            f' <strong>{len(zeek_only)} attacks triggered a Zeek notice but no Suricata SID</strong> '
-            f'-- opportunity to port Zeek coverage into Suricata rules.')
-    if neither:
-        parts.append(
-            f' <strong>{len(neither)} attacks produced no sensor evidence at all</strong> -- '
-            f'true blind spots requiring new detection capability.')
-    parts.append('</p></div>')
-
-    # Table of Zeek-notice-only detections (Zeek caught, Suricata missed)
-    if zeek_only:
-        parts.append('<h3>Zeek Notice Only (Suricata gap, Zeek alert fired)</h3>')
-        parts.append('<p style="font-size:0.85rem; color:#495057;">These attacks fired Zeek '
-                     'notice.log events but no Suricata SID -- candidates for porting into ET rules.</p>')
-        parts.append('<table class="gap-table" style="border-left:3px solid #17a2b8;">'
-                     '<thead><tr style="background:#17a2b8;">'
-                     '<th>Attack</th><th>MITRE</th><th>Zeek Notices</th><th>Recommendation</th>'
-                     '</tr></thead><tbody>')
-        for f in zeek_only:
-            notices = ", ".join(f.get("zeek_notices", []))
-            remed = f.get("remediation", "")
-            parts.append(
-                f'<tr>'
-                f'<td><strong>{_esc(f.get("probe", ""))}</strong></td>'
-                f'<td>{_esc(f.get("mitre_id", ""))}</td>'
-                f'<td style="font-family:monospace; font-size:0.8rem;">{_esc(notices[:200])}</td>'
-                f'<td>{_esc(remed[:150])}</td>'
-                f'</tr>'
-            )
-        parts.append('</tbody></table>')
-
-    # Visibility-only table: protocol logs captured traffic, nothing alerted
-    if visibility_only_list:
-        parts.append('<h3>Visibility Only (protocol logs, no alerts)</h3>')
-        parts.append('<p style="font-size:0.85rem; color:#495057;">Zeek protocol analyzers '
-                     'saw the traffic but no rule/notice fired. Hunting-grade signal, not detection.</p>')
-        parts.append('<table class="gap-table" style="border-left:3px solid #ffc107;">'
-                     '<thead><tr style="background:#ffc107; color:#212529;">'
-                     '<th>Attack</th><th>MITRE</th><th>Zeek Evidence</th><th>Recommendation</th>'
-                     '</tr></thead><tbody>')
-        for f in visibility_only_list:
-            zeek_ev = f.get("zeek_signals", "") or f.get("notes", "")
-            remed = f.get("remediation", "")
-            parts.append(
-                f'<tr>'
-                f'<td><strong>{_esc(f.get("probe", ""))}</strong></td>'
-                f'<td>{_esc(f.get("mitre_id", ""))}</td>'
-                f'<td style="font-family:monospace; font-size:0.8rem;">{_esc(zeek_ev[:200])}</td>'
-                f'<td>{_esc(remed[:150])}</td>'
-                f'</tr>'
-            )
-        parts.append('</tbody></table>')
-
-    # Table of true blind spots
-    if neither:
-        parts.append('<h3>True Blind Spots (invisible to both layers)</h3>')
-        parts.append('<table class="gap-table"><thead><tr>'
-                     '<th>Attack</th><th>Severity</th><th>MITRE</th><th>Tool</th><th>Notes</th>'
-                     '</tr></thead><tbody>')
-        for f in neither:
-            sev = f.get("severity", "Medium")
-            sev_color = SEVERITY_COLORS.get(sev, "#6c757d")
-            parts.append(
-                f'<tr>'
-                f'<td><strong>{_esc(f.get("probe", ""))}</strong></td>'
-                f'<td><span style="color:{sev_color}; font-weight:600;">{_esc(sev)}</span></td>'
-                f'<td>{_esc(f.get("mitre_id", ""))}</td>'
-                f'<td><code>{_esc(f.get("tool_used", ""))}</code></td>'
-                f'<td>{_esc(f.get("notes", "")[:150])}</td>'
-                f'</tr>'
-            )
-        parts.append('</tbody></table>')
-
-    return "\n".join(parts)
-
 
 def _build_gap_analysis(gaps):
     if not gaps:
@@ -1762,6 +1723,78 @@ def _build_gap_analysis(gaps):
                 f'<td><code>{_esc(g.get("tool_used", ""))}</code></td>'
                 f'<td>{_esc(g.get("notes", ""))}</td>'
                 f'</tr>'
+            )
+        parts.append('</tbody></table>')
+
+    return "\n".join(parts)
+
+
+def _build_sweep_section(sweep_data):
+    """Render the end-of-run Zeek sensor sweep.
+
+    The per-probe CHECK step can't see Zeek notices that fire on SumStats
+    buckets (Scan::Port_Scan, SSH::Password_Guessing) because those aggregate
+    over 2-minute windows. After the probe loop ends, the runner sleeps 3 min
+    and dumps every notice/intel entry from the run window. Rendered here as
+    an aggregate table -- we deliberately do NOT attribute notices to
+    specific probes to avoid muddling per-probe ledger accuracy.
+    """
+    if not sweep_data:
+        return '<h2>Zeek Sensor Sweep (post-run)</h2><p><em>Sweep skipped or sensor unreachable.</em></p>'
+
+    notices = sweep_data.get("notices", [])
+    intel_hits = sweep_data.get("intel_hits", [])
+
+    parts = ['<h2>Zeek Sensor Sweep (post-run)</h2>']
+    parts.append(
+        '<p>Aggregated Zeek notice.log and intel.log entries captured ~3 minutes '
+        'after the probe loop ended, so SumStats-based detections '
+        '(<code>Scan::Port_Scan</code>, <code>SSH::Password_Guessing</code>) have '
+        'time to flush. These entries may span multiple probes -- attribution to '
+        'individual findings is intentionally not performed here.</p>'
+    )
+
+    if not notices and not intel_hits:
+        parts.append('<p><em>No notices or intel hits during the run window.</em></p>')
+        return "\n".join(parts)
+
+    # Notice table
+    if notices:
+        note_counts = {}
+        for n in notices:
+            k = n.get("note", "?")
+            note_counts[k] = note_counts.get(k, 0) + 1
+        parts.append(f'<h3>Notices — {len(notices)} entries, {len(note_counts)} distinct types</h3>')
+        parts.append('<table class="gap-table" style="border-left:3px solid #17a2b8;">'
+                     '<thead><tr style="background:#17a2b8;">'
+                     '<th>Count</th><th>Note</th><th>Sources</th>'
+                     '</tr></thead><tbody>')
+        for note, count in sorted(note_counts.items(), key=lambda x: -x[1]):
+            srcs = set()
+            for n in notices:
+                if n.get("note") == note and n.get("src"):
+                    srcs.add(n["src"])
+            parts.append(
+                f'<tr><td><strong>{count}</strong></td>'
+                f'<td><code>{_esc(note)}</code></td>'
+                f'<td>{_esc(", ".join(sorted(srcs)[:5]))}</td></tr>'
+            )
+        parts.append('</tbody></table>')
+
+    # Intel framework hits
+    if intel_hits:
+        parts.append(f'<h3>Intel Framework hits — {len(intel_hits)}</h3>')
+        parts.append('<p>Indicators from <code>/opt/zeek/intel/intel.dat</code> (Abuse.ch URLhaus / ThreatFox / Feodo / SSLBL) that matched observed traffic.</p>')
+        parts.append('<table class="gap-table" style="border-left:3px solid #28a745;">'
+                     '<thead><tr style="background:#28a745;">'
+                     '<th>Indicator</th><th>Type</th><th>Feed</th><th>Destination</th>'
+                     '</tr></thead><tbody>')
+        for hit in intel_hits[:50]:
+            parts.append(
+                f'<tr><td><code>{_esc(hit.get("indicator", ""))}</code></td>'
+                f'<td>{_esc(hit.get("type", ""))}</td>'
+                f'<td>{_esc(hit.get("source", ""))}</td>'
+                f'<td>{_esc(hit.get("dst", ""))}</td></tr>'
             )
         parts.append('</tbody></table>')
 
@@ -1879,9 +1912,16 @@ def write_navigator_layer(reports_dir, ts, enriched):
     print(f"[purple-agent] navigator: {out}")
 
 
-def write_html_report(reports_dir, ts, ledger_path, args, probes_yaml_path=None):
+def write_html_report(reports_dir, ts, ledger_path, args, probes_yaml_path=None, sweep_path=None):
     findings = _load_findings(ledger_path)
     enriched = _enrich_findings(findings, probes_yaml_path)
+
+    sweep_data = None
+    if sweep_path and Path(sweep_path).exists():
+        try:
+            sweep_data = json.loads(Path(sweep_path).read_text(encoding="utf-8"))
+        except Exception:
+            sweep_data = None
 
     buckets = {"DETECTED": [], "UNDETECTED": [], "ERROR": [], "OTHER": []}
     for f in enriched:
@@ -1890,9 +1930,8 @@ def write_html_report(reports_dir, ts, ledger_path, args, probes_yaml_path=None)
 
     css = _build_css()
     cover = _build_cover(ts, args)
-    exec_summary = _build_exec_summary(enriched, buckets)
+    exec_summary = _build_exec_summary(enriched, buckets, sweep_data=sweep_data)
     suricata_alerts = _build_suricata_alerts(enriched)
-    detection_layers = _build_detection_layers(enriched)
     mitre_matrix = _build_mitre_matrix(enriched)
     findings_html = _build_findings_section(enriched)
     # Gap analysis shows true undetected probes only — FPs (a SID fired, just on
@@ -1900,6 +1939,7 @@ def write_html_report(reports_dir, ts, ledger_path, args, probes_yaml_path=None)
     gap_analysis = _build_gap_analysis(
         [f for f in buckets["UNDETECTED"] if not f.get("fp")]
     )
+    sweep_section = _build_sweep_section(sweep_data)
     appendix = _build_appendix(ledger_path)
 
     html = f"""<!DOCTYPE html>
@@ -1914,7 +1954,7 @@ def write_html_report(reports_dir, ts, ledger_path, args, probes_yaml_path=None)
 {cover}
 {exec_summary}
 {suricata_alerts}
-{detection_layers}
+{sweep_section}
 {mitre_matrix}
 {findings_html}
 {gap_analysis}
@@ -1967,6 +2007,12 @@ def parse_args():
         action="store_true",
         help="Skip probes.yaml entirely; agent improvises every probe from a "
              "built-in TTP taxonomy. Trades reproducibility for per-run variety.",
+    )
+    p.add_argument(
+        "--no-sweep",
+        action="store_true",
+        help="Skip the 3-minute end-of-run sensor sweep for aggregated "
+             "SumStats notices (Scan, SSH brute). Useful for fast iteration.",
     )
     p.add_argument(
         "--focus",

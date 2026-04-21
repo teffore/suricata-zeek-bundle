@@ -553,6 +553,7 @@ cat > /opt/zeek/intel/build-intel.sh <<'INTELSH'
 #   Feodo Tracker ipblock  -> Intel::ADDR       (legacy botnet C2 IPs)
 #   ThreatFox hostfile     -> Intel::DOMAIN     (current C2 host indicators)
 #   SSLBL blacklist CSV    -> Intel::CERT_HASH  (malicious TLS cert SHA1)
+#   MalwareBazaar full CSV -> Intel::FILE_HASH  (~1M malware sample SHA256)
 #
 # meta.do_notice=T on every row so matches fire Intel::Notice into notice.log,
 # not just intel.log. Without this flag, policy/frameworks/intel/do_notice
@@ -560,6 +561,7 @@ cat > /opt/zeek/intel/build-intel.sh <<'INTELSH'
 set +e
 DAT=/opt/zeek/intel/intel.dat
 TMP=$(mktemp)
+MB_ZIP=$(mktemp --suffix=.zip)
 {
   printf "#fields\tindicator\tindicator_type\tmeta.source\tmeta.desc\tmeta.url\tmeta.do_notice\n"
 
@@ -583,7 +585,19 @@ TMP=$(mktemp)
   curl -fsSL --max-time 30 https://sslbl.abuse.ch/blacklist/sslblacklist.csv 2>/dev/null \
     | tr -d '\r' \
     | awk -F',' '/^[0-9]{4}-/ && NF>=2 {print $2 "\tIntel::CERT_HASH\tabuse.ch/sslbl\tMalicious TLS cert\t-\tT"}'
+
+  # MalwareBazaar full CSV export — ~1M SHA256s of confirmed malware samples.
+  # The endpoint returns a zip containing full.csv. We use python3 to unzip
+  # inline because unzip(1) isn't guaranteed on minimal Ubuntu/Amazon Linux
+  # sensor images. The if-guard skips the block if curl fails (offline build,
+  # rate-limited, etc.) so the other five feeds still populate intel.dat.
+  if curl -fsSL --max-time 120 https://bazaar.abuse.ch/export/csv/full/ -o "$MB_ZIP" 2>/dev/null; then
+    python3 -c "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); sys.stdout.buffer.write(z.read(z.namelist()[0]))" "$MB_ZIP" 2>/dev/null \
+      | tr -d '\r' \
+      | awk -F',' '/^"[0-9]{4}-/ && NF>=2 {gsub(/"/, "", $2); gsub(/^ +| +$/, "", $2); if (length($2)==64) print $2 "\tIntel::FILE_HASH\tabuse.ch/malwarebazaar\tMalware sample SHA256\t-\tT"}'
+  fi
 } > "$TMP"
+rm -f "$MB_ZIP"
 
 # Guard: only replace live file if we got substantive data (>100 rows is a sanity cutoff;
 # previous full builds land at 60k+, so a few hundred means a feed outage).
