@@ -193,15 +193,22 @@ jobs:
           # Fan out: each box polls SSH readiness, then waits on cloud-init
           # in its own subshell. Wall-clock is now max(boxes) not sum(boxes).
           # Attacker is Kali (default user 'kali'); sensor + victim are Ubuntu.
+          # Kali's cloud-init status --wait can return non-zero on a "degraded"
+          # finish state even when init actually completed (module warning etc.),
+          # so we tolerate its exit code and instead gate on a follow-up SSH
+          # that runs after cloud-init says it's done.
           wait_box() {
             local IP="$1" NAME="$2" USER="${3:-ubuntu}"
+            local SSH_OPTS="-i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
             for i in $(seq 1 30); do
               nc -z -w 5 "$IP" 22 && break
               sleep 5
             done
-            nc -z -w 5 "$IP" 22 || { echo "SSH never came up on $NAME ($IP)"; exit 1; }
-            ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              "$USER"@"$IP" "cloud-init status --wait"
+            nc -z -w 5 "$IP" 22 || { echo "[$NAME] SSH never came up on $IP"; return 1; }
+            ssh $SSH_OPTS "$USER"@"$IP" "cloud-init status --wait || true" >/dev/null 2>&1
+            ssh $SSH_OPTS "$USER"@"$IP" "echo ready" >/dev/null \
+              || { echo "[$NAME] post-cloud-init SSH failed"; return 1; }
+            echo "[$NAME] ready"
           }
           wait_box "${{ steps.wait.outputs.sensor_ip }}"   sensor   ubuntu &
           SENSOR_PID=$!
