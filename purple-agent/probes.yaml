@@ -140,10 +140,10 @@ probes:
           --data-binary 'login=' >/dev/null
       done
 
-  - name: cisco-fmc-cve-2026-20079
-    category: cve-2026
+  - name: cisco-fmc-auth-bypass-synthetic
+    category: synthetic
     mitre: T1190
-    rationale: "Cisco FMC auth-bypass (ET v11172, Apr 2026)"
+    rationale: "Synthetic Cisco FMC auth-bypass pattern (NOT a real CVE -- generic API probe for rule-tuning only)"
     expected_sids: []
     expected_verdict: UNDETECTED
     already_in_catalog: false

@@ -431,6 +431,10 @@ apt-get install -y zeek-8.0
 /opt/zeek/bin/zkg install --force zeek/foxio/ja4
 /opt/zeek/bin/zkg install --force mitre-attack/bzar
 /opt/zeek/bin/zkg install --force corelight/zeek-long-connections
+# ncsa/bro-simple-scan — replaces the policy/misc/scan module that Zeek 8
+# removed. Emits Scan::Port_Scan / Scan::Address_Scan notices via
+# sumstats-based counting. Dependency: bro-is-darknet (pulled automatically).
+/opt/zeek/bin/zkg install --force ncsa/bro-simple-scan
 /opt/zeek/bin/zkg list
 
 # ---------- node.cfg: standalone on primary interface ----------
@@ -498,22 +502,33 @@ cat >> /opt/zeek/share/zeek/site/local.zeek <<'EOF'
 @load policy/frameworks/files/hash-all-files
 
 # SSH brute-force threshold — 5 trips on ordinary DevOps automation.
-# Default is 30; 15 is a middle ground that still catches hydra bursts.
-redef SSH::password_guesses_limit = 15;
+# Default is 30; tightened to 5 so short hydra bursts in purple-agent
+# runs still produce SSH::Password_Guessing notices.
+redef SSH::password_guesses_limit = 5;
 # SumStats bucket window. Default 30 mins means a burst that completes
 # in 3 minutes (our CI attack phase) won't produce a notice until the
 # bucket flushes, well after verify_alerts.sh has read notice.log.
 # Shorten to 2 mins so CI sees the notice before it looks for it.
 redef SSH::guessing_timeout = 2 mins;
 
-# Iteration 8 — volumetric detection via stats framework. Stock
-# Zeek 8 doesn't ship misc/scan (that's a zkg package, separate
-# install). policy/misc/stats IS available and emits periodic
-# engine stats to stats.log; useful telemetry for offline
-# behavioral / rate-based analysis even though it doesn't emit
-# notices itself.
+# Iteration 8 — volumetric detection via stats framework.
 @load misc/stats
 redef Stats::report_interval = 60 sec;
+
+# ---- Scan detection via the ncsa/bro-simple-scan zkg package.
+# Zeek 8 removed the built-in policy/misc/scan; the zkg equivalent gives us
+# Scan::Port_Scan and Scan::Address_Scan notices. Thresholds tuned down from
+# defaults (25 / 250) for lab sensitivity so short nmap -T4 --top-ports 20
+# bursts produce notices within one probe cycle.
+@load packages/bro-simple-scan
+redef Scan::scan_threshold = 10;
+redef Scan::local_scan_threshold = 50;
+redef Scan::knockknock_threshold = 5;
+redef Scan::scan_timeout = 2 mins;
+
+# ---- TLS hygiene + SIEM correlation.
+@load policy/protocols/ssl/weak-keys                 # flag RSA<2048, DH<2048
+@load policy/frameworks/notice/community-id          # add community_id to notice.log
 
 # Intel Framework — load abuse.ch feeds from /opt/zeek/intel/intel.dat.
 # Assembled by build-intel.sh below from URLhaus (malware domains)
@@ -531,39 +546,64 @@ mkdir -p /opt/zeek/intel
 cat > /opt/zeek/intel/build-intel.sh <<'INTELSH'
 #!/bin/bash
 # Build /opt/zeek/intel/intel.dat from abuse.ch feeds.
+#
+# Sources:
+#   URLhaus hostfile       -> Intel::DOMAIN     (malware delivery hosts)
+#   URLhaus recent URL CSV -> Intel::URL        (recent malicious URLs)
+#   Feodo Tracker ipblock  -> Intel::ADDR       (legacy botnet C2 IPs)
+#   ThreatFox hostfile     -> Intel::DOMAIN     (current C2 host indicators)
+#   SSLBL blacklist CSV    -> Intel::CERT_HASH  (malicious TLS cert SHA1)
+#
+# meta.do_notice=T on every row so matches fire Intel::Notice into notice.log,
+# not just intel.log. Without this flag, policy/frameworks/intel/do_notice
+# is a no-op and operators don't see matches in notice-based SOAR pipelines.
 set +e
 DAT=/opt/zeek/intel/intel.dat
 TMP=$(mktemp)
 {
-  printf "#fields\tindicator\tindicator_type\tmeta.source\tmeta.desc\tmeta.url\n"
+  printf "#fields\tindicator\tindicator_type\tmeta.source\tmeta.desc\tmeta.url\tmeta.do_notice\n"
 
-  # URLhaus — hostfile format is "127.0.0.1 malicious-domain.com",
-  # so we want $2 (the domain), and we strip Windows line endings.
   curl -fsSL --max-time 30 https://urlhaus.abuse.ch/downloads/hostfile/ 2>/dev/null \
     | tr -d '\r' \
-    | awk '/^[^#]/ && NF>=2 {print $2 "\tIntel::DOMAIN\tabuse.ch/urlhaus\tMalware delivery host\t-"}'
+    | awk '/^[^#]/ && NF>=2 {print $2 "\tIntel::DOMAIN\tabuse.ch/urlhaus\tMalware delivery host\t-\tT"}'
 
-  # Feodo Tracker — botnet C2 IPs (one per line)
+  curl -fsSL --max-time 30 https://urlhaus.abuse.ch/downloads/csv_recent/ 2>/dev/null \
+    | tr -d '\r' \
+    | awk -F',' '/^"[0-9]/ && NF>=3 {gsub(/"/, "", $3); print $3 "\tIntel::URL\tabuse.ch/urlhaus\tMalware URL\t-\tT"}' \
+    | head -2000
+
   curl -fsSL --max-time 30 https://feodotracker.abuse.ch/downloads/ipblocklist.txt 2>/dev/null \
     | tr -d '\r' \
-    | awk '/^[0-9]/ {print $1 "\tIntel::ADDR\tabuse.ch/feodo\tBotnet C2 IP\t-"}'
+    | awk '/^[0-9]/ {print $1 "\tIntel::ADDR\tabuse.ch/feodo\tBotnet C2 IP\t-\tT"}'
+
+  curl -fsSL --max-time 30 https://threatfox.abuse.ch/downloads/hostfile/ 2>/dev/null \
+    | tr -d '\r' \
+    | awk '/^[^#]/ && NF>=2 {print $2 "\tIntel::DOMAIN\tabuse.ch/threatfox\tThreatFox C2 IOC\t-\tT"}'
+
+  curl -fsSL --max-time 30 https://sslbl.abuse.ch/blacklist/sslblacklist.csv 2>/dev/null \
+    | tr -d '\r' \
+    | awk -F',' '/^[0-9]{4}-/ && NF>=2 {print $2 "\tIntel::CERT_HASH\tabuse.ch/sslbl\tMalicious TLS cert\t-\tT"}'
 } > "$TMP"
 
-# Only replace the live file if the build got more than just the header
-if [ "$(wc -l < "$TMP")" -gt 1 ]; then
+# Guard: only replace live file if we got substantive data (>100 rows is a sanity cutoff;
+# previous full builds land at 60k+, so a few hundred means a feed outage).
+if [ "$(wc -l < "$TMP")" -gt 100 ]; then
   mv "$TMP" "$DAT"
   chown suricata:suricata "$DAT" 2>/dev/null || true
+  echo "$(date -Iseconds) intel.dat rebuilt: $(wc -l < $DAT) rows"
 else
   rm -f "$TMP"
+  echo "$(date -Iseconds) ERROR: feeds empty or unreachable; keeping old intel.dat"
+  exit 1
 fi
 INTELSH
 chmod +x /opt/zeek/intel/build-intel.sh
 /opt/zeek/intel/build-intel.sh
 
-# Refresh intel daily at 4:30am
-echo "30 4 * * * root /opt/zeek/intel/build-intel.sh >/dev/null 2>&1" \
-  > /etc/cron.d/zeek-intel
-chmod 644 /etc/cron.d/zeek-intel
+# Refresh intel hourly (:17 to avoid top-of-hour congestion across feeds).
+echo "17 * * * * root /opt/zeek/intel/build-intel.sh >> /var/log/zeek-intel-refresh.log 2>&1" \
+  > /etc/cron.d/zeek-intel-refresh
+chmod 644 /etc/cron.d/zeek-intel-refresh
 
 # ---------- Logrotate (zeekctl already rotates hourly; keep 7d compressed) ----------
 cat > /etc/logrotate.d/zeek <<'LOGROTATE'
