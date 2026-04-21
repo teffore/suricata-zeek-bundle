@@ -35,6 +35,11 @@ permissions:
 env:
   AWS_REGION: us-east-1
   INSTANCE_TYPE: t3.medium
+  # Pinned Kali Linux AMI (us-east-1). Used for the attacker box only;
+  # sensor + victim stay on Ubuntu 22.04 because standalone.sh targets that.
+  # Bumping is intentional — doing so in a PR makes the version change
+  # reviewable and keeps CI reproducible.
+  KALI_AMI_ID: ami-003fa928ba1faa587
 
 jobs:
   detect:
@@ -105,10 +110,14 @@ jobs:
       - name: Launch sensor, victim, attacker
         id: ec2
         run: |
+          # Second positional arg is the AMI so we can give the attacker Kali
+          # while sensor + victim stay Ubuntu. Kali has the full red-team
+          # toolchain preinstalled (impacket-scripts, nikto, hydra, etc.)
+          # which lets attacker_setup.sh verify instead of install.
           launch() {
-            local role="$1"
+            local role="$1" ami="$2"
             aws ec2 run-instances \
-              --image-id "${{ steps.ctx.outputs.ami_id }}" \
+              --image-id "$ami" \
               --instance-type "${{ env.INSTANCE_TYPE }}" \
               --key-name "${{ steps.ctx.outputs.run_tag }}" \
               --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
@@ -118,9 +127,9 @@ jobs:
               --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ steps.ctx.outputs.run_tag }}-${role}},{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}},{Key=Role,Value=${role}}]" \
               --query 'Instances[0].InstanceId' --output text
           }
-          SENSOR_ID=$(launch sensor)
-          VICTIM_ID=$(launch victim)
-          ATTACKER_ID=$(launch attacker)
+          SENSOR_ID=$(launch sensor   "${{ steps.ctx.outputs.ami_id }}")
+          VICTIM_ID=$(launch victim   "${{ steps.ctx.outputs.ami_id }}")
+          ATTACKER_ID=$(launch attacker "${{ env.KALI_AMI_ID }}")
           echo "sensor_id=${SENSOR_ID}" >> "$GITHUB_OUTPUT"
           echo "victim_id=${VICTIM_ID}" >> "$GITHUB_OUTPUT"
           echo "attacker_id=${ATTACKER_ID}" >> "$GITHUB_OUTPUT"
@@ -183,21 +192,22 @@ jobs:
         run: |
           # Fan out: each box polls SSH readiness, then waits on cloud-init
           # in its own subshell. Wall-clock is now max(boxes) not sum(boxes).
+          # Attacker is Kali (default user 'kali'); sensor + victim are Ubuntu.
           wait_box() {
-            local IP="$1" NAME="$2"
+            local IP="$1" NAME="$2" USER="${3:-ubuntu}"
             for i in $(seq 1 30); do
               nc -z -w 5 "$IP" 22 && break
               sleep 5
             done
             nc -z -w 5 "$IP" 22 || { echo "SSH never came up on $NAME ($IP)"; exit 1; }
             ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              ubuntu@"$IP" "cloud-init status --wait"
+              "$USER"@"$IP" "cloud-init status --wait"
           }
-          wait_box "${{ steps.wait.outputs.sensor_ip }}"   sensor   &
+          wait_box "${{ steps.wait.outputs.sensor_ip }}"   sensor   ubuntu &
           SENSOR_PID=$!
-          wait_box "${{ steps.wait.outputs.victim_ip }}"   victim   &
+          wait_box "${{ steps.wait.outputs.victim_ip }}"   victim   ubuntu &
           VICTIM_PID=$!
-          wait_box "${{ steps.wait.outputs.attacker_ip }}" attacker &
+          wait_box "${{ steps.wait.outputs.attacker_ip }}" attacker kali &
           ATTACKER_PID=$!
           fail=0
           wait $SENSOR_PID   || fail=1
@@ -258,9 +268,10 @@ jobs:
 
           (
             echo "--- ATTACKER install ---"
-            scp $SSH_OPTS testing/attacker_setup.sh ubuntu@"$ATTACKER_IP":/tmp/attacker_setup.sh
-            scp $SSH_OPTS testing/run_attacks.sh   ubuntu@"$ATTACKER_IP":/tmp/run_attacks.sh
-            ssh $SSH_OPTS ubuntu@"$ATTACKER_IP" "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
+            # Attacker runs Kali (user 'kali'); sensor + victim are Ubuntu.
+            scp $SSH_OPTS testing/attacker_setup.sh kali@"$ATTACKER_IP":/tmp/attacker_setup.sh
+            scp $SSH_OPTS testing/run_attacks.sh   kali@"$ATTACKER_IP":/tmp/run_attacks.sh
+            ssh $SSH_OPTS kali@"$ATTACKER_IP" "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
           ) > /tmp/attacker-install.log 2>&1 &
           ATTACKER_PID=$!
 
@@ -282,7 +293,7 @@ jobs:
           # run would hit 'command not found' for every tool. Hard-fail here
           # if anything the attack battery expects is missing.
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.attacker_ip }} '
+            kali@${{ steps.wait.outputs.attacker_ip }} '
               set -e
               missing=()
               for t in nmap hydra nikto hping3 dig smbclient impacket-psexec xxd curl; do
@@ -379,7 +390,7 @@ jobs:
           # of the capture. `nohup` + detached I/O so sshd doesn't kill the
           # background process when the outer ssh exits.
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
+            kali@${{ steps.wait.outputs.attacker_ip }} \
             "nohup bash -c 'for i in \$(seq 1 30); do ping -c 1 ${{ steps.wait.outputs.victim_private }}; curl -fs --max-time 1 http://${{ steps.wait.outputs.victim_private }}/ >/dev/null; sleep 0.5; done' </dev/null >/dev/null 2>&1 &"
           sleep 3
           # Count actual packet lines (timestamped) — do NOT grep for
@@ -412,7 +423,7 @@ jobs:
         run: |
           set +e
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
+            kali@${{ steps.wait.outputs.attacker_ip }} \
             "sudo timeout 900 bash /tmp/run_attacks.sh ${{ steps.wait.outputs.victim_private }}"
           rc=$?
           if [ "$rc" -eq 124 ]; then

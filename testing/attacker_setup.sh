@@ -1,11 +1,16 @@
 #!/bin/bash
-# attacker_setup.sh — installs the toolkit run_attacks.sh expects, on a
-# plain Ubuntu 22.04 box. Originally "kali_setup.sh" from when this was
-# run on a Kali box; renamed because the attack box is now vanilla Ubuntu
-# and the package list has to fit what Ubuntu's repos actually ship.
+# attacker_setup.sh — installs the toolkit run_attacks.sh expects on the
+# attacker box. Distro-aware: runs on Kali Linux (CI default) AND on plain
+# Ubuntu 22.04 (fallback, also used for local dev).
 #
-# Per-package install (not a single apt-get line) so one missing package
-# in universe doesn't roll back the whole batch and leave the attack run
+# On Kali almost everything is preinstalled; we still run apt-get so the
+# package db is fresh and any missing bits (nghttp2-client, python3-paramiko
+# on older images) are pulled in. On Ubuntu we install from universe and
+# hand-roll impacket-* wrappers because Ubuntu's python3-impacket ships only
+# the Python sources under /usr/share/ — no shims.
+#
+# Per-package install (not a single apt-get line) so one missing package in
+# universe doesn't roll back the whole batch and leave the attack run
 # silently calling 'command not found'.
 #
 # Output streams back through SSH — no /var/log redirect — so CI sees what
@@ -15,6 +20,17 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 echo "=== Attacker toolkit setup ==="
+
+# Detect distro so we pick the right impacket-provisioning path.
+IS_KALI=0
+if grep -qi '^ID=kali' /etc/os-release 2>/dev/null \
+   || grep -qi 'kali' /etc/os-release 2>/dev/null; then
+  IS_KALI=1
+  echo "  distro: Kali Linux"
+else
+  echo "  distro: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+fi
+
 apt-get update -y -qq
 
 # Required tools — install failure aborts the script.
@@ -26,16 +42,22 @@ apt-get update -y -qq
 #   hping3      — IP fragmentation evasion (one probe; nmap -f covers most)
 #   dnsutils    — dig, for DNS tunneling probes (rules 9000101-112, 9000213-214)
 #   smbclient   — SMB tree-connect probes
-#   python3-impacket — provides impacket-psexec/services/reg/samrdump/atexec
-#                      entry points, used by run_attacks.sh lateral-movement
-#                      section. (Kali's impacket-scripts is NOT available in
-#                      Ubuntu universe — do not install it.)
+#   python3-impacket — provides impacket.* Python module; Kali additionally
+#                      ships impacket-scripts which installs /usr/bin/impacket-*
+#                      wrappers natively.
 #   python3-paramiko — SSH attribution probes (HASSH fingerprint via
 #                      SSH-2.0-paramiko_* client banner, exercised by the
 #                      impacket-ad-chain group)
 #   nghttp2-client — nghttp/nghttpx for HTTP/2 prior-knowledge evasion probes
 #                    (triggers Suricata 2260000/2290006 + Zeek weird)
 REQUIRED=(nmap curl hydra nikto xxd hping3 dnsutils smbclient python3-impacket python3-paramiko nghttp2-client)
+
+# On Kali, add impacket-scripts — provides /usr/bin/impacket-* shims out of the
+# box and skips the hand-rolled wrapper pass below. On Ubuntu the package
+# doesn't exist in universe so we keep REQUIRED Ubuntu-compatible.
+if [ "$IS_KALI" = 1 ]; then
+  REQUIRED+=(impacket-scripts)
+fi
 
 installed=()
 failed=()
@@ -58,31 +80,34 @@ if [ "${#failed[@]}" -gt 0 ]; then
   exit 1
 fi
 
-# ---------- Create impacket-* shell wrappers ----------
-# Kali's impacket-scripts package ships /usr/bin/impacket-psexec (and friends)
-# as small shell wrappers. Ubuntu's python3-impacket installs only the Python
-# sources under /usr/share/... — no shims — so run_attacks.sh's calls like
-# 'impacket-psexec ...' fail with 'command not found'. Generate the wrappers
-# here so the attack battery's lateral-movement section actually runs.
-EXAMPLE_PY=$(find /usr/share -maxdepth 4 -name psexec.py -path "*impacket*" 2>/dev/null | head -1)
-if [ -n "$EXAMPLE_PY" ]; then
-  EXAMPLES_DIR=$(dirname "$EXAMPLE_PY")
+# ---------- Ensure impacket-* wrappers are available ----------
+# Kali's impacket-scripts package (installed above) ships /usr/bin/impacket-*
+# as shell shims. Ubuntu has no such package — its python3-impacket installs
+# only the Python sources, so we generate wrappers by hand.
+if command -v impacket-psexec >/dev/null 2>&1; then
   echo ""
-  echo "Creating impacket-* wrappers from ${EXAMPLES_DIR}"
-  for tool in psexec services reg samrdump atexec lookupsid smbclient \
-              smbserver wmiexec dcomexec secretsdump GetNPUsers GetUserSPNs; do
-    if [ -f "${EXAMPLES_DIR}/${tool}.py" ]; then
-      cat > "/usr/local/bin/impacket-${tool}" <<WRAPPER
+  echo "  impacket-* wrappers already provided by packages: $(ls /usr/bin/impacket-* 2>/dev/null | wc -l) found"
+else
+  EXAMPLE_PY=$(find /usr/share -maxdepth 4 -name psexec.py -path "*impacket*" 2>/dev/null | head -1)
+  if [ -n "$EXAMPLE_PY" ]; then
+    EXAMPLES_DIR=$(dirname "$EXAMPLE_PY")
+    echo ""
+    echo "Creating impacket-* wrappers from ${EXAMPLES_DIR}"
+    for tool in psexec services reg samrdump atexec lookupsid smbclient \
+                smbserver wmiexec dcomexec secretsdump GetNPUsers GetUserSPNs; do
+      if [ -f "${EXAMPLES_DIR}/${tool}.py" ]; then
+        cat > "/usr/local/bin/impacket-${tool}" <<WRAPPER
 #!/bin/bash
 exec python3 "${EXAMPLES_DIR}/${tool}.py" "\$@"
 WRAPPER
-      chmod +x "/usr/local/bin/impacket-${tool}"
-    fi
-  done
-  echo "  wrappers: $(ls /usr/local/bin/impacket-* 2>/dev/null | wc -l) created"
-else
-  echo "WARN: impacket examples not found under /usr/share — impacket-* commands unavailable" >&2
-  exit 1
+        chmod +x "/usr/local/bin/impacket-${tool}"
+      fi
+    done
+    echo "  wrappers: $(ls /usr/local/bin/impacket-* 2>/dev/null | wc -l) created"
+  else
+    echo "WARN: impacket examples not found under /usr/share — impacket-* commands unavailable" >&2
+    exit 1
+  fi
 fi
 
 # --- nuclei (ProjectDiscovery) ---

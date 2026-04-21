@@ -32,6 +32,9 @@ permissions:
 env:
   AWS_REGION: us-east-1
   INSTANCE_TYPE: t3.medium
+  # Pinned Kali Linux AMI (us-east-1). Used for the attacker box only; the
+  # other four boxes (sensor/victim/cribl/elastic) stay on Ubuntu 22.04.
+  KALI_AMI_ID: ami-003fa928ba1faa587
 
 jobs:
   ship:
@@ -106,10 +109,12 @@ jobs:
       - name: Launch 5 instances (sensor, victim, attacker, cribl, elastic)
         id: ec2
         run: |
+          # Second positional arg is the AMI so we can give attacker Kali
+          # while the others stay Ubuntu.
           launch() {
-            local role="$1"
+            local role="$1" ami="$2"
             aws ec2 run-instances \
-              --image-id "${{ steps.ctx.outputs.ami_id }}" \
+              --image-id "$ami" \
               --instance-type "${{ env.INSTANCE_TYPE }}" \
               --key-name "${{ steps.ctx.outputs.run_tag }}" \
               --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
@@ -119,11 +124,11 @@ jobs:
               --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ steps.ctx.outputs.run_tag }}-${role}},{Key=RunTag,Value=${{ steps.ctx.outputs.run_tag }}},{Key=Role,Value=${role}}]" \
               --query 'Instances[0].InstanceId' --output text
           }
-          SENSOR_ID=$(launch sensor)
-          VICTIM_ID=$(launch victim)
-          ATTACKER_ID=$(launch attacker)
-          CRIBL_ID=$(launch cribl)
-          ELASTIC_ID=$(launch elastic)
+          SENSOR_ID=$(launch sensor   "${{ steps.ctx.outputs.ami_id }}")
+          VICTIM_ID=$(launch victim   "${{ steps.ctx.outputs.ami_id }}")
+          ATTACKER_ID=$(launch attacker "${{ env.KALI_AMI_ID }}")
+          CRIBL_ID=$(launch cribl     "${{ steps.ctx.outputs.ami_id }}")
+          ELASTIC_ID=$(launch elastic "${{ steps.ctx.outputs.ami_id }}")
           echo "sensor_id=${SENSOR_ID}"     >> "$GITHUB_OUTPUT"
           echo "victim_id=${VICTIM_ID}"     >> "$GITHUB_OUTPUT"
           echo "attacker_id=${ATTACKER_ID}" >> "$GITHUB_OUTPUT"
@@ -196,18 +201,19 @@ jobs:
 
       - name: Wait for SSH + cloud-init on all five (parallel)
         run: |
+          # Attacker is Kali (default user 'kali'); the other four are Ubuntu.
           wait_box() {
-            local IP="$1" NAME="$2"
+            local IP="$1" NAME="$2" USER="${3:-ubuntu}"
             for i in $(seq 1 30); do nc -z -w 5 "$IP" 22 && break; sleep 5; done
             nc -z -w 5 "$IP" 22 || { echo "SSH never came up on $NAME ($IP)"; exit 1; }
             ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              ubuntu@"$IP" "cloud-init status --wait"
+              "$USER"@"$IP" "cloud-init status --wait"
           }
-          wait_box "${{ steps.wait.outputs.sensor_ip }}"   sensor   & P1=$!
-          wait_box "${{ steps.wait.outputs.victim_ip }}"   victim   & P2=$!
-          wait_box "${{ steps.wait.outputs.attacker_ip }}" attacker & P3=$!
-          wait_box "${{ steps.wait.outputs.cribl_ip }}"    cribl    & P4=$!
-          wait_box "${{ steps.wait.outputs.elastic_ip }}"  elastic  & P5=$!
+          wait_box "${{ steps.wait.outputs.sensor_ip }}"   sensor   ubuntu & P1=$!
+          wait_box "${{ steps.wait.outputs.victim_ip }}"   victim   ubuntu & P2=$!
+          wait_box "${{ steps.wait.outputs.attacker_ip }}" attacker kali   & P3=$!
+          wait_box "${{ steps.wait.outputs.cribl_ip }}"    cribl    ubuntu & P4=$!
+          wait_box "${{ steps.wait.outputs.elastic_ip }}"  elastic  ubuntu & P5=$!
           fail=0
           wait $P1 || fail=1
           wait $P2 || fail=1
@@ -287,9 +293,10 @@ jobs:
 
           (
             echo "--- ATTACKER install ---"
-            scp $SSH_OPTS testing/attacker_setup.sh ubuntu@"$ATTACKER_IP":/tmp/attacker_setup.sh
-            scp $SSH_OPTS testing/run_attacks.sh   ubuntu@"$ATTACKER_IP":/tmp/run_attacks.sh
-            ssh $SSH_OPTS ubuntu@"$ATTACKER_IP" "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
+            # Attacker runs Kali — SSH user is 'kali', not 'ubuntu'.
+            scp $SSH_OPTS testing/attacker_setup.sh kali@"$ATTACKER_IP":/tmp/attacker_setup.sh
+            scp $SSH_OPTS testing/run_attacks.sh   kali@"$ATTACKER_IP":/tmp/run_attacks.sh
+            ssh $SSH_OPTS kali@"$ATTACKER_IP" "sudo bash /tmp/attacker_setup.sh && chmod +x /tmp/run_attacks.sh"
           ) > /tmp/attacker-install.log 2>&1 &
           ATTACKER_PID=$!
 
@@ -402,7 +409,7 @@ jobs:
         run: |
           set +e
           ssh -i ~/.ssh/gha_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            ubuntu@${{ steps.wait.outputs.attacker_ip }} \
+            kali@${{ steps.wait.outputs.attacker_ip }} \
             "sudo timeout 900 bash /tmp/run_attacks.sh ${{ steps.wait.outputs.victim_private }}"
           rc=$?
           if [ "$rc" -eq 124 ]; then
