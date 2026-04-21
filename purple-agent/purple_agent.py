@@ -68,6 +68,7 @@ REPORTS_DIR = SCRIPT_DIR / "reports"
 # Ledger path is set per-run in run_agent() -- the record_finding tool reads it
 # via this module-level var (simplest way to close over state with @tool).
 _ledger_path: Path | None = None
+_max_attacks: int | None = None  # hard cap, enforced inside record_finding
 
 
 # ============================================================================
@@ -148,6 +149,10 @@ TACTIC_SEVERITY = {
     "Impact": "High",
 }
 
+# Ambient/canary SIDs that fire on background traffic — separated from
+# "relevant" detections during report post-processing but kept in the ledger.
+NOISE_FLOOR_SIDS = {"9000003", "2001219"}
+
 # CISA KEV-listed probes: auto-escalate to Critical when UNDETECTED.
 KEV_PROBES = {
     "panos-cve-2024-3400-sessid", "fortios-cve-2024-21762",
@@ -186,12 +191,17 @@ SEVERITY_COLORS = {
     "structured entry to the orchestrator's findings ledger which becomes "
     "the final report. Include tool_used, command_executed, mitre_id, "
     "confidence (high/partial/behavioral/none), and for UNDETECTED findings "
-    "include remediation (what Suricata rule pattern would close the gap).",
+    "include remediation (what Suricata rule pattern would close the gap). "
+    "zeek_notices and zeek_weird come from DIFFERENT Zeek logs -- keep them "
+    "separate: notice.log entries (namespaced like 'Scan::Port_Scan') go in "
+    "zeek_notices, weird.log anomalies (e.g. 'HTTP_version_mismatch') go in "
+    "zeek_weird.",
     {
         "probe_name": str,
         "verdict": str,
         "fired_sids": str,
         "zeek_notices": str,
+        "zeek_weird": str,
         "notes": str,
         "tool_used": str,
         "command_executed": str,
@@ -203,21 +213,57 @@ SEVERITY_COLORS = {
 )
 async def record_finding(args):
     """verdict in {DETECTED, UNDETECTED, ERROR, FP}. fired_sids/zeek_notices = CSV."""
+    # Hard-cap enforcement: refuse new records once --max-attacks is hit.
+    if _max_attacks is not None and _ledger_path is not None and _ledger_path.exists():
+        current = sum(1 for line in _ledger_path.open(encoding="utf-8") if line.strip())
+        if current >= _max_attacks:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"ATTACK CAP REACHED ({_max_attacks}). record_finding will not "
+                        f"accept further entries. Do NOT call any more tools. "
+                        f"Reply with exactly 'PURPLE RUN COMPLETE' and stop."
+                    ),
+                }]
+            }
+    fired_sids = [s.strip() for s in args.get("fired_sids", "").split(",") if s.strip()]
+    zeek_notices = [s.strip() for s in args.get("zeek_notices", "").split(",") if s.strip()]
+    zeek_weird = [s.strip() for s in args.get("zeek_weird", "").split(",") if s.strip()]
+    claimed_confidence = (args.get("confidence") or "").lower()
+
+    # Normalize confidence against hard evidence -- the LLM tends to inflate
+    # "behavioral" onto plain protocol visibility. See _normalize_confidence().
+    normalized_confidence, was_corrected = _normalize_confidence(
+        claimed_confidence, fired_sids, zeek_notices
+    )
+    correction_note = ""
+    if was_corrected:
+        if claimed_confidence == "behavioral":
+            correction_note = (
+                f" [confidence auto-corrected from 'behavioral' to 'none' because "
+                f"zeek_notices is empty -- 'behavioral' requires a notice.log or weird.log "
+                f"entry, not just protocol visibility. Put protocol metadata in zeek_signals.]"
+            )
+        else:
+            correction_note = (
+                f" [confidence auto-corrected from '{claimed_confidence}' to 'none' because "
+                f"fired_sids is empty -- high/partial require a Suricata SID]"
+            )
+
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "probe": args.get("probe_name", ""),
         "verdict": args.get("verdict", ""),
-        "fired_sids": [
-            s.strip() for s in args.get("fired_sids", "").split(",") if s.strip()
-        ],
-        "zeek_notices": [
-            s.strip() for s in args.get("zeek_notices", "").split(",") if s.strip()
-        ],
+        "fired_sids": fired_sids,
+        "zeek_notices": zeek_notices,
+        "zeek_weird": zeek_weird,
         "notes": args.get("notes", ""),
         "tool_used": args.get("tool_used", ""),
         "command_executed": args.get("command_executed", ""),
         "mitre_id": args.get("mitre_id", ""),
-        "confidence": args.get("confidence", ""),
+        "confidence": normalized_confidence,
+        "claimed_confidence": claimed_confidence if correction_note else "",
         "remediation": args.get("remediation", ""),
         "zeek_signals": args.get("zeek_signals", ""),
     }
@@ -228,9 +274,12 @@ async def record_finding(args):
         "content": [
             {
                 "type": "text",
-                "text": f"recorded: {entry['probe']} -> {entry['verdict']} "
-                f"(sids={len(entry['fired_sids'])}, "
-                f"notices={len(entry['zeek_notices'])})",
+                "text": (
+                    f"recorded: {entry['probe']} -> {entry['verdict']} "
+                    f"(sids={len(fired_sids)}, notices={len(zeek_notices)}, "
+                    f"weird={len(zeek_weird)})"
+                    + correction_note
+                ),
             }
         ]
     }
@@ -239,6 +288,98 @@ async def record_finding(args):
 # ============================================================================
 #  system prompt
 # ============================================================================
+
+POOL_SECTION = """\
+## Probe pool
+
+A curated probe pool lives at: {probes_file}
+Start by reading it with the Read tool. Each entry has: name, category,
+mitre (ATT&CK technique ID), rationale, expected_sids (if known), and a
+`command` (bash) to run on the attacker.
+
+You may pick probes from the pool or improvise variants. PREFER the pool --
+those commands are validated to reach the wire. You may skip probes marked
+`already_in_catalog: true` in the pool since running them only re-confirms
+existing coverage. Prioritize probes marked `expected_verdict: UNDETECTED`
+and novel techniques not yet covered.
+
+When the probe pool has `requires` fields, attempt prerequisite probes first.
+When a probe `produces` facts, note them -- subsequent probes that `require`
+those facts should be prioritized next.
+"""
+
+
+POOL_FREE_SECTION = """\
+## Pool-free mode: improvise every probe
+
+You have NO probe pool file to read. Invent each probe from the taxonomy below.
+Aim for variety and breadth -- DO NOT funnel into the same 5-10 probes every
+run. Pick categories you haven't exercised yet in this run, mix well-known CVE
+patterns with active-campaign TTPs, and occasionally attempt something novel.
+
+Each probe you run must:
+  - Be ONE bash command runnable on Kali (single line; use `;` / `&&` for chains)
+  - Produce observable network traffic toward the victim IP (or authorized
+    outbound SaaS like api.openai.com for SNI exfil)
+  - Have `--max-time 5` on curl, `timeout N` on nc/python, etc. (no hangs)
+  - Use the literal victim IP from your lab endpoints (no {{placeholder}})
+
+### Attack taxonomy (pick a mix each run)
+
+**Edge-device CVE exploitation (T1190)** -- HTTP requests to vulnerable paths:
+  PAN-OS GlobalProtect, FortiOS SSL-VPN, Ivanti Connect Secure, SharePoint
+  ToolShell (CVE-2025-53770), CrushFTP, Oracle EBS SSRF, SAP NetWeaver
+  metadatauploader, CitrixBleed, TeamCity CVE-2024-27198, ScreenConnect,
+  Confluence OGNL, ProxyShell, Cisco SD-WAN / FMC.
+
+**Modern C2 beacon replay (T1071.001)** -- HTTP/S requests mimicking default
+  malleable profiles: Sliver default URIs, Havoc __cfduid, Cobalt Strike
+  jquery, Brute Ratel /api/search, Mythic Apollo/Medusa /api/v1.4/*,
+  Merlin HTTP/2, AdaptixC2.
+
+**Commodity malware checkin (T1071.001 / T1041)** -- Lumma, DarkGate,
+  SocGholish, NetSupport RAT, Pikabot, StealC, RedLine, Formbook.
+
+**SaaS / LLM SNI exfil (T1567, T1102)** -- TLS to: api.openai.com,
+  api.anthropic.com, generativelanguage.googleapis.com, huggingface.co,
+  hooks.slack.com, gist.github.com, webhook.site, api.telegram.org,
+  discord.com/api/webhooks, pipedream.com, ngrok-free.app, trycloudflare.com.
+
+**DNS abuse (T1572, T1568.002, T1071.004)** -- DoH to cloudflare-dns.com /
+  dns.google, TXT record base64 exfil, rapid NXDOMAIN bursts (DGA),
+  long-subdomain hex queries, dig AXFR attempts.
+
+**Identity / cloud-SSO abuse (T1528, T1556, T1078.004)** -- Microsoft OAuth
+  device-code bursts, Okta /.well-known enumeration, GitHub Actions OIDC
+  endpoint, AzureHound UA against graph.microsoft.com, AWS IMDSv1 SSRF
+  to 169.254.169.254, evilginx 8-char lure URIs.
+
+**AD / lateral movement (T1558, T1021, T1087.002)** -- Impacket
+  GetUserSPNs / GetNPUsers / secretsdump / psexec / wmiexec / dcomexec,
+  SMB null-session enum, SharpHound-style LDAP SDFlags=0x5, Certipy ESC1
+  find, kerbrute userenum, NetExec SMB spray, PetitPotam / DFSCoerce.
+
+**Scanning (T1595.001/002)** -- nmap SYN / Xmas / FIN / NULL / connect /
+  ACK scans, nikto HTTP scan, nuclei with -tags kev, feroxbuster content
+  discovery, wafw00f, sqlmap error-based injection.
+
+**Covert channels (T1095, T1572)** -- ICMP large-payload, SSH dynamic
+  port-forward, QUIC/HTTP3 beacons, ssh-banner-spoof, paramiko HASSH.
+
+**Supply chain (T1195.002)** -- npm registry pulls, PyPI / pythonhosted,
+  Docker Hub (registry-1.docker.io) pulls, GitHub raw content,
+  HuggingFace dataset pulls, typosquat SNI variants.
+
+**Cryptominer (T1496)** -- stratum login to supportxmr / nanopool /
+  minexmr, XMRig default UA patterns, coinhive legacy patterns.
+
+### Probe-naming convention
+
+Use kebab-case, include tool or CVE: `panos-cve-2024-3400-sessid`,
+`sliver-default-urls`, `azurehound-graph-enum`. If you improvise a variant,
+add a suffix: `panos-cve-2024-3400-evasion-unicode`.
+"""
+
 
 SYSTEM_PROMPT = """\
 You are a purple-team defensive-evaluation agent operating on an AUTHORIZED lab
@@ -264,30 +405,24 @@ Suricata + Zeek detect via sensor logs, and classify each probe:
 SSH options string (use verbatim):
   -i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5
 
-## Noise floor (IGNORE these background SIDs)
+## Fired SIDs: record ALL of them
 
-These SIDs fire on nearly every probe due to ambient lab traffic. Do NOT count
-them toward DETECTED or include in fired_sids unless they are the ONLY SID and
-directly relevant to the probe's technique:
-  - 9000003 (TCP SYN-scan canary)
-  - 2001219 (ET SCAN Potential SSH Scan)
+Include every SID that fired in `fired_sids`. Do NOT filter anything out.
+The orchestrator post-processes the ledger and separates ambient/canary SIDs
+(9000003, 2001219) from "relevant" SIDs for display, so the ledger must hold
+the raw truth.
 
-## Probe pool
+When setting the verdict:
+  - DETECTED   = at least one non-canary SID fired (i.e. something beyond
+                 the ambient set 9000003/2001219), OR a canary SID fired
+                 AND the probe is itself a scanning technique (nmap SYN/Xmas/
+                 stealth, ssh brute-force, etc. -- where the canary IS the
+                 intended detection).
+  - UNDETECTED = only ambient canary SIDs fired on a non-scanning probe, OR
+                 no SIDs fired at all. Still include the canary SIDs in fired_sids.
+  - FP         = a SID fired but is unrelated to the probe technique.
 
-A curated probe pool lives at: {probes_file}
-Start by reading it with the Read tool. Each entry has: name, category,
-mitre (ATT&CK technique ID), rationale, expected_sids (if known), and a
-`command` (bash) to run on the attacker.
-
-You may pick probes from the pool or improvise variants. PREFER the pool --
-those commands are validated to reach the wire. You may skip probes marked
-`already_in_catalog: true` in the pool since running them only re-confirms
-existing coverage. Prioritize probes marked `expected_verdict: UNDETECTED`
-and novel techniques not yet covered.
-
-When the probe pool has `requires` fields, attempt prerequisite probes first.
-When a probe `produces` facts, note them -- subsequent probes that `require`
-those facts should be prioritized next.
+{probe_source_section}
 
 ## Per-probe iteration loop
 
@@ -297,13 +432,19 @@ Bash tool call is still a turn.
 
 For each probe you attempt:
 
-1. BASELINE + PROBE (one or two Bash calls):
-   Option A (two calls, simpler):
+1. BASELINE + PROBE:
+   IMPORTANT: baseline BOTH Suricata (line count) AND Zeek (sensor epoch time).
+   Without the Zeek timestamp baseline, stale notice/weird entries from earlier
+   probes contaminate the next check -- you'll misattribute old detections
+   to the current probe.
+
+   Option A (simpler, 3 calls):
      BEFORE=$(ssh <sensor> "sudo wc -l /var/log/suricata/eve.json | awk '{{print \\$1}}'")
+     ZBEFORE=$(ssh <sensor> "date +%s")
      ssh <attacker> "<probe command>"
    Option B (one call, faster -- preferred when the probe is a simple one-liner):
-     BEFORE=$(ssh <sensor> "sudo wc -l /var/log/suricata/eve.json | awk '{{print \\$1}}'"); \\
-     ssh <attacker> "<probe command>"; echo "BEFORE=$BEFORE"
+     read BEFORE ZBEFORE < <(ssh <sensor> "echo \\$(sudo wc -l /var/log/suricata/eve.json | awk '{{print \\$1}}') \\$(date +%s)"); \\
+     ssh <attacker> "<probe command>"
    Use --max-time 5 on curl and `timeout N` on nc/long-runners.
 
 2. CHECK (ONE compound SSH call to sensor -- do NOT split into separate calls):
@@ -315,30 +456,55 @@ For each probe you attempt:
                    elif .event_type == \\"tls\\" then {{type:\\"tls\\", sni:.tls.sni, ja3:.tls.ja3.hash}}
                    else empty end' | sort -u | head -30;
        echo '=== ZEEK-NOTICES ===';
-       sudo tail -c 10000 /opt/zeek/logs/current/notice.log 2>/dev/null \\
-         | jq -rc '.note' 2>/dev/null | sort -u | tail -10;
+       sudo tail -c 50000 /opt/zeek/logs/current/notice.log 2>/dev/null \\
+         | jq -rc 'select((.ts|tonumber) > '$ZBEFORE') | .note' 2>/dev/null | sort -u | tail -10;
        echo '=== ZEEK-SSH ===';
-       sudo tail -c 5000 /opt/zeek/logs/current/ssh.log 2>/dev/null \\
-         | jq -rc '{{client, hassh}}' 2>/dev/null | tail -5;
+       sudo tail -c 20000 /opt/zeek/logs/current/ssh.log 2>/dev/null \\
+         | jq -rc 'select((.ts|tonumber) > '$ZBEFORE') | {{client, hassh}}' 2>/dev/null | tail -5;
        echo '=== ZEEK-TLS ===';
-       sudo tail -c 5000 /opt/zeek/logs/current/ssl.log 2>/dev/null \\
-         | jq -rc '{{server_name, ja3}}' 2>/dev/null | tail -5;
+       sudo tail -c 20000 /opt/zeek/logs/current/ssl.log 2>/dev/null \\
+         | jq -rc 'select((.ts|tonumber) > '$ZBEFORE') | {{server_name, ja3}}' 2>/dev/null | tail -5;
        echo '=== ZEEK-DNS ===';
-       sudo tail -c 5000 /opt/zeek/logs/current/dns.log 2>/dev/null \\
-         | jq -rc '{{query, qtype_name, rcode_name}}' 2>/dev/null | tail -10
+       sudo tail -c 20000 /opt/zeek/logs/current/dns.log 2>/dev/null \\
+         | jq -rc 'select((.ts|tonumber) > '$ZBEFORE') | {{query, qtype_name, rcode_name}}' 2>/dev/null | tail -10;
+       echo '=== ZEEK-HTTP ===';
+       sudo tail -c 30000 /opt/zeek/logs/current/http.log 2>/dev/null \\
+         | jq -rc 'select((.ts|tonumber) > '$ZBEFORE') | {{host, uri: (.uri // \\"\\" | .[0:80]), method, user_agent: (.user_agent // \\"\\" | .[0:60]), status_code}}' 2>/dev/null | tail -10;
+       echo '=== ZEEK-WEIRD ===';
+       sudo tail -c 20000 /opt/zeek/logs/current/weird.log 2>/dev/null \\
+         | jq -rc 'select((.ts|tonumber) > '$ZBEFORE') | .name' 2>/dev/null | sort -u | tail -10
      "
+   Every jq filter includes `select((.ts|tonumber) > '$ZBEFORE')` so ONLY
+   entries logged after the baseline appear. An empty section for a log means
+   this probe did not produce activity in that protocol -- not that the log
+   itself is empty.
    This single SSH call gives you alerts, anomalies, TLS SNI, and all relevant
-   Zeek protocol logs. Anomalies and Zeek entries count as detection signals
-   even without a Suricata alert ("behavioral" confidence).
+   Zeek protocol logs. Two DIFFERENT Zeek logs matter here:
+     - notice.log entries (namespaced, e.g. "Scan::Port_Scan",
+       "ProtocolDetector::Protocol_Found") are opinionated Zeek detections.
+       They belong in zeek_notices.
+     - weird.log entries (non-namespaced, e.g. "HTTP_version_mismatch",
+       "unescaped_%_in_URI") are protocol-parser anomalies, lower-signal.
+       They belong in zeek_weird -- NOT in zeek_notices.
+   A notice.log entry qualifies for confidence="behavioral". weird-only (no
+   notice) does NOT -- weird is hunting context, not detection.
+   Plain protocol metadata in ssh.log/ssl.log/dns.log/http.log without a
+   corresponding notice is VISIBILITY only -- record it in zeek_signals but
+   keep confidence="none".
    You may omit Zeek sections not relevant to the probe type to keep output short.
 
 5. CLASSIFY -- call the `record_finding` tool with:
      - probe_name        -- the pool entry's `name` (or a descriptive name if improvised)
      - verdict           -- DETECTED / UNDETECTED / ERROR / FP
-     - fired_sids        -- CSV of SIDs from step 3 (e.g. "2047929,2024792").
-                            Exclude noise-floor SIDs (9000003, 2001219) unless they
-                            are the only relevant SID.
-     - zeek_notices      -- CSV of Zeek notice types if novel
+     - fired_sids        -- CSV of ALL SIDs from step 3 (e.g. "2047929,2024792").
+                            Include everything that fired; do NOT filter ambient
+                            SIDs (9000003, 2001219) out -- the orchestrator handles
+                            ambient/canary separation in post-processing.
+     - zeek_notices      -- CSV of notice.log entries only (namespaced,
+                            "Module::Event"). Empty string if notice.log was quiet.
+     - zeek_weird        -- CSV of weird.log entry names (non-namespaced, e.g.
+                            "HTTP_version_mismatch"). Empty string if weird.log
+                            was quiet. Do NOT mix these into zeek_notices.
      - notes             -- one-line rationale. Mention any anomalies or Zeek
                             protocol-log signals observed even if no alert fired.
      - tool_used         -- primary tool (curl, nmap, impacket, nc, hydra, dig,
@@ -407,14 +573,28 @@ the sensor-side proof that no detection fires is itself the deliverable.
 
 ## Termination
 
-When you've either (a) worked through the pool, or (b) hit the turn budget,
-or (c) exhausted novel candidates -- reply with the literal phrase
-"PURPLE RUN COMPLETE" and stop calling tools. The orchestrator will gather
-your findings and write the final report.
+When you've either (a) worked through the pool, (b) hit the turn budget, OR
+(c) hit the attack cap -- reply with the literal phrase "PURPLE RUN COMPLETE"
+and stop calling tools. The orchestrator will gather your findings and write
+the final report.
+
+IMPORTANT: when an attack cap IS set (see "Attack cap" below), do NOT
+self-terminate just because you think novel candidates are exhausted --
+there is ALWAYS another variant worth trying (different tool, encoding,
+port, protocol wrapper, user-agent, evasion twist). Keep improvising until
+you fill the cap or hit the turn budget. "I've covered enough categories"
+is NOT a valid reason to stop short of the cap. Only terminate early via
+(d) if there is NO attack cap set AND you genuinely cannot invent a new
+probe that would add distinct sensor signal.
 
 Your budget: {max_turns} turns. Pace yourself -- each probe iteration should
 use 2-3 turns (baseline+probe, check, classify). Batching commands into fewer
 Bash calls is critical for throughput.
+
+Attack cap: {max_attacks_str}. When set, record_finding will REFUSE further
+calls once the cap is reached (returning an "ATTACK CAP REACHED" message).
+When it refuses, stop immediately -- do NOT retry, do NOT batch more probes.
+Respect the cap by NOT queuing more probes than remaining slots.
 """
 
 
@@ -423,26 +603,30 @@ Bash calls is critical for throughput.
 # ============================================================================
 
 async def run_agent(args):
-    global _ledger_path
+    global _ledger_path, _max_attacks
 
     REPORTS_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     _ledger_path = REPORTS_DIR / f"findings-{ts}.jsonl"
     _ledger_path.touch()
+    _max_attacks = args.max_attacks
 
-    probes_src = Path(args.probe_pool).resolve() if args.probe_pool else (SCRIPT_DIR / "probes.yaml")
-    if not probes_src.exists():
-        print(f"probe pool not found: {probes_src}", file=sys.stderr)
-        sys.exit(1)
+    # Probe source: either a curated YAML pool or pool-free taxonomy-only mode.
+    probes_path = None
+    if not args.pool_free:
+        probes_src = Path(args.probe_pool).resolve() if args.probe_pool else (SCRIPT_DIR / "probes.yaml")
+        if not probes_src.exists():
+            print(f"probe pool not found: {probes_src}", file=sys.stderr)
+            sys.exit(1)
 
-    # Pre-substitute {{VICTIM_IP}} in the probe pool so the agent can't forget.
-    # Write the staged copy next to the ledger.
-    probes_path = REPORTS_DIR / f"probes-staged-{ts}.yaml"
-    probes_raw = probes_src.read_text(encoding="utf-8")
-    probes_path.write_text(
-        probes_raw.replace("{{VICTIM_IP}}", args.victim_ip),
-        encoding="utf-8",
-    )
+        # Pre-substitute {{VICTIM_IP}} in the probe pool so the agent can't forget.
+        # Write the staged copy next to the ledger.
+        probes_path = REPORTS_DIR / f"probes-staged-{ts}.yaml"
+        probes_raw = probes_src.read_text(encoding="utf-8")
+        probes_path.write_text(
+            probes_raw.replace("{{VICTIM_IP}}", args.victim_ip),
+            encoding="utf-8",
+        )
 
     key_path = args.key
 
@@ -456,15 +640,25 @@ async def run_agent(args):
         f"-o ControlPersist=300"
     )
 
+    if args.pool_free:
+        probe_source_section = POOL_FREE_SECTION
+    else:
+        probe_source_section = POOL_SECTION.format(probes_file=str(probes_path))
+
     system_prompt = SYSTEM_PROMPT.format(
         attacker_ip=args.attacker_ip,
         sensor_ip=args.sensor_ip,
         victim_ip=args.victim_ip,
         key_path=key_path,
         ssh_opts=ssh_opts,
-        probes_file=str(probes_path),
+        probe_source_section=probe_source_section,
         ledger_path=str(_ledger_path),
         max_turns=args.budget,
+        max_attacks_str=(
+            f"{args.max_attacks} (absolute hard cap)"
+            if args.max_attacks is not None
+            else "not set (no hard cap beyond turn budget)"
+        ),
     )
 
     findings_server = create_sdk_mcp_server(
@@ -485,37 +679,99 @@ async def run_agent(args):
         permission_mode="bypassPermissions",
     )
 
-    kickoff = (
-        "Begin the purple-team run. First, use the Read tool to read the probe "
-        "pool at the path given in your system prompt. Then iterate through "
-        "candidates (baseline -> probe -> check -> record_finding) until you hit "
-        "the turn budget or have nothing novel left to try. Focus on probes "
-        "NOT already covered by the CI catalog. Call record_finding for every "
-        "attempt. Say 'PURPLE RUN COMPLETE' when you're done."
-    )
+    if args.pool_free:
+        kickoff = (
+            "Begin the pool-free purple-team run. You have NO probe pool file. "
+            "Improvise each probe from the attack taxonomy in your system prompt. "
+            "AIM FOR VARIETY -- spread across 6+ categories, not just one. "
+            "Iterate (baseline -> probe -> check -> record_finding) until you hit "
+            "the turn budget, the attack cap, or run out of interesting ideas. "
+            "Call record_finding for every attempt. Say 'PURPLE RUN COMPLETE' when done."
+        )
+    else:
+        kickoff = (
+            "Begin the purple-team run. First, use the Read tool to read the probe "
+            "pool at the path given in your system prompt. Then iterate through "
+            "candidates (baseline -> probe -> check -> record_finding) until you hit "
+            "the turn budget or have nothing novel left to try. Focus on probes "
+            "NOT already covered by the CI catalog. Call record_finding for every "
+            "attempt. Say 'PURPLE RUN COMPLETE' when you're done."
+        )
+    if args.focus:
+        kickoff += f"\n\nADDITIONAL FOCUS FOR THIS RUN: {args.focus}"
 
     print(f"[purple-agent] starting run {ts}")
     print(f"[purple-agent] ledger:  {_ledger_path}")
     print(f"[purple-agent] budget:  {args.budget} turns")
+    print(f"[purple-agent] mode:    {'pool-free (improvised)' if args.pool_free else 'pool-driven'}")
+    if args.max_attacks is not None:
+        print(f"[purple-agent] max-attacks cap: {args.max_attacks}")
     print(f"[purple-agent] lab:     atk={args.attacker_ip} sns={args.sensor_ip} vic={args.victim_ip}")
     print("=" * 72)
 
     turn = 0
+    pushback_count = 0
+    MAX_PUSHBACKS = 5
     try:
         async with ClaudeSDKClient(options=options) as client:
-            await client.query(kickoff)
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    turn += 1
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            text = block.text.strip()
-                            if text:
-                                preview = text[:160].replace("\n", " ")
-                                print(f"[turn {turn:>2}] {preview}")
-                        elif isinstance(block, ToolUseBlock):
-                            inp_preview = str(block.input)[:120].replace("\n", " ")
-                            print(f"[turn {turn:>2}] -> {block.name}({inp_preview}...)")
+            current_query = kickoff
+            while True:
+                await client.query(current_query)
+                said_complete = False
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        turn += 1
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                text = block.text.strip()
+                                if text:
+                                    preview = text[:160].replace("\n", " ")
+                                    print(f"[turn {turn:>2}] {preview}")
+                                if "PURPLE RUN COMPLETE" in block.text.upper():
+                                    said_complete = True
+                            elif isinstance(block, ToolUseBlock):
+                                inp_preview = str(block.input)[:120].replace("\n", " ")
+                                print(f"[turn {turn:>2}] -> {block.name}({inp_preview}...)")
+
+                # After the response ends, decide whether to pushback or exit.
+                if not said_complete:
+                    break  # turn budget hit, or other non-self-termination reason
+                if _max_attacks is None:
+                    break  # no cap → termination claim is legitimate
+                current_count = sum(
+                    1 for line in _ledger_path.open(encoding="utf-8") if line.strip()
+                ) if _ledger_path.exists() else 0
+                if current_count >= _max_attacks:
+                    break  # cap reached, legitimate
+                if pushback_count >= MAX_PUSHBACKS:
+                    print(
+                        f"[purple-agent] cap not reached ({current_count}/{_max_attacks}); "
+                        f"pushback limit ({MAX_PUSHBACKS}) hit — terminating."
+                    )
+                    break
+                pushback_count += 1
+                remaining = _max_attacks - current_count
+                print(
+                    f"[purple-agent] agent said COMPLETE at {current_count}/{_max_attacks} -- "
+                    f"pushing back (attempt {pushback_count}/{MAX_PUSHBACKS}, "
+                    f"{remaining} slots remaining)"
+                )
+                current_query = (
+                    f"REJECTED: the attack cap is NOT reached "
+                    f"({current_count}/{_max_attacks} probes recorded, "
+                    f"{remaining} slots remaining). Do NOT say PURPLE RUN COMPLETE. "
+                    f"Improvise {remaining} MORE distinct probes. Pick from UNEXPLORED "
+                    f"territory: tools you haven't used yet (feroxbuster, gobuster, "
+                    f"wpscan, enum4linux, snmpwalk, ike-scan, nbtscan, smbmap, "
+                    f"rpcinfo, showmount, wafw00f, httpx, whatweb), protocols you "
+                    f"haven't touched (SMTP banner grab, FTP anonymous, LDAP "
+                    f"anonymous, NTP mode-6, VoIP SIP OPTIONS, mqtt, amqp, rsync, "
+                    f"NFS showmount, SNMPv1/v2c/v3, telnet), old CVEs (Apache "
+                    f"CVE-2021-41773, Log4Shell JNDI, Shellshock, Heartbleed), and "
+                    f"evasion variants of probes you already ran (different ports, "
+                    f"encodings, user-agents, protocol wrappers, timing). Start "
+                    f"the next probe immediately."
+                )
     except KeyboardInterrupt:
         print("\n[purple-agent] interrupted -- writing partial report")
     except Exception as e:
@@ -581,6 +837,24 @@ def _infer_tool(command):
     return "bash"
 
 
+def _normalize_confidence(claimed, fired_sids, zeek_notices):
+    """Return (confidence, was_corrected) so callers can flag inflated claims.
+
+    Rules:
+      - high/partial require a Suricata SID (fired_sids non-empty)
+      - behavioral requires a Zeek notice/weird entry (zeek_notices non-empty)
+      - any violation is downgraded to "none"
+    Applied in both record_finding (write-time) and _enrich_findings (read-time)
+    so old ledgers regenerate clean.
+    """
+    c = (claimed or "").lower()
+    if c in ("high", "partial") and not fired_sids:
+        return "none", True
+    if c == "behavioral" and not zeek_notices:
+        return "none", True
+    return c, False
+
+
 def _normalize_verdict(raw):
     """Map legacy verdicts (PROMOTE/SKIP/GAP/FP) onto the current 3-state taxonomy.
 
@@ -614,6 +888,36 @@ def _enrich_findings(findings, probes_yaml_path):
         e["verdict"] = verdict
         e["fp"] = fp_flag
 
+        # Backward-compat: old ledgers (pre-split) dumped weird.log entries into
+        # zeek_notices. Split them apart using the "namespaced" heuristic —
+        # notice.log events are Module::Event; weird.log names have no "::".
+        raw_notices = e.get("zeek_notices", []) or []
+        raw_weird = e.get("zeek_weird", []) or []
+        if raw_notices and not raw_weird:
+            real_notices = [n for n in raw_notices if "::" in n]
+            misplaced_weird = [n for n in raw_notices if "::" not in n]
+            if misplaced_weird:
+                e["zeek_notices"] = real_notices
+                e["zeek_weird"] = misplaced_weird
+            else:
+                e["zeek_weird"] = []
+        else:
+            e["zeek_notices"] = raw_notices
+            e["zeek_weird"] = raw_weird
+
+        # Older runs encoded weird.log entries inside the free-text zeek_signals
+        # field (e.g. "weird.log: data_before_established, inappropriate_FIN --
+        # ...") instead of the structured zeek_weird list. Extract those so they
+        # get counted as weird anomalies on regeneration.
+        if not e["zeek_weird"] and e.get("zeek_signals"):
+            m = re.search(r"weird\.log:\s*([^|]+?)(?:\s*--|\s*\||\s*$)", e["zeek_signals"], re.I)
+            if m:
+                tokens = [t.strip() for t in re.split(r"[,;]", m.group(1)) if t.strip()]
+                # keep only identifier-shaped tokens (weird names are snake_case)
+                extracted = [t for t in tokens if re.match(r"^[A-Za-z][A-Za-z0-9_%]{2,}$", t)]
+                if extracted:
+                    e["zeek_weird"] = extracted
+
         # MITRE ID: prefer finding, fallback to pool
         mitre_id = e.get("mitre_id", "") or pool_entry.get("mitre", "")
         e["mitre_id"] = mitre_id
@@ -632,14 +936,21 @@ def _enrich_findings(findings, probes_yaml_path):
         # Category from pool
         e["category"] = pool_entry.get("category", "")
 
-        # Confidence: prefer finding, fallback to inference
+        # Confidence: prefer finding, fallback to inference, then normalize
+        # against hard evidence so old ledgers with inflated "behavioral" values
+        # regenerate into honest reports.
         confidence = e.get("confidence", "")
         if not confidence:
             if verdict == "DETECTED" and not fp_flag:
                 confidence = "high"
             else:
                 confidence = "none"
+        confidence, was_corrected = _normalize_confidence(
+            confidence, e.get("fired_sids", []), e.get("zeek_notices", [])
+        )
         e["confidence"] = confidence
+        if was_corrected and not e.get("claimed_confidence"):
+            e["claimed_confidence"] = f.get("confidence", "")
 
         # Remediation and Zeek signals: pass through from finding
         e["remediation"] = e.get("remediation", "")
@@ -804,6 +1115,26 @@ def _build_cover(ts, args):
 """
 
 
+_NEGATIVE_SIGNAL_RE = re.compile(
+    r"^\s*(no\b|none\b|n/a\b|nothing\b|empty\b|tcp/\d+ refused|connection refused)",
+    re.I,
+)
+
+
+def _has_zeek_visibility(f):
+    """True iff zeek_signals describes actual observed traffic.
+
+    The agent sometimes records absence assertions ("No Kerberos log entries --
+    TCP/88 refused at SYN") in zeek_signals. A naive bool(str) check reads those
+    as presence. Strip leading whitespace and reject if the string starts with a
+    negative-assertion pattern.
+    """
+    sigs = (f.get("zeek_signals") or "").strip()
+    if not sigs:
+        return False
+    return not _NEGATIVE_SIGNAL_RE.match(sigs)
+
+
 def _classify_by_layer(enriched):
     """Classify each finding into one of four detection states.
 
@@ -817,7 +1148,7 @@ def _classify_by_layer(enriched):
     for f in enriched:
         has_suricata = bool(f.get("fired_sids"))
         has_zeek_alert = bool(f.get("zeek_notices")) or f.get("confidence") == "behavioral"
-        has_zeek_visibility = bool(f.get("zeek_signals"))
+        has_zeek_visibility = _has_zeek_visibility(f)
         if has_suricata:
             suricata_alert.append(f)
         elif has_zeek_alert:
@@ -836,13 +1167,23 @@ def _build_exec_summary(enriched, buckets):
 
     suricata_alert, zeek_alert_only, visibility_only, no_visibility = _classify_by_layer(enriched)
     n_suri = len(suricata_alert)
-    n_zeek = len(zeek_alert_only)
+    n_zeek_only = len(zeek_alert_only)
     n_vis = len(visibility_only)
     n_blind = len(no_visibility)
     n_undetected = n_vis + n_blind
 
+    # Total Zeek notice.log alerts = probes with non-empty zeek_notices,
+    # regardless of Suricata overlap. weird.log is counted separately.
+    n_zeek_total = sum(1 for f in enriched if f.get("zeek_notices"))
+    n_weird_total = sum(1 for f in enriched if f.get("zeek_weird"))
+    n_both_layers = sum(
+        1 for f in enriched if f.get("zeek_notices") and f.get("fired_sids")
+    )
+
     suri_pct = f"{100 * n_suri / total:.0f}" if total > 0 else "0"
-    any_detect_pct = f"{100 * (n_suri + n_zeek) / total:.0f}" if total > 0 else "0"
+    zeek_pct = f"{100 * n_zeek_total / total:.0f}" if total > 0 else "0"
+    # Overall = union of Suricata SIDs and Zeek notices (either layer alerted)
+    overall_pct = f"{100 * (n_suri + n_zeek_only) / total:.0f}" if total > 0 else "0"
     undetected_pct = f"{100 * n_undetected / total:.0f}" if total > 0 else "0"
 
     # Count unique SIDs fired
@@ -851,8 +1192,12 @@ def _build_exec_summary(enriched, buckets):
         for sid in f.get("fired_sids", []):
             unique_sids.add(sid)
 
-    # Undetected breakdown by tactic (visibility_only + no_visibility — neither layer alerted)
-    undetected = visibility_only + no_visibility
+    # Undetected breakdown by tactic -- exclude ERROR probes (probe didn't run ≠
+    # detection gap) and FP probes (rule-accuracy issue ≠ detection gap).
+    undetected = [
+        f for f in (visibility_only + no_visibility)
+        if f.get("verdict") != "ERROR" and not f.get("fp")
+    ]
     gap_tactics = {}
     for f in undetected:
         t = f.get("mitre_tactic", "Unknown")
@@ -876,6 +1221,12 @@ def _build_exec_summary(enriched, buckets):
     tactics_tested = len(all_tactics)
     tactics_with_gaps = len(gap_tactic_set)
 
+    # Real undetected count for exec summary (excludes ERROR + FP)
+    n_true_undetected = len(undetected)
+    true_undetected_pct = (
+        f"{100 * n_true_undetected / total:.0f}" if total > 0 else "0"
+    )
+
     tools = set(f.get("tool_used", "") for f in enriched if f.get("tool_used"))
 
     narrative = (
@@ -887,24 +1238,34 @@ def _build_exec_summary(enriched, buckets):
         f"<strong>Suricata signatures fired on {n_suri} attacks ({suri_pct}%)</strong>, "
         f"matching {len(unique_sids)} unique SID{'s' if len(unique_sids) != 1 else ''}. "
     )
-    if n_zeek > 0:
+    if n_zeek_total > 0:
         narrative += (
-            f"<strong>Zeek notices fired on {n_zeek} additional attacks</strong> "
-            f"(notice.log / behavioral signals with no Suricata signature). "
+            f"<strong>Zeek notice.log fired on {n_zeek_total} attacks</strong> "
+            f"({n_both_layers} overlapping with Suricata, {n_zeek_only} where Zeek "
+            f"caught it but Suricata missed). "
+        )
+    if n_weird_total > 0:
+        narrative += (
+            f"Zeek weird.log flagged protocol-parser anomalies on {n_weird_total} "
+            f"attacks (hunting-grade signal, not a direct alert). "
         )
     narrative += (
-        f"<strong>{n_undetected} attacks ({undetected_pct}%) produced no alert on either layer</strong> -- "
-        f"detection gaps requiring rule-engineering work. "
+        f"<strong>{n_true_undetected} attacks ({true_undetected_pct}%) produced no alert "
+        f"on either layer</strong> -- detection gaps requiring rule-engineering work. "
     )
-    if n_vis > 0:
+    # Visibility/blind-spot breakdown should mirror the true-undetected slice,
+    # not lump ERROR/FP probes in with real gaps.
+    vis_true = [f for f in visibility_only if f.get("verdict") != "ERROR" and not f.get("fp")]
+    blind_true = [f for f in no_visibility if f.get("verdict") != "ERROR" and not f.get("fp")]
+    if vis_true:
         narrative += (
-            f"Of those, <strong>{n_vis} were visible in Zeek protocol logs</strong> "
+            f"Of those, <strong>{len(vis_true)} were visible in Zeek protocol logs</strong> "
             f"(TLS SNI / JA3 / HTTP / DNS / conn-log metadata) -- actionable leads for writing "
             f"Suricata rules informed by Zeek evidence. "
         )
-    if n_blind > 0:
+    if blind_true:
         narrative += (
-            f"<strong>{n_blind} attacks produced no sensor evidence at all</strong> -- true blind spots. "
+            f"<strong>{len(blind_true)} attacks produced no sensor evidence at all</strong> -- true blind spots. "
         )
     if crit_gaps > 0:
         narrative += (
@@ -941,17 +1302,21 @@ def _build_exec_summary(enriched, buckets):
     <div class="stat-boxes">
         <div class="stat-box" style="background:#1a1a2e;"><div class="num">{total}</div><div class="label">Attacks Conducted</div></div>
         <div class="stat-box stat-promote"><div class="num">{n_suri}</div><div class="label">Suricata Alerts</div></div>
-        <div class="stat-box" style="background:#17a2b8;"><div class="num">{n_zeek}</div><div class="label">Zeek Alerts</div></div>
-        <div class="stat-box stat-gap"><div class="num">{n_undetected}</div><div class="label">No Detection</div></div>
+        <div class="stat-box" style="background:#17a2b8;"><div class="num">{n_zeek_total}</div><div class="label" title="Probes where Zeek notice.log fired (may overlap with Suricata)">Zeek Alerts</div></div>
+        <div class="stat-box stat-gap"><div class="num">{n_true_undetected}</div><div class="label" title="Probes with no Suricata SID and no Zeek notice. Excludes ERROR and FP probes.">No Detection</div></div>
     </div>
     <div class="detection-rates">
+        <div class="rate-item">
+            <div class="pct" style="color:#28a745;">{overall_pct}%</div>
+            <div class="rlabel">Overall Detection Rate</div>
+        </div>
         <div class="rate-item">
             <div class="pct" style="color:#28a745;">{suri_pct}%</div>
             <div class="rlabel">Suricata Detection Rate</div>
         </div>
         <div class="rate-item">
-            <div class="pct" style="color:#28a745;">{any_detect_pct}%</div>
-            <div class="rlabel">Any-Layer Detection Rate</div>
+            <div class="pct" style="color:#17a2b8;">{zeek_pct}%</div>
+            <div class="rlabel">Zeek Detection Rate</div>
         </div>
         <div class="rate-item">
             <div class="pct">{tactics_tested}</div>
@@ -1172,70 +1537,95 @@ def _build_findings_section(enriched):
 
 
 def _build_detection_layers(enriched):
-    """Build a Suricata vs Zeek dual-layer detection comparison."""
+    """Build a Suricata vs Zeek dual-layer detection comparison.
+
+    Uses the same _classify_by_layer buckets as the executive summary so the
+    two sections agree on what counts as a Zeek alert vs Zeek visibility.
+    """
     parts = ['<h2>Detection Layer Analysis: Suricata vs Zeek</h2>',
-             '<p>Each attack is evaluated against both detection layers. An attack may be '
-             'invisible to Suricata (no signature) but visible to Zeek (protocol metadata, '
-             'JA3 fingerprints, behavioral signals), or vice versa.</p>']
+             '<p>Each attack is evaluated against both detection layers. '
+             '"Zeek notice" means an entry in notice.log (actual Zeek alert). '
+             '"Zeek visibility" means protocol-log metadata (ssl/http/dns/conn) '
+             'with no matching notice -- hunting-grade signal, not an alert.</p>']
 
-    # Classify each finding by layer visibility
-    both = []
-    suricata_only = []
-    zeek_only = []
-    neither = []
+    suricata_alert, zeek_alert_only, visibility_only, no_visibility = _classify_by_layer(enriched)
 
-    for f in enriched:
-        has_suricata = bool(f.get("fired_sids"))
-        has_zeek = bool(f.get("zeek_notices")) or bool(f.get("zeek_signals")) or f.get("confidence") == "behavioral"
-        if has_suricata and has_zeek:
-            both.append(f)
-        elif has_suricata:
-            suricata_only.append(f)
-        elif has_zeek:
-            zeek_only.append(f)
-        else:
-            neither.append(f)
+    # Split suricata_alert into those that ALSO have a Zeek notice vs those
+    # where only Suricata fired (no Zeek notice, regardless of visibility).
+    both_layers = [f for f in suricata_alert if f.get("zeek_notices")]
+    suricata_only = [f for f in suricata_alert if not f.get("zeek_notices")]
+    zeek_only = zeek_alert_only  # notice.log only, no SID -- Suricata missed
+    visibility_only_list = visibility_only  # protocol logs only, no alerts
+    neither = no_visibility
 
     total = len(enriched)
-    # Summary boxes
     parts.append(f"""
     <div class="stat-boxes">
-        <div class="stat-box" style="background:#155724;"><div class="num">{len(both)}</div><div class="label">Both Layers</div></div>
-        <div class="stat-box" style="background:#28a745;"><div class="num">{len(suricata_only)}</div><div class="label">Suricata Only</div></div>
-        <div class="stat-box" style="background:#17a2b8;"><div class="num">{len(zeek_only)}</div><div class="label">Zeek Only</div></div>
-        <div class="stat-box" style="background:#dc3545;"><div class="num">{len(neither)}</div><div class="label">Neither Layer</div></div>
+        <div class="stat-box" style="background:#155724;"><div class="num">{len(both_layers)}</div><div class="label" title="Suricata SID fired AND Zeek notice.log fired">Both Layers</div></div>
+        <div class="stat-box" style="background:#28a745;"><div class="num">{len(suricata_only)}</div><div class="label" title="Suricata SID fired, no Zeek notice">Suricata Only</div></div>
+        <div class="stat-box" style="background:#17a2b8;"><div class="num">{len(zeek_only)}</div><div class="label" title="Zeek notice.log fired but Suricata missed">Zeek Only</div></div>
+        <div class="stat-box" style="background:#ffc107; color:#212529;"><div class="num">{len(visibility_only_list)}</div><div class="label" title="Zeek protocol logs saw the traffic but neither layer alerted">Visibility Only</div></div>
+        <div class="stat-box" style="background:#dc3545;"><div class="num">{len(neither)}</div><div class="label" title="Sensor observed nothing">Neither Layer</div></div>
     </div>
     """)
 
-    # Insight narrative
-    zeek_coverage = len(both) + len(zeek_only)
-    suri_coverage = len(both) + len(suricata_only)
-    any_coverage = len(both) + len(suricata_only) + len(zeek_only)
+    suri_coverage = len(suricata_alert)
+    zeek_notice_coverage = len(both_layers) + len(zeek_only)
+    alert_coverage = suri_coverage + len(zeek_only)  # probes with any alert
     parts.append('<div class="summary-text">')
-    parts.append(f'<p>Suricata detected <strong>{suri_coverage}/{total}</strong> attacks via signatures. '
-                 f'Zeek provided visibility into <strong>{zeek_coverage}/{total}</strong> attacks via protocol metadata. '
-                 f'Combined, <strong>{any_coverage}/{total}</strong> attacks had at least one detection signal. ')
+    parts.append(
+        f'<p>Suricata alerted on <strong>{suri_coverage}/{total}</strong> attacks. '
+        f'Zeek notice.log fired on <strong>{zeek_notice_coverage}/{total}</strong>. '
+        f'Combined, <strong>{alert_coverage}/{total}</strong> attacks triggered at '
+        f'least one alert. '
+    )
+    if visibility_only_list:
+        parts.append(
+            f'Zeek protocol logs captured metadata for <strong>{len(visibility_only_list)} '
+            f'additional attacks</strong> with no alert on either layer -- hunting context, '
+            f'not detection.')
     if zeek_only:
         parts.append(
-            f'<strong>{len(zeek_only)} attacks were visible only through Zeek</strong> (protocol logs, '
-            f'JA3/HASSH fingerprints, or behavioral indicators) -- these represent opportunities '
-            f'to write Suricata rules informed by Zeek metadata, or to build Zeek-native detections.')
+            f' <strong>{len(zeek_only)} attacks triggered a Zeek notice but no Suricata SID</strong> '
+            f'-- opportunity to port Zeek coverage into Suricata rules.')
     if neither:
         parts.append(
-            f' <strong>{len(neither)} attacks were invisible to both layers</strong> -- these are '
+            f' <strong>{len(neither)} attacks produced no sensor evidence at all</strong> -- '
             f'true blind spots requiring new detection capability.')
     parts.append('</p></div>')
 
-    # Table of Zeek-only detections (high value -- Zeek saw it, Suricata didn't)
+    # Table of Zeek-notice-only detections (Zeek caught, Suricata missed)
     if zeek_only:
-        parts.append('<h3>Zeek-Only Visibility (Suricata gap, Zeek signal present)</h3>')
-        parts.append('<p style="font-size:0.85rem; color:#495057;">These attacks were not caught by '
-                     'Suricata signatures but Zeek protocol analyzers captured actionable metadata.</p>')
+        parts.append('<h3>Zeek Notice Only (Suricata gap, Zeek alert fired)</h3>')
+        parts.append('<p style="font-size:0.85rem; color:#495057;">These attacks fired Zeek '
+                     'notice.log events but no Suricata SID -- candidates for porting into ET rules.</p>')
         parts.append('<table class="gap-table" style="border-left:3px solid #17a2b8;">'
                      '<thead><tr style="background:#17a2b8;">'
-                     '<th>Attack</th><th>MITRE</th><th>Zeek Evidence</th><th>Recommendation</th>'
+                     '<th>Attack</th><th>MITRE</th><th>Zeek Notices</th><th>Recommendation</th>'
                      '</tr></thead><tbody>')
         for f in zeek_only:
+            notices = ", ".join(f.get("zeek_notices", []))
+            remed = f.get("remediation", "")
+            parts.append(
+                f'<tr>'
+                f'<td><strong>{_esc(f.get("probe", ""))}</strong></td>'
+                f'<td>{_esc(f.get("mitre_id", ""))}</td>'
+                f'<td style="font-family:monospace; font-size:0.8rem;">{_esc(notices[:200])}</td>'
+                f'<td>{_esc(remed[:150])}</td>'
+                f'</tr>'
+            )
+        parts.append('</tbody></table>')
+
+    # Visibility-only table: protocol logs captured traffic, nothing alerted
+    if visibility_only_list:
+        parts.append('<h3>Visibility Only (protocol logs, no alerts)</h3>')
+        parts.append('<p style="font-size:0.85rem; color:#495057;">Zeek protocol analyzers '
+                     'saw the traffic but no rule/notice fired. Hunting-grade signal, not detection.</p>')
+        parts.append('<table class="gap-table" style="border-left:3px solid #ffc107;">'
+                     '<thead><tr style="background:#ffc107; color:#212529;">'
+                     '<th>Attack</th><th>MITRE</th><th>Zeek Evidence</th><th>Recommendation</th>'
+                     '</tr></thead><tbody>')
+        for f in visibility_only_list:
             zeek_ev = f.get("zeek_signals", "") or f.get("notes", "")
             remed = f.get("remediation", "")
             parts.append(
@@ -1405,7 +1795,11 @@ def write_html_report(reports_dir, ts, ledger_path, args, probes_yaml_path=None)
     detection_layers = _build_detection_layers(enriched)
     mitre_matrix = _build_mitre_matrix(enriched)
     findings_html = _build_findings_section(enriched)
-    gap_analysis = _build_gap_analysis(buckets["UNDETECTED"])
+    # Gap analysis shows true undetected probes only — FPs (a SID fired, just on
+    # the wrong thing) are a rule-accuracy issue, not a detection gap.
+    gap_analysis = _build_gap_analysis(
+        [f for f in buckets["UNDETECTED"] if not f.get("fp")]
+    )
     appendix = _build_appendix(ledger_path)
 
     html = f"""<!DOCTYPE html>
@@ -1436,6 +1830,11 @@ def write_html_report(reports_dir, ts, ledger_path, args, probes_yaml_path=None)
     # ATT&CK Navigator layer
     write_navigator_layer(reports_dir, ts, enriched)
 
+    # Auto-open in default browser unless explicitly suppressed (e.g. CI, headless)
+    if not os.environ.get("PURPLE_AGENT_NO_OPEN"):
+        import webbrowser
+        webbrowser.open(out.resolve().as_uri())
+
 
 # ============================================================================
 #  cli
@@ -1453,8 +1852,27 @@ def parse_args():
     p.add_argument("--key", required=True, help="SSH private key file path")
     p.add_argument("--budget", type=int, default=30, help="Max agent turns (default 30)")
     p.add_argument(
+        "--max-attacks",
+        type=int,
+        default=None,
+        help="Hard cap on attack count. record_finding refuses further calls once reached. "
+             "Unlike --budget (turns), this is an absolute, enforced probe-count ceiling.",
+    )
+    p.add_argument(
         "--probe-pool",
         help="Path to probes.yaml (default: probes.yaml in script dir)",
+    )
+    p.add_argument(
+        "--pool-free",
+        action="store_true",
+        help="Skip probes.yaml entirely; agent improvises every probe from a "
+             "built-in TTP taxonomy. Trades reproducibility for per-run variety.",
+    )
+    p.add_argument(
+        "--focus",
+        default="",
+        help="Free-text steering hint appended to the kickoff message (e.g. "
+             "'prioritize probes likely to trigger both Suricata and Zeek').",
     )
     return p.parse_args()
 
