@@ -17,6 +17,3 @@ id_ed25519.*
 # kept out of the repo so forks don't pick it up
 update-iam-role.ps1
 
-# Local-only autonomous agent tooling (purple-team runner)
-# Not part of the shipped bundle — lives locally, keys + reports never committed
-purple-agent/

