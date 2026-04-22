@@ -979,16 +979,31 @@ def _end_of_run_zeek_sweep(args, ts):
         f"-i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
     )
     # One compound sensor query: notice.log + intel.log for the run window.
-    # Tail forward from run-start line-count baselines where captured -- same
-    # truncation fix as the accuracy audit uses.
-    if _notice_before_lines is not None:
-        notice_src = f"sudo tail -n +{_notice_before_lines + 1} /opt/zeek/logs/current/notice.log 2>/dev/null"
-    else:
-        notice_src = "sudo tail -c 2000000 /opt/zeek/logs/current/notice.log 2>/dev/null"
-    if _intel_before_lines is not None:
-        intel_src = f"sudo tail -n +{_intel_before_lines + 1} /opt/zeek/logs/current/intel.log 2>/dev/null"
-    else:
-        intel_src = "sudo tail -c 500000 /opt/zeek/logs/current/intel.log 2>/dev/null"
+    # Reads both the current-hour log AND any rotated-hour gz files under
+    # /opt/zeek/logs/<YYYY-MM-DD>/ whose timestamps overlap the run. Without
+    # the rotated-file sweep, runs that cross the top-of-hour rotation
+    # boundary lose every notice fired in the pre-rotation window -- Zeek
+    # rotates at :00 and the line baselines point into the current file,
+    # which gets moved, leaving the sweep querying an empty recreated file.
+    # Python filters by (.ts > run_start) after pulling, so we don't need
+    # per-file time filters.
+    def _sweep_src(current_path, line_base, bytes_fallback):
+        # Current live file: tail from the line baseline (or fallback bytes).
+        if line_base is not None:
+            live = f"sudo tail -n +{line_base + 1} {current_path} 2>/dev/null"
+        else:
+            live = f"sudo tail -c {bytes_fallback} {current_path} 2>/dev/null"
+        # Rotated gz archives from today + yesterday (handles UTC date boundary).
+        # Log basename differs per file (notice.log -> notice.HH:MM:SS-HH:MM:SS.log.gz)
+        base = current_path.rsplit("/", 1)[-1].split(".", 1)[0]  # 'notice' | 'intel'
+        rotated = (
+            f"for f in /opt/zeek/logs/$(date -u +%Y-%m-%d)/{base}.*.log.gz "
+            f"/opt/zeek/logs/$(date -u -d yesterday +%Y-%m-%d)/{base}.*.log.gz; do "
+            f"[ -f \"$f\" ] && sudo zcat \"$f\" 2>/dev/null; done"
+        )
+        return f"( {live}; {rotated} )"
+    notice_src = _sweep_src("/opt/zeek/logs/current/notice.log", _notice_before_lines, 2000000)
+    intel_src = _sweep_src("/opt/zeek/logs/current/intel.log", _intel_before_lines, 500000)
     remote_cmd = (
         f"echo '=== NOTICES ==='; "
         f"{notice_src} "
