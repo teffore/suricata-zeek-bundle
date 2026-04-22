@@ -394,6 +394,16 @@ Each probe you run must:
 Use kebab-case, include tool or CVE: `panos-cve-2024-3400-sessid`,
 `sliver-default-urls`, `azurehound-graph-enum`. If you improvise a variant,
 add a suffix: `panos-cve-2024-3400-evasion-unicode`.
+
+### Attribution rule (critical for pool-free)
+
+Without an `expected_sids` anchor, it is easy to over-attribute ambient
+alerts to your probe. Before listing a SID in `fired_sids`, confirm its
+alert's `dest_ip` matches your victim IP AND its timestamp is after
+BEFORE. Everything else is ambient and belongs in `notes`, not
+`fired_sids`. Canary SIDs 2001219 and 9000003 fire on background sensor
+traffic -- they count as probe-attributable ONLY when the probe is
+itself a scan-type technique.
 """
 
 
@@ -421,22 +431,31 @@ Suricata + Zeek detect via sensor logs, and classify each probe:
 SSH options string (use verbatim):
   -i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5
 
-## Fired SIDs: record ALL of them
+## Fired SIDs: record only probe-attributable SIDs
 
-Include every SID that fired in `fired_sids`. Do NOT filter anything out.
-The orchestrator post-processes the ledger and separates ambient/canary SIDs
-(9000003, 2001219) from "relevant" SIDs for display, so the ledger must hold
-the raw truth.
+`fired_sids` must contain ONLY SIDs whose alert is causally tied to THIS
+probe. An alert is causally tied when BOTH of these hold:
+  (a) its `dest_ip` equals the victim IP (the probe's target), AND
+  (b) its timestamp falls between BEFORE and "now" (the baseline window).
+
+Canary / ambient SIDs (2001219 "ET SCAN Potential SSH Scan", 9000003 local
+probe-visibility rule) fire on background sensor traffic continuously and
+must be EXCLUDED from `fired_sids` unless the probe is itself a scan-type
+technique (nmap SYN/Xmas/stealth, hping3 flood, ssh password spray,
+rapid port enumeration) -- in those cases the canary IS the intended
+detection and belongs in `fired_sids`. For non-scan probes (CVE exploits,
+SaaS exfil, C2 beacons, web attacks), list canary SIDs in `notes` as
+"ambient canaries observed: 2001219, 9000003" but keep them OUT of
+`fired_sids`.
 
 When setting the verdict:
-  - DETECTED   = at least one non-canary SID fired (i.e. something beyond
-                 the ambient set 9000003/2001219), OR a canary SID fired
-                 AND the probe is itself a scanning technique (nmap SYN/Xmas/
-                 stealth, ssh brute-force, etc. -- where the canary IS the
-                 intended detection).
-  - UNDETECTED = only ambient canary SIDs fired on a non-scanning probe, OR
-                 no SIDs fired at all. Still include the canary SIDs in fired_sids.
-  - FP         = a SID fired but is unrelated to the probe technique.
+  - DETECTED   = at least one probe-attributable SID fired (per the
+                 causal-attribution rule above).
+  - UNDETECTED = no probe-attributable SIDs fired. `fired_sids` should be
+                 empty or contain ONLY canaries-on-a-scan-probe.
+  - FP         = a SID fired, was causally attributable to this probe's
+                 traffic, but the signature is unrelated to the technique
+                 (e.g. a generic "POST to /" rule fires on a CVE exploit).
 
 {probe_source_section}
 
@@ -524,10 +543,14 @@ For each probe you attempt:
 3. CLASSIFY -- call the `record_finding` tool with:
      - probe_name        -- the pool entry's `name` (or a descriptive name if improvised)
      - verdict           -- DETECTED / UNDETECTED / ERROR / FP
-     - fired_sids        -- CSV of ALL SIDs from step 2 (e.g. "2047929,2024792").
-                            Include everything that fired; do NOT filter ambient
-                            SIDs (9000003, 2001219) out -- the orchestrator handles
-                            ambient/canary separation in post-processing.
+     - fired_sids        -- CSV of probe-attributable SIDs ONLY (e.g.
+                            "2047929,2024792"). A SID is attributable ONLY if
+                            BOTH (a) its alert's `dest_ip` matches the victim IP
+                            AND (b) its timestamp is after BEFORE. Canary SIDs
+                            (2001219, 9000003) belong here ONLY if the probe is
+                            itself a scan-type (nmap/hping3/ssh-spray); otherwise
+                            put them in `notes` as "ambient canaries observed: X"
+                            and keep them OUT of this field.
      - zeek_notices      -- CSV of notice.log entries only (namespaced,
                             "Module::Event"). Empty string if notice.log was quiet.
      - zeek_weird        -- CSV of weird.log entry names (non-namespaced, e.g.
