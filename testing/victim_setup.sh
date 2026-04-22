@@ -61,6 +61,92 @@ CONF
 sudo systemctl restart nginx
 sudo systemctl enable --now ssh
 
+# ---------- TIER2 listeners: fill gaps that used to RST probe traffic ----------
+# Every probe below used to fail because nothing was listening on the target
+# port; adding these surfaces completes the detection loop for Suricata +
+# Zeek. Each service is deliberately permissive (anonymous / default
+# community / guest-writable) — this is a detection lab, not a hardened
+# target.
+#
+#   vsftpd :21       — T1078.001 anonymous FTP login (probe_catalog ftp-anonymous-login)
+#   snmpd  :161/udp  — T1602 SNMP community walk (probe_catalog snmp-community-walk)
+#   rsync  :873      — T1105 rsync push/pull exfil (TIER2 ART atomics)
+#   nginx  :8443 TLS — T1571 HTTPS-on-non-standard-port, TLS cert probes
+
+echo "=== [victim_setup] vsftpd on :21 (anonymous login) ==="
+sudo apt-get install -y -qq vsftpd
+sudo tee /etc/vsftpd.conf > /dev/null <<'VSFTPD'
+listen=YES
+listen_ipv6=NO
+anonymous_enable=YES
+local_enable=NO
+write_enable=NO
+xferlog_enable=YES
+xferlog_std_format=YES
+secure_chroot_dir=/var/run/vsftpd/empty
+pam_service_name=vsftpd
+ftpd_banner=Welcome to the lab FTP service
+VSFTPD
+sudo mkdir -p /srv/ftp && echo "lab ftp readme" | sudo tee /srv/ftp/README >/dev/null
+sudo systemctl restart vsftpd
+sudo systemctl enable vsftpd
+
+echo "=== [victim_setup] snmpd on :161/udp (community=public) ==="
+sudo apt-get install -y -qq snmpd snmp
+sudo tee /etc/snmp/snmpd.conf > /dev/null <<'SNMPD'
+agentAddress udp:0.0.0.0:161
+rocommunity public default
+sysLocation lab
+sysContact lab@lab
+SNMPD
+sudo systemctl restart snmpd
+sudo systemctl enable snmpd
+
+echo "=== [victim_setup] rsync daemon on :873 (anonymous [public] module) ==="
+sudo apt-get install -y -qq rsync
+sudo tee /etc/rsyncd.conf > /dev/null <<'RSYNCD'
+uid = nobody
+gid = nogroup
+use chroot = yes
+max connections = 10
+pid file = /var/run/rsyncd.pid
+log file = /var/log/rsyncd.log
+
+[public]
+   path = /srv/rsync
+   comment = public anonymous share
+   read only = true
+   list = yes
+RSYNCD
+sudo mkdir -p /srv/rsync && echo "lab rsync readme" | sudo tee /srv/rsync/README >/dev/null
+# Ubuntu 22.04 ships rsync.service but gates it on RSYNC_ENABLE=true
+if grep -q '^RSYNC_ENABLE=' /etc/default/rsync 2>/dev/null; then
+  sudo sed -i 's/^RSYNC_ENABLE=.*/RSYNC_ENABLE=true/' /etc/default/rsync
+else
+  echo "RSYNC_ENABLE=true" | sudo tee -a /etc/default/rsync >/dev/null
+fi
+sudo systemctl restart rsync || sudo systemctl restart rsyncd || true
+sudo systemctl enable rsync  || sudo systemctl enable rsyncd  || true
+
+echo "=== [victim_setup] nginx TLS on :8443 (self-signed cert) ==="
+sudo mkdir -p /etc/nginx/ssl
+if [ ! -f /etc/nginx/ssl/lab.crt ]; then
+  sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout /etc/nginx/ssl/lab.key -out /etc/nginx/ssl/lab.crt \
+    -subj "/C=US/ST=Lab/L=Lab/O=Lab/CN=victim.lab" 2>/dev/null
+fi
+sudo tee /etc/nginx/sites-available/tls8443 > /dev/null <<'TLSCONF'
+server {
+    listen 8443 ssl default_server;
+    server_name _;
+    ssl_certificate     /etc/nginx/ssl/lab.crt;
+    ssl_certificate_key /etc/nginx/ssl/lab.key;
+    location / { return 200 "tls-ok\n"; add_header Content-Type text/plain; }
+}
+TLSCONF
+sudo ln -sf /etc/nginx/sites-available/tls8443 /etc/nginx/sites-enabled/tls8443
+sudo nginx -t && sudo systemctl reload nginx
+
 echo "=== [victim_setup] docker + compose ==="
 # docker.io from Ubuntu universe is fine for a disposable CI target; we don't
 # need the bleeding-edge docker-ce channel. docker-compose-v2 gives us the
@@ -98,9 +184,19 @@ for d in log4j/CVE-2021-44228 spring/CVE-2022-22965; do
   fi
 done
 
+echo "=== [victim_setup] DVWA on :8081 (realistic web surface) ==="
+# Gives gobuster/ffuf/feroxbuster/nikto a real directory tree + PHP forms to
+# enumerate, versus nginx's single-endpoint "ok". vulnerables/web-dvwa ships
+# MySQL bundled so no sidecar needed.
+if ! sudo docker ps --format '{{.Names}}' | grep -q '^dvwa$'; then
+  sudo docker run -d --restart unless-stopped \
+    --name dvwa -p 8081:80 vulnerables/web-dvwa >/dev/null 2>&1 \
+    || sudo docker start dvwa || true
+fi
+
 echo "=== [victim_setup] waiting for vulnerable listeners ==="
 # Up to 120s per port; vulhub images sometimes need that long on a cold pull.
-for port in 8080 8983; do
+for port in 8080 8081 8983; do
   printf "  :%s " "$port"
   for i in $(seq 1 60); do
     if ss -tln | grep -q ":${port} "; then
@@ -116,7 +212,7 @@ for port in 8080 8983; do
 done
 
 echo "=== [victim_setup] final listener summary ==="
-ss -tln | grep -E ':(22|80|139|445|8080|8983) ' || true
+ss -tlnu | grep -E ':(21|22|80|139|161|445|873|8080|8081|8443|8983) ' || true
 echo ""
 echo "=== [victim_setup] docker ps ==="
 sudo docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}' || true
