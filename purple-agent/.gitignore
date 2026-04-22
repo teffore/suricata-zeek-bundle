@@ -15,3 +15,8 @@ venv/
 .lab-state
 .lab-key
 .install-logs/
+
+# Test artifacts
+.pytest_cache/
+pytest-cache-files-*/
+.testwrite
