@@ -603,7 +603,10 @@ rm -f "$MB_ZIP"
 # previous full builds land at 60k+, so a few hundred means a feed outage).
 if [ "$(wc -l < "$TMP")" -gt 100 ]; then
   mv "$TMP" "$DAT"
-  chown suricata:suricata "$DAT" 2>/dev/null || true
+  # Zeek runs as root via zeekctl and reads intel.dat at load time. Keep
+  # it root:root so there is no ownership mismatch if/when Zeek reloads
+  # (the earlier suricata:suricata was a copy-paste artefact).
+  chown root:root "$DAT" 2>/dev/null || true
   echo "$(date -Iseconds) intel.dat rebuilt: $(wc -l < $DAT) rows"
 else
   rm -f "$TMP"

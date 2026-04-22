@@ -399,11 +399,13 @@ add a suffix: `panos-cve-2024-3400-evasion-unicode`.
 
 Without an `expected_sids` anchor, it is easy to over-attribute ambient
 alerts to your probe. Before listing a SID in `fired_sids`, confirm its
-alert's `dest_ip` matches your victim IP AND its timestamp is after
-BEFORE. Everything else is ambient and belongs in `notes`, not
-`fired_sids`. Canary SIDs 2001219 and 9000003 fire on background sensor
-traffic -- they count as probe-attributable ONLY when the probe is
-itself a scan-type technique.
+alert's `dest_ip` matches your probe's INTENDED TARGET (victim IP for
+victim-targeting probes; the external endpoint -- SaaS SNI host, DoH
+resolver, IMDS 169.254.169.254, C2 IP -- for outbound probes) AND its
+timestamp is after BEFORE. Everything else is ambient and belongs in
+`notes`, not `fired_sids`. Canary SIDs 2001219 and 9000003 fire on
+background sensor traffic -- they count as probe-attributable ONLY when
+the probe is itself a scan-type technique.
 """
 
 
@@ -435,7 +437,13 @@ SSH options string (use verbatim):
 
 `fired_sids` must contain ONLY SIDs whose alert is causally tied to THIS
 probe. An alert is causally tied when BOTH of these hold:
-  (a) its `dest_ip` equals the victim IP (the probe's target), AND
+  (a) its `dest_ip` equals the probe's INTENDED TARGET -- which is the
+      victim IP for victim-targeting probes, OR the probe's external
+      endpoint for outbound probes (SaaS SNI exfil -> api.openai.com /
+      huggingface.co / hooks.slack.com; DoH/DGA -> 1.1.1.1 / 8.8.8.8 /
+      cloudflare-dns.com; IMDS SSRF -> 169.254.169.254; C2 beacon ->
+      the C2 IP). Pick the ip or hostname that YOUR probe actually
+      reaches out to, not blindly the victim IP.
   (b) its timestamp falls between BEFORE and "now" (the baseline window).
 
 Canary / ambient SIDs (2001219 "ET SCAN Potential SSH Scan", 9000003 local
@@ -545,12 +553,16 @@ For each probe you attempt:
      - verdict           -- DETECTED / UNDETECTED / ERROR / FP
      - fired_sids        -- CSV of probe-attributable SIDs ONLY (e.g.
                             "2047929,2024792"). A SID is attributable ONLY if
-                            BOTH (a) its alert's `dest_ip` matches the victim IP
-                            AND (b) its timestamp is after BEFORE. Canary SIDs
-                            (2001219, 9000003) belong here ONLY if the probe is
-                            itself a scan-type (nmap/hping3/ssh-spray); otherwise
-                            put them in `notes` as "ambient canaries observed: X"
-                            and keep them OUT of this field.
+                            BOTH (a) its alert's `dest_ip` matches the probe's
+                            INTENDED TARGET (victim IP for victim-targeting
+                            probes; the external endpoint -- SaaS SNI host, DoH
+                            resolver, IMDS 169.254.169.254, C2 IP -- for
+                            outbound probes) AND (b) its timestamp is after
+                            BEFORE. Canary SIDs (2001219, 9000003) belong here
+                            ONLY if the probe is itself a scan-type
+                            (nmap/hping3/ssh-spray); otherwise put them in
+                            `notes` as "ambient canaries observed: X" and keep
+                            them OUT of this field.
      - zeek_notices      -- CSV of notice.log entries only (namespaced,
                             "Module::Event"). Empty string if notice.log was quiet.
      - zeek_weird        -- CSV of weird.log entry names (non-namespaced, e.g.
@@ -1085,6 +1097,20 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
         if probe in seen_probes:
             structural_issues.append({"issue": "duplicate probe name", "probe": probe})
         seen_probes.add(probe)
+
+        # DETECTED verdict is only valid if the agent recorded SOME evidence:
+        # a Suricata SID, a Zeek notice, or a populated zeek_signals line.
+        verdict = entry.get("verdict", "")
+        if verdict == "DETECTED":
+            has_sid = bool(entry.get("fired_sids", []))
+            has_notice = bool(entry.get("zeek_notices", []))
+            zsig = entry.get("zeek_signals", "") or ""
+            has_zsig = bool(zsig) and zsig.lower().strip() not in ("empty", "none", "")
+            if not (has_sid or has_notice or has_zsig):
+                structural_issues.append({
+                    "issue": "DETECTED with no evidence (no fired_sids, no zeek_notices, no zeek_signals)",
+                    "probe": probe,
+                })
 
         claimed_sids = entry.get("fired_sids", []) or []
         try:
