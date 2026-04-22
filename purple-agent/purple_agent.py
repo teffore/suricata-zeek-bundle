@@ -151,6 +151,13 @@ MITRE_LOOKUP = {
     "T1090.004": {"tactic": "Command and Control", "name": "Proxy: Domain Fronting", "url": "https://attack.mitre.org/techniques/T1090/004/"},
     "T1595.003": {"tactic": "Reconnaissance", "name": "Active Scanning: Wordlist Scanning", "url": "https://attack.mitre.org/techniques/T1595/003/"},
     "T1021.006": {"tactic": "Lateral Movement", "name": "Remote Services: Windows Remote Management", "url": "https://attack.mitre.org/techniques/T1021/006/"},
+    "T1016": {"tactic": "Discovery", "name": "System Network Configuration Discovery", "url": "https://attack.mitre.org/techniques/T1016/"},
+    "T1083": {"tactic": "Discovery", "name": "File and Directory Discovery", "url": "https://attack.mitre.org/techniques/T1083/"},
+    "T1087": {"tactic": "Discovery", "name": "Account Discovery", "url": "https://attack.mitre.org/techniques/T1087/"},
+    "T1135": {"tactic": "Discovery", "name": "Network Share Discovery", "url": "https://attack.mitre.org/techniques/T1135/"},
+    "T1212": {"tactic": "Credential Access", "name": "Exploitation for Credential Access", "url": "https://attack.mitre.org/techniques/T1212/"},
+    "T1530": {"tactic": "Collection", "name": "Data from Cloud Storage", "url": "https://attack.mitre.org/techniques/T1530/"},
+    "T1613": {"tactic": "Discovery", "name": "Container and Resource Discovery", "url": "https://attack.mitre.org/techniques/T1613/"},
 }
 
 # Severity derivation: for UNDETECTED findings, map MITRE tactic to risk severity.
