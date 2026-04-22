@@ -100,6 +100,11 @@ from purple_agent_pkg.enrich import (  # noqa: E402
     _load_probes_yaml,
     _enrich_findings,
 )
+from purple_agent_pkg.sensor import (  # noqa: E402
+    parse_sectioned_jq_stream,
+    normalize_suricata_ts,
+    compute_audit,
+)
 
 
 # ============================================================================
@@ -920,24 +925,12 @@ def _end_of_run_zeek_sweep(args, ts):
         print(f"[purple-agent] sweep ssh failed: {e}")
         return None
 
-    notices, intel = [], []
-    section = None
-    for line in raw.splitlines():
-        line = line.strip()
-        if line == "=== NOTICES ===":
-            section = "n"; continue
-        if line == "=== INTEL ===":
-            section = "i"; continue
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if section == "n":
-            notices.append(entry)
-        elif section == "i":
-            intel.append(entry)
+    sections = parse_sectioned_jq_stream(
+        raw,
+        {"=== NOTICES ===": "notices", "=== INTEL ===": "intel"},
+    )
+    notices = sections["notices"]
+    intel = sections["intel"]
 
     sweep = {"run_start_epoch": run_start, "window_sec": window_sec, "notices": notices, "intel_hits": intel}
     sweep_path.write_text(json.dumps(sweep, indent=2), encoding="utf-8")
@@ -1027,127 +1020,23 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
         print(f"[purple-agent] accuracy audit ssh failed: {e}")
         return None
 
-    sensor_alerts, sensor_notices = [], []
-    section = None
-    for line in raw.splitlines():
-        line = line.strip()
-        if line == "=== ALERTS ===":
-            section = "a"; continue
-        if line == "=== NOTICES ===":
-            section = "n"; continue
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if section == "a":
-            sensor_alerts.append(entry)
-        elif section == "n":
-            sensor_notices.append(entry)
+    sections = parse_sectioned_jq_stream(
+        raw,
+        {"=== ALERTS ===": "alerts", "=== NOTICES ===": "notices"},
+    )
+    sensor_alerts = sections["alerts"]
+    sensor_notices = sections["notices"]
 
-    # Index sensor alerts by SID with timestamp list for ±60s window comparison.
-    sid_timestamps = {}
-    for a in sensor_alerts:
-        sid = str(a.get("sid", ""))
-        ts_raw = a.get("ts", "")
-        # Suricata timestamps look like "2026-04-21T23:58:37.123456+0000".
-        # Python 3.11+ fromisoformat accepts compact tz "+HHMM", older versions
-        # need "+HH:MM". Normalize the trailing tz so it's colon-separated.
-        ts_normalized = ts_raw.replace("Z", "+00:00")
-        if len(ts_normalized) >= 5 and ts_normalized[-5] in ("+", "-") and ":" not in ts_normalized[-5:]:
-            ts_normalized = ts_normalized[:-2] + ":" + ts_normalized[-2:]
-        try:
-            ts_epoch = datetime.fromisoformat(ts_normalized).timestamp() if ts_normalized else 0
-        except Exception:
-            ts_epoch = 0
-        # Only keep alerts from run_start forward. The per-probe ±60s match
-        # below handles forward drift; opening this floor lets historical
-        # alerts leak in and falsely "verify" claims.
-        if ts_epoch and ts_epoch >= run_start:
-            sid_timestamps.setdefault(sid, []).append(ts_epoch)
+    # Deterministic cross-check: ledger claims vs sensor ground truth.
+    # See purple_agent_pkg.sensor.compute_audit for the causal attribution
+    # rules (±60s window, run_start floor, structural guards).
+    audit = compute_audit(sensor_alerts, sensor_notices, ledger, run_start, window_sec)
 
-    # Cross-check each ledger entry.
-    probe_audits = []
-    overclaim_count = 0
-    underclaim_count = 0
-    structural_issues = []
-    seen_probes = set()
-
-    for entry in ledger:
-        probe = entry.get("probe", "")
-        if not probe:
-            structural_issues.append({"issue": "missing probe_name", "entry_ts": entry.get("ts", "")})
-            continue
-        if probe in seen_probes:
-            structural_issues.append({"issue": "duplicate probe name", "probe": probe})
-        seen_probes.add(probe)
-
-        # DETECTED verdict is only valid if the agent recorded SOME evidence:
-        # a Suricata SID, a Zeek notice, or a populated zeek_signals line.
-        verdict = entry.get("verdict", "")
-        if verdict == "DETECTED":
-            has_sid = bool(entry.get("fired_sids", []))
-            has_notice = bool(entry.get("zeek_notices", []))
-            zsig = entry.get("zeek_signals", "") or ""
-            has_zsig = bool(zsig) and zsig.lower().strip() not in ("empty", "none", "")
-            if not (has_sid or has_notice or has_zsig):
-                structural_issues.append({
-                    "issue": "DETECTED with no evidence (no fired_sids, no zeek_notices, no zeek_signals)",
-                    "probe": probe,
-                })
-
-        claimed_sids = entry.get("fired_sids", []) or []
-        try:
-            probe_ts = datetime.fromisoformat(entry.get("ts", "").replace("Z", "+00:00")).timestamp()
-        except Exception:
-            probe_ts = 0
-
-        # For each claimed SID, verify it fired within ±60s of the probe's ts.
-        verified_sids = []
-        unverified_sids = []
-        if probe_ts:
-            for sid in claimed_sids:
-                firings = sid_timestamps.get(str(sid), [])
-                match = any(abs(t - probe_ts) <= 60 for t in firings)
-                (verified_sids if match else unverified_sids).append(sid)
-
-        if unverified_sids:
-            overclaim_count += 1
-
-        probe_audits.append({
-            "probe": probe,
-            "ts": entry.get("ts", ""),
-            "verdict": entry.get("verdict", ""),
-            "claimed_sids": claimed_sids,
-            "verified_sids": verified_sids,
-            "unverified_sids": unverified_sids,
-        })
-
-    # Aggregate counts
-    total_probes = len(ledger)
-    verdicts = {}
-    for e in ledger:
-        v = e.get("verdict", "?")
-        verdicts[v] = verdicts.get(v, 0) + 1
-
-    audit = {
-        "run_start_epoch": run_start,
-        "window_sec": window_sec,
-        "total_probes": total_probes,
-        "verdict_distribution": verdicts,
-        "sensor_alerts_in_window": len(sensor_alerts),
-        "sensor_unique_sids": len({str(a.get("sid", "")) for a in sensor_alerts}),
-        "sensor_notices_in_window": len(sensor_notices),
-        "structural_issues": structural_issues,
-        "overclaim_count": overclaim_count,
-        "probe_audits": probe_audits,
-    }
     audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     print(
         f"[purple-agent] accuracy audit written: {audit_path} "
-        f"({total_probes} probes, {overclaim_count} overclaims, "
-        f"{len(structural_issues)} structural issues)"
+        f"({audit['total_probes']} probes, {audit['overclaim_count']} overclaims, "
+        f"{len(audit['structural_issues'])} structural issues)"
     )
     return audit_path
 
