@@ -40,7 +40,18 @@ with `--no-sweep`.
 **Inline accuracy audit.** Every report now ends with a deterministic
 cross-check that pulls Suricata alerts + Zeek notices straight from the sensor
 and compares them to what the agent claimed in the ledger. Overclaim counts
-(claimed SIDs that never actually fired) appear at the bottom of every report.
+(claimed SIDs that never actually fired within ±60s of the probe) appear at the
+bottom of every report. Reads eve.json forward from a line-count baseline
+captured at run start, so alerts are never truncated even on large eve.json files.
+
+**Causal attribution rule.** A SID is "probe-attributable" only if its alert's
+`dest_ip` matches the probe's intended target (the victim IP, or — for outbound
+probes — the external endpoint: SaaS SNI host, DoH resolver, IMDS 169.254.169.254,
+C2 IP) AND its timestamp falls inside the baseline window. Canary SIDs 2001219
+(ET SCAN Potential SSH Scan) and 9000003 (local probe-visibility) count as evidence
+only when the probe is itself a scan-type technique (nmap / hping3 / ssh-spray).
+Structurally, a `DETECTED` verdict is invalid without at least one fired_sid, one
+Zeek notice, or populated zeek_signals — the audit flags violations.
 
 At run end the script writes:
 
@@ -128,6 +139,28 @@ when the run finishes.
 | `--pool-free` | off | Agent improvises attacks ATT&CK-style instead of reading `probes.yaml`. Useful for exploring novel coverage gaps. |
 | `--focus "phrase"` | none | Appended to the system prompt. Example: `--focus "prioritize AD lateral movement / Kerberos / SMB"`. |
 | `--no-sweep` | off | Skip the 3-minute post-run sensor sweep (SumStats-delayed notices). |
+
+## Coverage patterns from batch runs
+
+Consistent across Runs 1-4 (130 probes, pool-free):
+
+**Detects cleanly** — Log4Shell (8-11 ET rules per hit), Shellshock, SMB null-session,
+Nikto/sqlmap/masscan UAs, Confluence OGNL, ProxyShell, Spring4Shell, Tomcat manager,
+Drupalgeddon, webhook exfil (Slack/Telegram/Discord/Pipedream), DoH tunneling, Tor/VPN
+SNIs, XXE, custom DGA rules on DNS-to-victim patterns.
+
+**Consistent rule-engineering targets** (UNDETECTED every run):
+IMDS SSRF to 169.254.169.254, CitrixBleed (CVE-2023-4966), Ivanti (CVE-2024-21893),
+CrushFTP (CVE-2024-4040), SharePoint ToolShell (CVE-2025-53770), modern C2 beacons
+(Havoc/Mythic/Sliver/BruteRatel defaults), SSO/OAuth abuse (Okta/AzureHound/GitHub OIDC),
+commodity-malware UAs (Lumma/DarkGate/StealC), stealth nmap variants (NULL/FIN).
+
+**Lab-architecture limits** (won't fix via rules):
+Victim has no password-auth SSH → `SSH::Password_Guessing` never fires. No real AD/SMB
+service → most Kerberos / LDAP / SMB enum errors out rather than detecting. Zeek's
+Intel framework is loaded (1.14M URLhaus+ThreatFox+SSLBL+MalwareBazaar indicators)
+but needs probes that visit indicator-listed domains to exercise — our pool-free
+taxonomy hits mostly legit SaaS, so `intel.log` stays empty.
 
 ## Customizing the probe pool
 

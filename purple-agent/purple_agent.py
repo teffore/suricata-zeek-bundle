@@ -69,10 +69,12 @@ REPORTS_DIR = SCRIPT_DIR / "reports"
 # via this module-level var (simplest way to close over state with @tool).
 _ledger_path: Path | None = None
 _max_attacks: int | None = None  # hard cap, enforced inside record_finding
-_eve_before_lines: int | None = None  # eve.json line count captured at run start;
-                                      # lets the audit tail forward from here instead
-                                      # of the fixed -c 5MB tail (which truncates the
-                                      # run window when eve.json is large).
+# Sensor-log line counts captured at run start so audit + sweep can tail
+# forward from these baselines -- avoids the byte-count tail truncation bug
+# that silently drops the early half of the run window when logs are large.
+_eve_before_lines: int | None = None
+_notice_before_lines: int | None = None
+_intel_before_lines: int | None = None
 
 
 # ============================================================================
@@ -684,7 +686,7 @@ Respect the cap by NOT queuing more probes than remaining slots.
 # ============================================================================
 
 async def run_agent(args):
-    global _ledger_path, _max_attacks, _eve_before_lines
+    global _ledger_path, _max_attacks, _eve_before_lines, _notice_before_lines, _intel_before_lines
 
     REPORTS_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -692,25 +694,34 @@ async def run_agent(args):
     _ledger_path.touch()
     _max_attacks = args.max_attacks
 
-    # Capture eve.json line count on the sensor RIGHT NOW so the accuracy
-    # audit can later read from this offset forward. Using a fixed -c 5MB
-    # tail was truncating the run's early alerts when eve.json was large
-    # (Run 3: 34MB file, run's first alert at byte offset 15MB, tail only
-    # reached back to byte 29MB -> 10 false "overclaims").
+    # Capture sensor log line counts RIGHT NOW so the audit + sweep can read
+    # forward from these offsets. A byte-count tail silently drops the early
+    # half of the run window when a log is large (Run 3: 34MB eve.json, run
+    # start at byte 15MB, tail -c 5MB only reached back to byte 29MB -> 10
+    # false "overclaims"). notice.log / intel.log suffer the same class of
+    # bug, so capture baselines for all three.
     import subprocess
-    try:
-        result = subprocess.run(
-            ["bash", "-c",
-             f"ssh -i {args.key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-             f"-o ConnectTimeout=10 ubuntu@{args.sensor_ip} "
-             f"\"sudo wc -l /var/log/suricata/eve.json 2>/dev/null | awk '{{print \\$1}}'\""],
-            capture_output=True, text=True, timeout=30,
-        )
-        _eve_before_lines = int((result.stdout or "0").strip() or "0")
-        print(f"[purple-agent] eve.json baseline: {_eve_before_lines} lines")
-    except Exception as e:
-        print(f"[purple-agent] WARNING: failed to capture eve.json baseline ({e}); audit will fall back to tail -c")
-        _eve_before_lines = None
+    ssh_base = (
+        f"ssh -i {args.key} -o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "
+        f"ubuntu@{args.sensor_ip}"
+    )
+    def _capture_lines(remote_path, label):
+        try:
+            r = subprocess.run(
+                ["bash", "-c",
+                 f"{ssh_base} \"sudo wc -l {remote_path} 2>/dev/null | awk '{{print \\$1}}'\""],
+                capture_output=True, text=True, timeout=30,
+            )
+            n = int((r.stdout or "0").strip() or "0")
+            print(f"[purple-agent] {label} baseline: {n} lines")
+            return n
+        except Exception as e:
+            print(f"[purple-agent] WARNING: failed to capture {label} baseline ({e}); will fall back to tail -c")
+            return None
+    _eve_before_lines = _capture_lines("/var/log/suricata/eve.json", "eve.json")
+    _notice_before_lines = _capture_lines("/opt/zeek/logs/current/notice.log", "notice.log")
+    _intel_before_lines = _capture_lines("/opt/zeek/logs/current/intel.log", "intel.log")
 
     # Probe source: either a curated YAML pool or pool-free taxonomy-only mode.
     probes_path = None
@@ -826,6 +837,7 @@ async def run_agent(args):
     turn = 0
     pushback_count = 0
     MAX_PUSHBACKS = 5
+    last_count = 0  # progress guard: if a pushback adds zero new probes, bail
     try:
         async with ClaudeSDKClient(options=options) as client:
             current_query = kickoff
@@ -860,6 +872,15 @@ async def run_agent(args):
                 ) if _ledger_path.exists() else 0
                 if current_count >= _max_attacks:
                     break  # cap reached, legitimate
+                # Progress guard: if the most recent pushback added zero probes
+                # (agent answered with text only, never called record_finding),
+                # do not burn another slot -- terminate cleanly.
+                if pushback_count > 0 and current_count == last_count:
+                    print(
+                        f"[purple-agent] cap not reached ({current_count}/{_max_attacks}); "
+                        f"agent made no ledger progress on pushback — terminating."
+                    )
+                    break
                 if pushback_count >= MAX_PUSHBACKS:
                     print(
                         f"[purple-agent] cap not reached ({current_count}/{_max_attacks}); "
@@ -867,6 +888,7 @@ async def run_agent(args):
                     )
                     break
                 pushback_count += 1
+                last_count = current_count
                 remaining = _max_attacks - current_count
                 stop_reason = (
                     "said COMPLETE" if said_complete
@@ -949,15 +971,25 @@ def _end_of_run_zeek_sweep(args, ts):
     ssh_opts = (
         f"-i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
     )
-    # One compound sensor query: notice.log + intel.log + weird.log for the run window.
+    # One compound sensor query: notice.log + intel.log for the run window.
+    # Tail forward from run-start line-count baselines where captured -- same
+    # truncation fix as the accuracy audit uses.
+    if _notice_before_lines is not None:
+        notice_src = f"sudo tail -n +{_notice_before_lines + 1} /opt/zeek/logs/current/notice.log 2>/dev/null"
+    else:
+        notice_src = "sudo tail -c 2000000 /opt/zeek/logs/current/notice.log 2>/dev/null"
+    if _intel_before_lines is not None:
+        intel_src = f"sudo tail -n +{_intel_before_lines + 1} /opt/zeek/logs/current/intel.log 2>/dev/null"
+    else:
+        intel_src = "sudo tail -c 500000 /opt/zeek/logs/current/intel.log 2>/dev/null"
     remote_cmd = (
         f"echo '=== NOTICES ==='; "
-        f"sudo tail -c 2000000 /opt/zeek/logs/current/notice.log 2>/dev/null "
+        f"{notice_src} "
         f'| jq -c "select((.ts|tonumber) > (now - {window_sec})) | '
         f'{{ts, note, src: (.src // .\\"id.orig_h\\"), dst: .\\"id.resp_h\\", msg: (.msg // \\"\\"), sub: (.sub // \\"\\")}}"'
         f" 2>/dev/null; "
         f"echo '=== INTEL ==='; "
-        f"sudo tail -c 500000 /opt/zeek/logs/current/intel.log 2>/dev/null "
+        f"{intel_src} "
         f'| jq -c "select((.ts|tonumber) > (now - {window_sec})) | '
         f'{{ts, indicator: .\\"seen.indicator\\", type: .\\"seen.indicator_type\\", src: (.src // .\\"id.orig_h\\"), dst: .\\"id.resp_h\\", source: .sources[0]}}"'
         f" 2>/dev/null"
@@ -1032,27 +1064,31 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
         run_start = int(datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp())
     except Exception:
         run_start = 0
-    window_sec = max(300, int(_time.time() - run_start) + 60)
+    if run_start == 0:
+        # Without a valid run_start, the ts-based window filter can't tell run
+        # alerts from historical noise. Refuse to produce a misleading audit.
+        print("[purple-agent] accuracy audit: bad run_start (ts parse failed); skipping")
+        return None
+    window_sec = max(60, int(_time.time() - run_start) + 60)
 
     key_path = args.key
     ssh_opts = (
         f"-i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
     )
-    # One compound sensor query: every alert + notice in the run window.
-    # For alerts: tail FORWARD from the eve.json line captured at run start
-    # (_eve_before_lines). The old `tail -c 5MB` approach silently truncated
-    # the run window on large eve.json files — Run 3 regressed to 10 "overclaims"
-    # because the audit read bytes 29MB-34MB but the run's first alert was at
-    # byte 15MB. Falling back to a large `tail -c` if the baseline wasn't
-    # captured.
-    # For notices: `tail -c` + `sed '1d'` drops the partial first line so jq
-    # doesn't abort on the JSON fragment. Python filters by timestamp after
-    # pulling; jq's fromdate/fromdateiso8601 don't handle Suricata's
-    # microsecond+tz format.
+    # Compound sensor query: every alert + notice since the run started.
+    # Tail FORWARD from line-count baselines captured at run start; falls back
+    # to a large byte-count tail with sed '1d' to drop the partial first line
+    # when baselines weren't captured. (Python filters by timestamp after
+    # pulling; jq's fromdate/fromdateiso8601 can't parse Suricata's
+    # microsecond+tz format.)
     if _eve_before_lines is not None:
         alert_src = f"sudo tail -n +{_eve_before_lines + 1} /var/log/suricata/eve.json 2>/dev/null"
     else:
         alert_src = "sudo tail -c 50000000 /var/log/suricata/eve.json 2>/dev/null | sed '1d'"
+    if _notice_before_lines is not None:
+        notice_src = f"sudo tail -n +{_notice_before_lines + 1} /opt/zeek/logs/current/notice.log 2>/dev/null"
+    else:
+        notice_src = "sudo tail -c 2000000 /opt/zeek/logs/current/notice.log 2>/dev/null | sed '1d'"
     remote_cmd = (
         f"echo '=== ALERTS ==='; "
         f"{alert_src} "
@@ -1061,8 +1097,7 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
         f'src: .src_ip, dst: .dest_ip}}"'
         f" 2>/dev/null; "
         f"echo '=== NOTICES ==='; "
-        f"sudo tail -c 2000000 /opt/zeek/logs/current/notice.log 2>/dev/null "
-        f"| sed '1d' "
+        f"{notice_src} "
         f'| jq -c "select((.ts|tonumber) > (now - {window_sec})) | '
         f'{{ts, note, src: (.src // .\\"id.orig_h\\")}}"'
         f" 2>/dev/null"
@@ -1111,8 +1146,10 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
             ts_epoch = datetime.fromisoformat(ts_normalized).timestamp() if ts_normalized else 0
         except Exception:
             ts_epoch = 0
-        # Only keep alerts within run window (run_start - 60s to now)
-        if ts_epoch and ts_epoch >= (run_start - 60):
+        # Only keep alerts from run_start forward. The per-probe ±60s match
+        # below handles forward drift; opening this floor lets historical
+        # alerts leak in and falsely "verify" claims.
+        if ts_epoch and ts_epoch >= run_start:
             sid_timestamps.setdefault(sid, []).append(ts_epoch)
 
     # Cross-check each ledger entry.
@@ -2053,8 +2090,12 @@ def _build_accuracy_audit_section(audit_data):
     sensor_sids = audit_data.get("sensor_unique_sids", 0)
     sensor_notices = audit_data.get("sensor_notices_in_window", 0)
 
-    # Overclaim rate
-    overclaim_pct = f"{100 * overclaim / total:.0f}" if total > 0 else "0"
+    # Overclaim rate -- denominator is probes-with-claims, not total probes.
+    # UNDETECTED/ERROR probes have no fired_sids and can't logically overclaim;
+    # including them in the denominator dilutes the rate and understates the
+    # problem for runs with many ambient-gap probes.
+    claimants = sum(1 for p in probe_audits if p.get("claimed_sids"))
+    overclaim_pct = f"{100 * overclaim / claimants:.0f}" if claimants > 0 else "0"
 
     parts = [
         '<h2>Accuracy Audit</h2>',
