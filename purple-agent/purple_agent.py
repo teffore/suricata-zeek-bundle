@@ -69,6 +69,10 @@ REPORTS_DIR = SCRIPT_DIR / "reports"
 # via this module-level var (simplest way to close over state with @tool).
 _ledger_path: Path | None = None
 _max_attacks: int | None = None  # hard cap, enforced inside record_finding
+_eve_before_lines: int | None = None  # eve.json line count captured at run start;
+                                      # lets the audit tail forward from here instead
+                                      # of the fixed -c 5MB tail (which truncates the
+                                      # run window when eve.json is large).
 
 
 # ============================================================================
@@ -680,13 +684,33 @@ Respect the cap by NOT queuing more probes than remaining slots.
 # ============================================================================
 
 async def run_agent(args):
-    global _ledger_path, _max_attacks
+    global _ledger_path, _max_attacks, _eve_before_lines
 
     REPORTS_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     _ledger_path = REPORTS_DIR / f"findings-{ts}.jsonl"
     _ledger_path.touch()
     _max_attacks = args.max_attacks
+
+    # Capture eve.json line count on the sensor RIGHT NOW so the accuracy
+    # audit can later read from this offset forward. Using a fixed -c 5MB
+    # tail was truncating the run's early alerts when eve.json was large
+    # (Run 3: 34MB file, run's first alert at byte offset 15MB, tail only
+    # reached back to byte 29MB -> 10 false "overclaims").
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["bash", "-c",
+             f"ssh -i {args.key} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+             f"-o ConnectTimeout=10 ubuntu@{args.sensor_ip} "
+             f"\"sudo wc -l /var/log/suricata/eve.json 2>/dev/null | awk '{{print \\$1}}'\""],
+            capture_output=True, text=True, timeout=30,
+        )
+        _eve_before_lines = int((result.stdout or "0").strip() or "0")
+        print(f"[purple-agent] eve.json baseline: {_eve_before_lines} lines")
+    except Exception as e:
+        print(f"[purple-agent] WARNING: failed to capture eve.json baseline ({e}); audit will fall back to tail -c")
+        _eve_before_lines = None
 
     # Probe source: either a curated YAML pool or pool-free taxonomy-only mode.
     probes_path = None
@@ -1015,14 +1039,23 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
         f"-i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
     )
     # One compound sensor query: every alert + notice in the run window.
-    # `tail -c` starts mid-file so the first line is a JSON fragment — `sed '1d'`
-    # drops it so jq doesn't abort on the parse error (jq 1.6 is strict).
-    # Python filters by timestamp after pulling; jq's fromdate/fromdateiso8601
-    # don't handle Suricata's microsecond+tz format.
+    # For alerts: tail FORWARD from the eve.json line captured at run start
+    # (_eve_before_lines). The old `tail -c 5MB` approach silently truncated
+    # the run window on large eve.json files — Run 3 regressed to 10 "overclaims"
+    # because the audit read bytes 29MB-34MB but the run's first alert was at
+    # byte 15MB. Falling back to a large `tail -c` if the baseline wasn't
+    # captured.
+    # For notices: `tail -c` + `sed '1d'` drops the partial first line so jq
+    # doesn't abort on the JSON fragment. Python filters by timestamp after
+    # pulling; jq's fromdate/fromdateiso8601 don't handle Suricata's
+    # microsecond+tz format.
+    if _eve_before_lines is not None:
+        alert_src = f"sudo tail -n +{_eve_before_lines + 1} /var/log/suricata/eve.json 2>/dev/null"
+    else:
+        alert_src = "sudo tail -c 50000000 /var/log/suricata/eve.json 2>/dev/null | sed '1d'"
     remote_cmd = (
         f"echo '=== ALERTS ==='; "
-        f"sudo tail -c 5000000 /var/log/suricata/eve.json 2>/dev/null "
-        f"| sed '1d' "
+        f"{alert_src} "
         f'| jq -c "select(.event_type == \\"alert\\") | '
         f'{{ts: .timestamp, sid: .alert.signature_id, sig: .alert.signature, '
         f'src: .src_ip, dst: .dest_ip}}"'
