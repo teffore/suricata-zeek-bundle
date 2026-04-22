@@ -160,4 +160,88 @@ if ! command -v flightsim >/dev/null 2>&1; then
 fi
 echo "  flightsim: $(flightsim --help 2>&1 | head -1 || echo 'not installed')"
 
+# ---------- TIER2: expanded atomic-red-team coverage ----------
+# Second install pass for probes drawn from Atomic Red Team Linux atomics that
+# produce network-observable signal beyond the TIER1 CI baseline. Same
+# per-package install pattern as REQUIRED above — one failed package does not
+# roll back the batch.
+#
+#   rsync          — T1105 rsync push/pull exfil (TCP/873, @RSYNCD banner)
+#   socat          — T1059.004 TLS reverse shell (distinctive JA3)
+#   masscan        — T1046 fast SYN scan (timing distinct from nmap)
+#   gobuster/ffuf/feroxbuster — T1595.003 content discovery (404 burst + UA)
+#   whois          — T1105 whois-as-tunnel probe (raw TCP/8443)
+#   fping/arp-scan — T1018 host discovery sweeps
+#   slowhttptest   — T1499.002 slowloris / slow-body DoS
+#   dsniff         — T1557.002 arpspoof (ARP cache poison, Zeek arp.log)
+#   knockd         — T1205 port-knocking client (provides /usr/bin/knock)
+#   tor            — T1090.003 Tor bootstrap (SNI + Tor cert-subject pattern)
+#   rclone         — T1567.002 cloud exfil (distinct JA3, *.s3.amazonaws.com)
+#   apache2-utils  — T1499.002 ApacheBench flood (ab)
+#   dnscat2        — T1071.004 DNS C2 (/usr/bin/dnscat client,
+#                    /usr/bin/dnscat2-server server)
+echo "=== Installing TIER2 atomic-red-team toolkit ==="
+TIER2=(rsync socat masscan gobuster ffuf feroxbuster whois fping arp-scan \
+       slowhttptest dsniff knockd tor rclone apache2-utils dnscat2)
+t2_installed=()
+t2_failed=()
+for pkg in "${TIER2[@]}"; do
+  if apt-get install -y -qq "$pkg"; then
+    t2_installed+=("$pkg")
+  else
+    t2_failed+=("$pkg")
+  fi
+done
+echo "  TIER2: ${#t2_installed[@]}/${#TIER2[@]} installed"
+for p in "${t2_failed[@]}"; do echo "  FAIL $p"; done
+if [ "${#t2_failed[@]}" -gt 0 ]; then
+  echo "ERROR: ${#t2_failed[@]} TIER2 package(s) failed" >&2
+  exit 1
+fi
+
+# --- cloudflared (Cloudflare Tunnel client) ---
+# T1572 — spawns TLS to *.trycloudflare.com with distinctive SNI+JA3.
+echo "=== Installing cloudflared ==="
+if ! command -v cloudflared >/dev/null 2>&1; then
+  curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+    -o /usr/local/bin/cloudflared
+  chmod +x /usr/local/bin/cloudflared
+fi
+echo "  cloudflared: $(cloudflared --version 2>&1 | head -1)"
+
+# --- devtunnel (Microsoft Dev Tunnels CLI) ---
+# T1572 — SNI *.devtunnels.ms. aka.ms redirect resolves to tunnelsassets blob.
+echo "=== Installing devtunnel ==="
+if ! command -v devtunnel >/dev/null 2>&1; then
+  curl -fsSL "https://aka.ms/TunnelsCliDownload/linux-x64" -o /usr/local/bin/devtunnel
+  chmod +x /usr/local/bin/devtunnel
+fi
+echo "  devtunnel: $(devtunnel --version 2>&1 | head -1)"
+
+# --- code (VSCode CLI, for `code tunnel`) ---
+# T1572 — SNI *.tunnels.api.visualstudio.com + GitHub device-code OAuth.
+echo "=== Installing VSCode CLI (code) ==="
+if ! command -v code >/dev/null 2>&1; then
+  curl -fsSL "https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64" \
+    -o /tmp/vscode-cli.tar.gz
+  tar -xzf /tmp/vscode-cli.tar.gz -C /usr/local/bin/
+  chmod +x /usr/local/bin/code
+  rm -f /tmp/vscode-cli.tar.gz
+fi
+echo "  code: $(code --version 2>&1 | head -1)"
+
+# --- icmpdoor (ICMP C2 tunnel) ---
+# T1095 — full ICMP reverse shell (vs. our existing ICMP-large/ICMP-exfil one-shots).
+# Binaries live under /opt/icmpdoor; pinned to a specific commit SHA so the
+# file MD5 is deterministic for detection-rule authoring.
+echo "=== Installing icmpdoor ==="
+if [ ! -x /opt/icmpdoor/icmpdoor ]; then
+  mkdir -p /opt/icmpdoor
+  BASE=https://github.com/krabelize/icmpdoor/raw/2398f7e0b8548d8ef2891089e4199ee630e84ef6/binaries/x86_64-linux
+  curl -fsSL "$BASE/icmp-cnc" -o /opt/icmpdoor/icmp-cnc
+  curl -fsSL "$BASE/icmpdoor" -o /opt/icmpdoor/icmpdoor
+  chmod +x /opt/icmpdoor/icmp-cnc /opt/icmpdoor/icmpdoor
+fi
+echo "  icmpdoor: $(/opt/icmpdoor/icmpdoor --help 2>&1 | head -1)"
+
 echo "=== Attacker toolkit setup complete ==="
