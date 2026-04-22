@@ -1,10 +1,11 @@
 # purple-agent
 
 Autonomous purple-team probe runner for the Suricata+Zeek lab. Drops you a
-3-box lab (attacker / victim / sensor) and this runs Claude as an agent that
-iterates through a curated probe pool, observes the sensor, and writes a
-markdown report — the script-version of what you did interactively with me
-during wave 1 and wave 2.
+3-box lab (attacker / victim / sensor) and runs Claude as an agent that
+iterates through a curated probe pool (or improvises, with `--pool-free`),
+observes the sensor, and writes a self-contained HTML report with an inline
+ledger-vs-sensor accuracy audit — the script-version of what you did
+interactively with me during wave 1 and wave 2.
 
 Inspired by Tech Raj's HackTheBox-pentest-agent pattern (custom system
 prompt + autonomous Claude + final walkthrough report) but scoped to
@@ -13,19 +14,41 @@ pentesting.
 
 ## What it does
 
-For each iteration (budget default = 30 turns):
+For each iteration:
 
-1. **Baseline** sensor — snapshot `/var/log/suricata/eve.json` line count
+1. **Baseline** sensor — snapshot `eve.json` line count, Zeek `weird.log` line
+   count, and sensor epoch time (one `ssh` per baseline, so all three are tight)
 2. **Probe** — SSH to attacker, run a bash probe against the victim IP
-3. **Check** — SSH to sensor, diff new Suricata SIDs + Zeek notices
+3. **Check** — SSH to sensor, diff new Suricata SIDs + Zeek notices + weird events
 4. **Classify** — call `record_finding` with verdict:
-   - `DETECTED` — a relevant Suricata SID fired
+   - `DETECTED` — a relevant Suricata SID fired (or a material Zeek notice / intel hit)
    - `UNDETECTED` — probe reached the wire but no rule matched (rule-engineering target)
    - `ERROR` — probe failed to run (tool missing, connection refused)
    - `FP` — a SID fired but is unrelated to the probe technique (false positive)
 
-At budget exhaustion it writes `reports/report-<ts>.html` + the raw JSONL
-trace and a MITRE ATT&CK Navigator layer JSON alongside it.
+**Pushback loop.** If the agent stops before reaching `--max-attacks` (text-only
+turn, hit budget, or just said COMPLETE early), the orchestrator pushes it back
+with a continuation prompt up to a fixed retry cap. The run only ends when the
+ledger reaches the requested count or the cap is hit.
+
+**End-of-run Zeek sweep.** After the agent finishes, a 3-minute wait + final
+sensor query catches SumStats-delayed notices (Scan::Port_Scan,
+SSH::Password_Guessing, etc.) that Zeek emits on a timer rather than inline.
+Findings are merged into the report as a "Zeek Sensor Sweep" section. Skip
+with `--no-sweep`.
+
+**Inline accuracy audit.** Every report now ends with a deterministic
+cross-check that pulls Suricata alerts + Zeek notices straight from the sensor
+and compares them to what the agent claimed in the ledger. Overclaim counts
+(claimed SIDs that never actually fired) appear at the bottom of every report.
+
+At run end the script writes:
+
+- `reports/report-<ts>.html` — self-contained HTML report (auto-opens in browser)
+- `reports/findings-<ts>.jsonl` — raw per-probe JSONL trace
+- `reports/sweep-<ts>.json` — sensor sweep results
+- `reports/accuracy-<ts>.json` — accuracy audit sidecar
+- `reports/navigator-layer-<ts>.json` — MITRE ATT&CK Navigator layer
 
 ## Hard safety constraints (enforced via system prompt + tool allowlist)
 
@@ -88,21 +111,29 @@ python purple_agent.py \
   --attacker-ip 34.231.243.255 \
   --sensor-ip   98.92.118.21 \
   --victim-ip   172.31.78.152 \
-  --key         /tmp/lab-1776710818.key \
-  --budget      30
+  --key         .lab-key \
+  --budget      30 \
+  --max-attacks 10
 ```
 
-Output streams a one-line preview per LLM turn to stdout. When the run
-ends, the script writes:
+Output streams a one-line preview per LLM turn to stdout. Report auto-opens
+when the run finishes.
 
-- `reports/report-<timestamp>.md` — markdown summary
-- `reports/findings-<timestamp>.jsonl` — raw per-probe JSONL trace
+### Flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--budget N` | 30 | Max LLM turns before the agent has to wrap up. |
+| `--max-attacks N` | unset | Cap the ledger at N probes. Pushback loop keeps the agent going until this is hit. |
+| `--pool-free` | off | Agent improvises attacks ATT&CK-style instead of reading `probes.yaml`. Useful for exploring novel coverage gaps. |
+| `--focus "phrase"` | none | Appended to the system prompt. Example: `--focus "prioritize AD lateral movement / Kerberos / SMB"`. |
+| `--no-sweep` | off | Skip the 3-minute post-run sensor sweep (SumStats-delayed notices). |
 
 ## Customizing the probe pool
 
-`probes.yaml` ships with ~35 probes curated from the wave-1 and wave-2
+`probes.yaml` ships with ~80 probes curated from the wave-1 and wave-2
 research (CVE-2024 signatures, modern C2, SaaS/LLM SNIs, supply-chain,
-cryptominer, Zeek-specific signals). Each entry has an
+cryptominer-live, Zeek-specific signals). Each entry has an
 `expected_verdict` hint the agent uses to classify.
 
 Add your own by appending a new block with the same schema:

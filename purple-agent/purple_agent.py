@@ -980,16 +980,21 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
         f"-i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
     )
     # One compound sensor query: every alert + notice in the run window.
+    # `tail -c` starts mid-file so the first line is a JSON fragment — `sed '1d'`
+    # drops it so jq doesn't abort on the parse error (jq 1.6 is strict).
+    # Python filters by timestamp after pulling; jq's fromdate/fromdateiso8601
+    # don't handle Suricata's microsecond+tz format.
     remote_cmd = (
         f"echo '=== ALERTS ==='; "
         f"sudo tail -c 5000000 /var/log/suricata/eve.json 2>/dev/null "
+        f"| sed '1d' "
         f'| jq -c "select(.event_type == \\"alert\\") | '
-        f'select((.timestamp | fromdate? // 0) > (now - {window_sec})) | '
         f'{{ts: .timestamp, sid: .alert.signature_id, sig: .alert.signature, '
         f'src: .src_ip, dst: .dest_ip}}"'
         f" 2>/dev/null; "
         f"echo '=== NOTICES ==='; "
         f"sudo tail -c 2000000 /opt/zeek/logs/current/notice.log 2>/dev/null "
+        f"| sed '1d' "
         f'| jq -c "select((.ts|tonumber) > (now - {window_sec})) | '
         f'{{ts, note, src: (.src // .\\"id.orig_h\\")}}"'
         f" 2>/dev/null"
@@ -1028,11 +1033,18 @@ def _end_of_run_accuracy_audit(args, ts, ledger_path):
     for a in sensor_alerts:
         sid = str(a.get("sid", ""))
         ts_raw = a.get("ts", "")
+        # Suricata timestamps look like "2026-04-21T23:58:37.123456+0000".
+        # Python 3.11+ fromisoformat accepts compact tz "+HHMM", older versions
+        # need "+HH:MM". Normalize the trailing tz so it's colon-separated.
+        ts_normalized = ts_raw.replace("Z", "+00:00")
+        if len(ts_normalized) >= 5 and ts_normalized[-5] in ("+", "-") and ":" not in ts_normalized[-5:]:
+            ts_normalized = ts_normalized[:-2] + ":" + ts_normalized[-2:]
         try:
-            ts_epoch = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp() if ts_raw else 0
+            ts_epoch = datetime.fromisoformat(ts_normalized).timestamp() if ts_normalized else 0
         except Exception:
             ts_epoch = 0
-        if ts_epoch:
+        # Only keep alerts within run window (run_start - 60s to now)
+        if ts_epoch and ts_epoch >= (run_start - 60):
             sid_timestamps.setdefault(sid, []).append(ts_epoch)
 
     # Cross-check each ledger entry.
