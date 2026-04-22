@@ -1802,8 +1802,11 @@ def _build_exec_summary(enriched, buckets, sweep_data=None):
         <div class="stat-box" style="background:#1a1a2e;"><div class="num">{total}</div><div class="label">Attacks Conducted</div></div>
         <div class="stat-box stat-promote"><div class="num">{n_suri}</div><div class="label">Suricata Alerts</div></div>
         <div class="stat-box" style="background:#17a2b8;"><div class="num">{n_zeek_total}</div><div class="label" title="Probes where Zeek notice.log fired during per-probe check. Attributed to specific attacks.">Zeek Alerts</div></div>
+        <div class="stat-box" style="background:#6c757d;" title="Palo Alto NGFW alert integration — pending future release"><div class="num">N/A</div><div class="label">Palo Alto Alerts</div></div>
+        <div class="stat-box" style="background:#6c757d;" title="CrowdStrike Falcon EDR alert integration — pending future release"><div class="num">N/A</div><div class="label">CrowdStrike Alerts</div></div>
         <div class="stat-box stat-gap"><div class="num">{n_true_undetected}</div><div class="label" title="Probes with no Suricata SID and no Zeek notice. Excludes ERROR and FP probes.">No Detection</div></div>
     </div>
+    <p style="font-size:0.8rem; color:#888; margin:0.3rem 0 0 0;">Palo Alto + CrowdStrike alert correlation planned for a future release — currently these sources are not wired into the sensor.</p>
     <div class="detection-rates">
         <div class="rate-item">
             <div class="pct" style="color:#28a745;">{overall_pct}%</div>
