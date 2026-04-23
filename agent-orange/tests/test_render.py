@@ -15,6 +15,66 @@ from tests._ledger_fixtures import (
 )
 
 
+class TestFormatVerdictBadge:
+    """Maps internal verdict tiers to visible badges.
+
+    Unicode style for HTML/MD, ASCII for stdout. Only DETECTED_EXPECTED
+    gets a visible mark; all other DETECTED tiers render as plain
+    "DETECTED".
+    """
+
+    def test_detected_expected_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_EXPECTED", "unicode") == "DETECTED \u2713"
+
+    def test_detected_expected_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_EXPECTED", "ascii") == "DETECTED [x]"
+
+    def test_detected_partial_unicode_same_as_unexpected(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_PARTIAL", "unicode") == "DETECTED"
+
+    def test_detected_partial_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_PARTIAL", "ascii") == "DETECTED"
+
+    def test_detected_unexpected_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_UNEXPECTED", "unicode") == "DETECTED"
+
+    def test_detected_unexpected_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_UNEXPECTED", "ascii") == "DETECTED"
+
+    def test_undetected_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("UNDETECTED", "unicode") == "UNDETECTED"
+
+    def test_undetected_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("UNDETECTED", "ascii") == "UNDETECTED"
+
+    def test_failed_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("FAILED", "unicode") == "FAILED"
+
+    def test_failed_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("FAILED", "ascii") == "FAILED"
+
+    def test_unknown_tier_defaults_to_tier_name(self):
+        # Defensive: if verdict.py ever grows a new tier and render isn't
+        # updated in lockstep, fall back to the raw tier name rather than
+        # crash. Makes the miss visible without breaking the report.
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("BRAND_NEW_TIER", "unicode") == "BRAND_NEW_TIER"
+
+    def test_unknown_style_defaults_to_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_EXPECTED", "html5") == "DETECTED \u2713"
+
+
 # ---------------------------------------------------------------------------
 #  ledger_to_dict
 # ---------------------------------------------------------------------------

@@ -36,6 +36,44 @@ _PKTS_DROPPED_RE = re.compile(r"pkts_dropped\s*[=:]\s*(\d+)", re.IGNORECASE)
 _LOADED_SCRIPT_LINE_RE = re.compile(r"^\s*\S+\.(zeek|bro)\s*$")
 
 
+# Verdict badge mapping: internal tier -> visible text.
+# `DETECTED_EXPECTED` is the only tier that carries a mark; PARTIAL and
+# UNEXPECTED both render as plain "DETECTED" so the UNEXPECTED word never
+# appears in human-facing output. Full tier still lives in ledger.json.
+_VERDICT_BADGE_UNICODE = {
+    "DETECTED_EXPECTED": "DETECTED \u2713",
+    "DETECTED_PARTIAL": "DETECTED",
+    "DETECTED_UNEXPECTED": "DETECTED",
+    "UNDETECTED": "UNDETECTED",
+    "FAILED": "FAILED",
+}
+_VERDICT_BADGE_ASCII = {
+    "DETECTED_EXPECTED": "DETECTED [x]",
+    "DETECTED_PARTIAL": "DETECTED",
+    "DETECTED_UNEXPECTED": "DETECTED",
+    "UNDETECTED": "UNDETECTED",
+    "FAILED": "FAILED",
+}
+
+
+def format_verdict_badge(tier: str, style: str) -> str:
+    """Return the human-facing badge for an internal verdict tier.
+
+    style:
+      "unicode" -- HTML and Markdown renderers pass this. The mark is
+                   U+2713. Renders cleanly in all major viewers.
+      "ascii"   -- stdout summary passes this. Mark is "[x]". Windows
+                   CMD legacy code pages can't render U+2713 reliably.
+
+    Unknown tier -> returns the tier string unchanged (defensive: lets a
+    future tier-addition in verdict.py surface visibly without crashing
+    the report).
+    Unknown style -> falls back to unicode.
+    """
+    table = _VERDICT_BADGE_ASCII if style == "ascii" else _VERDICT_BADGE_UNICODE
+    return table.get(tier, tier)
+
+
 def _count_loaded_scripts(loaded_text: str) -> int:
     """Count Zeek scripts in a loaded_scripts.log body.
 
