@@ -11,9 +11,9 @@ Without this, ET rule churn (SIDs renamed/retired daily by upstream)
 looks identical to real detection changes and the user can't tell
 which is which.
 
-Snapshot is computed by grepping /etc/suricata/rules/*.rules for the
-`sid:<N>;` pattern. Simple, doesn't require a running Suricata, works
-even if the service is mid-restart.
+Snapshot is computed by grepping Suricata's configured rules directory
+(see `SURICATA_RULES_GLOB`) for the `sid:<N>;` pattern. Simple, doesn't
+require a running Suricata, works even if the service is mid-restart.
 
 Drift is a pure set operation over two snapshots. ssh_runner is the
 same injectable callable pattern used in harvest.py.
