@@ -204,6 +204,16 @@ if [ "${#t2_failed[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# --- dirb wordlist path shim ---
+# Kali's dirb package ships common.txt at /usr/share/dirb/wordlists/, but
+# gobuster/ffuf probes (in probes.yaml) hardcode the Ubuntu convention at
+# /usr/share/wordlists/dirb/. Symlink so the probes work on both distros.
+if [ -f /usr/share/dirb/wordlists/common.txt ] && [ ! -e /usr/share/wordlists/dirb/common.txt ]; then
+  mkdir -p /usr/share/wordlists/dirb
+  ln -sf /usr/share/dirb/wordlists/common.txt /usr/share/wordlists/dirb/common.txt
+  echo "  dirb wordlist shim: /usr/share/wordlists/dirb/common.txt -> /usr/share/dirb/wordlists/common.txt"
+fi
+
 # --- cloudflared (Cloudflare Tunnel client) ---
 # T1572 — spawns TLS to *.trycloudflare.com with distinctive SNI+JA3.
 echo "=== Installing cloudflared ==="
