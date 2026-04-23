@@ -13,55 +13,91 @@ coexist and can be compared side by side.
   per-attack commentary, remediation suggestions, and drift comparison
   vs. the prior run. The LLM never changes verdicts.
 - **Attack-first vocabulary.** "Attack" everywhere in code and reports,
-  not "probe." Tightens the scope: this is for atomic red team
-  simulations.
+  not "probe."
 
-See the design spec in the plan file (and the git history of PRs
-against `agent-orange/`) for the full rationale.
+## Installing
 
-## Current status
-
-**Foundation only.** This PR lands:
-
-- `attacks.yaml` — 23 atomic red team attacks, ported from
-  `purple-agent/probes.yaml` into a stricter schema.
-- `agent_orange_pkg/catalog.py` — YAML loader + schema validator.
-- `agent_orange_pkg/attribution.py` — pure time-window + dest-match
-  filters.
-- `agent_orange_pkg/verdict.py` — pure tiered classifier.
-- `tests/` — pytest coverage of the three modules (plus a sanity test
-  that the real `attacks.yaml` parses cleanly).
-
-Nothing runs end-to-end yet. Upcoming PRs:
-
-1. `harvest.py` (batch sensor query), `runner.py` (sequential SSH),
-   `ruleset.py` (snapshot + drift).
-2. `render.py` (JSON/HTML/MD), `narrative.py` (Anthropic SDK call),
-   `run.py` + `run.sh` (wire it all up).
-
-## Schema
-
-```yaml
-attacks:
-  - name: art-masscan-syn-burst     # required, unique
-    mitre: T1046                    # required
-    source: atomic-red-team         # required, always this string
-    art_test: "T1046 (masscan)"     # required
-    rationale: "short why"          # required
-    target:                         # required
-      type: victim                  # victim | sni | external
-      value: "{{VICTIM_IP}}"        # victim IP placeholder, SNI, or external host
-    expected_sids: []               # required, int list (empty = expected UNDETECTED)
-    expected_zeek_notices: []       # required, string list
-    expected_verdict: UNDETECTED    # required, DETECTED_EXPECTED | UNDETECTED
-    timeout: 30                     # optional, default 45
-    command: |                      # required
-      timeout 20 sudo masscan ...
+```bash
+pip install -r agent-orange/requirements.txt
 ```
 
-Any entry missing a required field is rejected at load time with a
-clear message. Duplicate names are rejected. `source` must be exactly
-`"atomic-red-team"`.
+Dependencies: `PyYAML` (catalog parsing), `claude-agent-sdk`
+(end-of-run narrative). Both are pinned permissively in
+`requirements.txt`. The narrative step goes through your Claude Code
+subscription auth -- no separate Anthropic API key needed.
+
+## Running
+
+```bash
+# Auto-sources purple-agent/.lab-state (if lab-up.sh has run). Prefers
+# VICTIM_PRIVATE (VPC) over the public VICTIM_IP automatically.
+./agent-orange/run.sh
+
+# Explicit args (no .lab-state needed)
+./agent-orange/run.sh \
+  --attacker-ip A.B.C.D --sensor-ip E.F.G.H \
+  --victim-ip 10.0.1.5  --key path/to/.lab-key
+
+# Run a subset by name or by MITRE technique
+./agent-orange/run.sh --only art-masscan-syn-burst,art-tor-bootstrap
+./agent-orange/run.sh --only-mitre T1046,T1090.003
+
+# Skip the Anthropic narrative (faster, no API key needed)
+./agent-orange/run.sh --no-llm
+
+# Suppress auto-opening the HTML report in a browser
+./agent-orange/run.sh --no-open
+```
+
+The narrative step uses `claude-agent-sdk`, which authenticates via
+your Claude Code subscription (same path purple-agent uses). If the
+`claude` CLI works on your machine, the narrative step will too. Use
+`--no-llm` to skip it entirely; the ledger + report still render,
+just without the LLM-generated prose sections.
+
+## What it produces
+
+Every run emits three artifacts under
+`agent-orange/runs/<run_id>/`:
+
+| File | Purpose |
+|---|---|
+| `ledger.json` | Structured source of truth. Every verdict, every attributed alert/notice, ruleset snapshot + drift, LLM narrative. Machine-readable. |
+| `report.html` | Self-contained HTML (no external assets). Auto-opens in the default browser unless `--no-open` or `PURPLE_AGENT_NO_OPEN=1`. |
+| `report.md` | Terminal / git / wiki-friendly rendering of the same content. |
+
+Plus `runs/index.json` — an ordered list of every run's summary,
+used for drift comparison.
+
+## What it does (pipeline)
+
+```
+1. Load attacks.yaml, apply --only / --only-mitre filters.
+2. SSH to sensor: capture baseline line counts for eve.json + the
+   core Zeek logs (notice, weird, intel, conn).
+3. SSH to sensor: snapshot enabled Suricata SIDs.
+4. For each attack (strictly sequential):
+     - substitute {{VICTIM_IP}} in command + target
+     - record probe_start_ts
+     - SSH to attacker, execute the attack command
+     - record probe_end_ts, classify RAN/FAILED
+5. SSH to sensor ONCE: harvest everything — eve.json forward from
+   baseline, all Zeek protocol logs (http, ssh, ssl, dns, ftp, smtp,
+   files, software, snmp, x509, tunnel, dce_rpc, smb_*, kerberos)
+   plus diagnostic pair (loaded_scripts, stats).
+6. Attribute evidence to each attack by time window + destination
+   match. Classify verdict by pure set operations.
+7. Load prior run's ledger (if runs/index.json has one) for drift
+   comparison.
+8. LLM narrative call: one Anthropic SDK request with the ledger +
+   prior run. Skip if --no-llm. Falls back gracefully on failure.
+9. Render JSON + HTML + MD. Update runs/index.json. Open HTML.
+```
+
+Three SSH calls to sensor total (baseline, ruleset snapshot, harvest).
+**Zero during the attack loop.** Attribution happens entirely after
+the run — no per-attack sensor queries, so Zeek's bucket-flush
+behavior can't cause false UNDETECTED results.
 
 ## Verdicts
 
@@ -78,6 +114,13 @@ clear message. Duplicate names are rejected. `source` must be exactly
 captured and reported alongside the verdict, but never inflates the
 detection count.
 
+## Comparing with purple-agent
+
+Run both agents against the same lab with the same probe / attack set
+and compare the resulting verdicts. Where they agree, trust grows.
+Where they disagree, investigate — often Agent Orange is right because
+its attribution window is wider and doesn't race Zeek's flush cycle.
+
 ## Tests
 
 ```bash
@@ -85,4 +128,21 @@ cd agent-orange
 pytest -q
 ```
 
-Pure-function coverage; no lab required.
+Suite is fixture-driven; no lab required. 200+ cases covering catalog
+validation, attribution boundary math, verdict set operations, SSH
+harvest parsing, runner status classification, ruleset drift math,
+ledger helpers, JSON/HTML/Markdown rendering, narrative LLM
+integration (with fake client), and cross-module integration.
+
+## Known limitations
+
+- **Hourly Zeek log rotation.** A run that crosses the `:00`
+  boundary reads baseline line counts against a freshly rotated log
+  and can miss pre-rotation events. Stay within one hour until
+  rotation detection lands.
+- **IP-range attribution.** Attacks targeting a pool of destination
+  IPs (e.g., Tor DA IPs) without SNI context are not fully attributed
+  under the current model — SNI-based attribution still works for
+  most TLS events. Known follow-up.
+- **LLM narrative needs the `claude` CLI available + network.** Use
+  `--no-llm` if you only need the deterministic ledger.

@@ -277,6 +277,11 @@ def _normalize_generic_zeek(raw: dict, log_name: str) -> dict | None:
     tag for provenance, and all original fields preserved so report
     layers can show rich log-specific context without re-reading the
     source files.
+
+    For intel.log, synthesizes a `note` field so the verdict classifier
+    treats an Intel Framework hit as a Zeek-side detection (it doesn't
+    natively carry a `note` field, so without this it'd be invisible
+    to coverage math).
     """
     ts = parse_zeek_ts(raw.get("ts"))
     if ts is None:
@@ -286,7 +291,27 @@ def _normalize_generic_zeek(raw: dict, log_name: str) -> dict | None:
     out["dest_ip"] = _resolve_dest_ip(raw, log_name)
     out["sni"] = _resolve_sni(raw, log_name)
     out["_log"] = log_name
+    if log_name == "intel.log" and "note" not in out:
+        out["note"] = _synthesize_intel_note(raw)
     return out
+
+
+def _synthesize_intel_note(raw: dict) -> str:
+    """Produce a classifier-friendly note string for a Zeek intel hit.
+
+    Intel events have `matched` (list of Intel types) and
+    `seen.indicator_type`. We prefer `matched[0]` because it's the
+    concrete Intel type the event actually triggered on; fall back to
+    `seen.indicator_type`, then a generic tag so something useful
+    always makes it to the verdict layer.
+    """
+    matched = raw.get("matched")
+    if isinstance(matched, list) and matched and isinstance(matched[0], str):
+        return f"Intel::{matched[0].removeprefix('Intel::')}"
+    indicator_type = raw.get("seen.indicator_type")
+    if isinstance(indicator_type, str) and indicator_type:
+        return f"Intel::{indicator_type.removeprefix('Intel::')}"
+    return "Intel::HIT"
 
 
 # ---------------------------------------------------------------------------
