@@ -1,6 +1,8 @@
 """Unit tests for agent_orange_pkg.narrative.
 
-Anthropic SDK is NOT imported here; a fake client is injected.
+claude-agent-sdk is NOT imported here; a fake invoker callable is
+injected directly into generate_narrative so tests don't spawn a
+`claude` subprocess or need a subscription.
 """
 
 from __future__ import annotations
@@ -8,9 +10,9 @@ from __future__ import annotations
 import json
 
 from agent_orange_pkg.narrative import (
-    EVIDENCE_CAP_PER_ATTACK,
+    EVIDENCE_CAP_PER_ATTACK, SYSTEM_PROMPT,
     _build_user_message, _compact_entry,
-    _extract_text, _require_dict_str, _require_str,
+    _require_dict_str, _require_str,
     generate_narrative,
 )
 from tests._ledger_fixtures import (
@@ -77,38 +79,6 @@ class TestBuildUserMessage:
 
 
 # ---------------------------------------------------------------------------
-#  _extract_text
-# ---------------------------------------------------------------------------
-
-class FakeBlock:
-    def __init__(self, text: str):
-        self.text = text
-
-
-class FakeResponse:
-    def __init__(self, content: list):
-        self.content = content
-
-
-class TestExtractText:
-    def test_object_style_blocks(self):
-        r = FakeResponse([FakeBlock("hello "), FakeBlock("world")])
-        assert _extract_text(r) == "hello world"
-
-    def test_dict_style_blocks(self):
-        r = {"content": [{"text": "hi"}, {"text": " there"}]}
-        assert _extract_text(r) == "hi there"
-
-    def test_missing_content_returns_empty(self):
-        assert _extract_text({}) == ""
-        assert _extract_text(FakeResponse([])) == ""
-
-    def test_non_text_block_ignored(self):
-        r = FakeResponse([FakeBlock("keep"), {"type": "image"}])
-        assert _extract_text(r) == "keep"
-
-
-# ---------------------------------------------------------------------------
 #  _require_* helpers
 # ---------------------------------------------------------------------------
 
@@ -133,69 +103,83 @@ class TestRequireHelpers:
 
 
 # ---------------------------------------------------------------------------
-#  generate_narrative (fake client)
+#  generate_narrative (fake invoker)
 # ---------------------------------------------------------------------------
 
-class FakeMessages:
-    def __init__(self, response):
-        self._response = response
-        self.last_call: dict = {}
+def _canned_json_invoker(
+    exec_summary: str = "summary text",
+    per_attack: dict[str, str] | None = None,
+    remediation: dict[str, str] | None = None,
+    drift: str = "drift text",
+):
+    """Return an invoke(system, user, model) callable that returns canned JSON.
 
-    def create(self, **kwargs):
-        self.last_call = kwargs
-        return self._response
+    Also records its last invocation in `.last_call` for assertion.
+    """
+    payload = json.dumps({
+        "exec_summary": exec_summary,
+        "per_attack_commentary": per_attack or {"a": "commentary"},
+        "remediation_suggestions": remediation or {"a": "rule snippet"},
+        "drift_commentary": drift,
+    })
+    calls: list[dict] = []
 
+    def invoker(system: str, user: str, model: str) -> str:
+        calls.append({"system": system, "user": user, "model": model})
+        return payload
 
-class FakeClient:
-    def __init__(self, response):
-        self.messages = FakeMessages(response)
+    invoker.calls = calls  # type: ignore[attr-defined]
+    return invoker
 
 
 class TestGenerateNarrative:
-    def _valid_response(self, exec_summary: str = "summary text"):
-        payload = {
-            "exec_summary": exec_summary,
-            "per_attack_commentary": {"a": "commentary"},
-            "remediation_suggestions": {"a": "rule snippet"},
-            "drift_commentary": "drift text",
-        }
-        return FakeResponse([FakeBlock(json.dumps(payload))])
-
     def test_happy_path(self):
-        client = FakeClient(self._valid_response("gopher"))
-        n = generate_narrative(make_ledger(), None, client=client)
+        invoke = _canned_json_invoker("gopher")
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
         assert n.available is True
         assert n.exec_summary == "gopher"
         assert n.per_attack_commentary == {"a": "commentary"}
         assert n.remediation_suggestions == {"a": "rule snippet"}
         assert n.drift_commentary == "drift text"
-        assert n.model  # populated
+        assert n.model  # populated from default
         assert n.generated_at > 0
 
+    def test_passes_system_prompt(self):
+        invoke = _canned_json_invoker()
+        generate_narrative(make_ledger(), None, invoke=invoke)
+        assert invoke.calls[0]["system"] == SYSTEM_PROMPT  # type: ignore[attr-defined]
+
+    def test_passes_default_model(self):
+        invoke = _canned_json_invoker()
+        generate_narrative(make_ledger(), None, invoke=invoke)
+        assert invoke.calls[0]["model"] == "claude-opus-4-7"  # type: ignore[attr-defined]
+
+    def test_user_message_is_json(self):
+        invoke = _canned_json_invoker()
+        generate_narrative(make_ledger(), None, invoke=invoke)
+        user_msg = invoke.calls[0]["user"]  # type: ignore[attr-defined]
+        # Should be valid JSON with known top-level keys
+        data = json.loads(user_msg)
+        assert "run_id" in data
+        assert "attacks" in data
+
     def test_non_json_llm_output_returns_unavailable(self):
-        client = FakeClient(FakeResponse([FakeBlock("this is not json")]))
-        n = generate_narrative(make_ledger(), None, client=client)
+        def invoke(system: str, user: str, model: str) -> str:
+            return "this is not json"
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
         assert n.available is False
         assert "not valid JSON" in n.error
 
-    def test_llm_exception_returns_unavailable(self):
-        class BoomMessages:
-            def create(self, **kwargs):
-                raise RuntimeError("api down")
-        class BoomClient:
-            messages = BoomMessages()
-        n = generate_narrative(make_ledger(), None, client=BoomClient())
+    def test_invoker_exception_returns_unavailable(self):
+        def invoke(system: str, user: str, model: str) -> str:
+            raise RuntimeError("api down")
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
         assert n.available is False
         assert "api down" in n.error
 
-    def test_passes_system_prompt_with_cache_control(self):
-        client = FakeClient(self._valid_response())
-        generate_narrative(make_ledger(), None, client=client)
-        system = client.messages.last_call["system"]
-        assert isinstance(system, list)
-        assert system[0]["cache_control"] == {"type": "ephemeral"}
-
-    def test_temperature_is_zero(self):
-        client = FakeClient(self._valid_response())
-        generate_narrative(make_ledger(), None, client=client)
-        assert client.messages.last_call["temperature"] == 0
+    def test_model_override_respected(self):
+        invoke = _canned_json_invoker()
+        generate_narrative(
+            make_ledger(), None, invoke=invoke, model="claude-haiku-4-5",
+        )
+        assert invoke.calls[0]["model"] == "claude-haiku-4-5"  # type: ignore[attr-defined]

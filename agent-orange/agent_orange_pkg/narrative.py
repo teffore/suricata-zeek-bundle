@@ -1,4 +1,4 @@
-"""narrative.py -- single Anthropic SDK call for the end-of-run narrative.
+"""narrative.py -- single claude-agent-sdk call for the end-of-run narrative.
 
 The deterministic pipeline writes the ledger first. This module then
 reads the complete ledger + the most recent prior run's ledger and
@@ -18,37 +18,35 @@ fails for any reason, return a Narrative with available=False so the
 renderer can show "narrative unavailable" and keep the raw ledger
 usable. Pipeline never depends on LLM success.
 
-Anthropic client is injected (keeps the module testable) and optional
-(falls through to building one from env). Tests always inject fakes.
+Uses claude-agent-sdk so the call goes through the user's Claude Code
+subscription (same auth path purple-agent uses). No separate Anthropic
+API key required.
+
+The actual LLM invocation is abstracted behind a callable so tests can
+inject canned responses without spawning a subprocess.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
-from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Callable
 
 from agent_orange_pkg.ledger import AttackLedgerEntry, Narrative, RunLedger
 
 
 DEFAULT_MODEL = "claude-opus-4-7"
-DEFAULT_MAX_TOKENS = 4096
 # Cap evidence passed to the LLM per attack so very noisy probes don't
-# blow the context window. The full evidence stays in the ledger; LLM
-# just gets a representative slice.
+# blow the context window. Full evidence stays in the ledger; LLM just
+# gets a representative slice.
 EVIDENCE_CAP_PER_ATTACK = 8
 
 
-class AnthropicClient(Protocol):
-    """Subset of the Anthropic SDK we use.
-
-    Defined as a Protocol so fakes can duck-type without subclassing
-    the real client. Real anthropic.Anthropic() satisfies this because
-    it exposes .messages.create(...).
-    """
-    messages: Any  # real client exposes .messages.create(...)
+# An InvokeLLM is (system_prompt, user_message, model) -> response_text.
+# Production uses _real_invoke_llm via claude-agent-sdk. Tests pass a
+# fake function that returns canned text -- no subprocess, no SDK.
+InvokeLLM = Callable[[str, str, str], str]
 
 
 SYSTEM_PROMPT = """\
@@ -95,47 +93,39 @@ outside the JSON:
 """
 
 
+# ---------------------------------------------------------------------------
+#  Public API
+# ---------------------------------------------------------------------------
+
 def generate_narrative(
     ledger: RunLedger,
     prior_ledger: RunLedger | None,
     *,
-    client: AnthropicClient | None = None,
+    invoke: InvokeLLM | None = None,
     model: str = DEFAULT_MODEL,
 ) -> Narrative:
     """Produce a Narrative for the given ledger.
 
-    If `client` is None, try to instantiate anthropic.Anthropic() from
-    the environment. If that raises, return an unavailable Narrative
-    with a descriptive error -- the pipeline continues.
-    """
-    try:
-        real_client = client or _default_client()
-    except Exception as exc:  # pragma: no cover -- import/env failure
-        return _unavailable(f"LLM client init failed: {exc}")
+    By default calls claude-agent-sdk (uses the user's Claude Code
+    subscription auth -- no ANTHROPIC_API_KEY needed). Pass `invoke`
+    for tests or to swap in a different provider.
 
+    Any exception during the LLM call or any non-JSON response produces
+    an unavailable Narrative with a descriptive error. The pipeline
+    continues either way.
+    """
     try:
         user_message = _build_user_message(ledger, prior_ledger)
     except Exception as exc:
         return _unavailable(f"LLM input build failed: {exc}")
 
+    invoker = invoke or _real_invoke_llm
+
     try:
-        response = real_client.messages.create(
-            model=model,
-            max_tokens=DEFAULT_MAX_TOKENS,
-            temperature=0,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_message}],
-        )
+        text = invoker(SYSTEM_PROMPT, user_message, model)
     except Exception as exc:
         return _unavailable(f"LLM call failed: {exc}")
 
-    text = _extract_text(response)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -157,7 +147,49 @@ def generate_narrative(
 
 
 # ---------------------------------------------------------------------------
-#  Helpers (pure, testable)
+#  claude-agent-sdk bridge (production invoker)
+# ---------------------------------------------------------------------------
+
+def _real_invoke_llm(system_prompt: str, user_message: str, model: str) -> str:
+    """Call claude-agent-sdk.query() synchronously, return concatenated text.
+
+    Wraps the async iterator from `query()` with asyncio.run so callers
+    can stay sync. claude-agent-sdk invokes the local `claude` CLI,
+    which authenticates via the user's Claude Code subscription.
+    """
+    return asyncio.run(_query_and_collect(system_prompt, user_message, model))
+
+
+async def _query_and_collect(
+    system_prompt: str, user_message: str, model: str,
+) -> str:  # pragma: no cover -- requires live claude CLI
+    # Imports inside the function so test environments without the SDK
+    # still pass -- the default path is only reached when no invoker
+    # was injected.
+    from claude_agent_sdk import (
+        AssistantMessage, ClaudeAgentOptions, TextBlock, query,
+    )
+
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        model=model,
+        # One-shot completion: we only need the LLM's reply, not tool
+        # execution. Leaving allowed_tools empty + max_turns=1 ensures
+        # the CLI doesn't start an agent loop.
+        max_turns=1,
+    )
+
+    parts: list[str] = []
+    async for message in query(prompt=user_message, options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    parts.append(block.text)
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+#  Pure helpers (testable without claude-agent-sdk)
 # ---------------------------------------------------------------------------
 
 def _unavailable(error: str) -> Narrative:
@@ -171,36 +203,6 @@ def _unavailable(error: str) -> Narrative:
         model="",
         error=error,
     )
-
-
-def _default_client():  # pragma: no cover -- requires real anthropic SDK
-    import anthropic
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY environment variable not set")
-    return anthropic.Anthropic(api_key=api_key)
-
-
-def _extract_text(response: Any) -> str:
-    """Pull text content out of an Anthropic messages.create() response.
-
-    Handles real SDK response objects (content is a list of blocks) and
-    fake dict/list responses injected by tests.
-    """
-    content = getattr(response, "content", None)
-    if content is None and isinstance(response, dict):
-        content = response.get("content")
-    if content is None:
-        return ""
-    text_parts: list[str] = []
-    for block in content:
-        # Real SDK blocks have a .text attribute; dict fakes use ["text"].
-        t = getattr(block, "text", None)
-        if t is None and isinstance(block, dict):
-            t = block.get("text")
-        if isinstance(t, str):
-            text_parts.append(t)
-    return "".join(text_parts)
 
 
 def _require_str(data: dict, key: str) -> str:
@@ -225,7 +227,7 @@ def _build_user_message(
     Evidence lists are capped at EVIDENCE_CAP_PER_ATTACK to keep
     token count bounded.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "run_id": ledger.run_id,
         "victim_ip": ledger.victim_ip,
         "wall_clock_seconds": ledger.total_seconds(),
@@ -236,9 +238,7 @@ def _build_user_message(
             "enabled_sid_count": len(ledger.ruleset_snapshot.enabled_sids),
             "hash": ledger.ruleset_snapshot.hash,
         },
-        "attacks": [
-            _compact_entry(e) for e in ledger.attacks
-        ],
+        "attacks": [_compact_entry(e) for e in ledger.attacks],
     }
     if ledger.ruleset_drift is not None:
         payload["ruleset_drift"] = {

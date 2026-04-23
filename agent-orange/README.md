@@ -21,8 +21,10 @@ coexist and can be compared side by side.
 pip install -r agent-orange/requirements.txt
 ```
 
-Dependencies: `PyYAML` (catalog parsing), `anthropic` (end-of-run
-narrative). Both are pinned permissively in `requirements.txt`.
+Dependencies: `PyYAML` (catalog parsing), `claude-agent-sdk`
+(end-of-run narrative). Both are pinned permissively in
+`requirements.txt`. The narrative step goes through your Claude Code
+subscription auth -- no separate Anthropic API key needed.
 
 ## Running
 
@@ -47,9 +49,11 @@ narrative). Both are pinned permissively in `requirements.txt`.
 ./agent-orange/run.sh --no-open
 ```
 
-The narrative step requires `ANTHROPIC_API_KEY` in the environment.
-Without it, use `--no-llm`; the ledger + report still render, just
-without the LLM-generated prose sections.
+The narrative step uses `claude-agent-sdk`, which authenticates via
+your Claude Code subscription (same path purple-agent uses). If the
+`claude` CLI works on your machine, the narrative step will too. Use
+`--no-llm` to skip it entirely; the ledger + report still render,
+just without the LLM-generated prose sections.
 
 ## What it produces
 
@@ -139,5 +143,5 @@ integration (with fake client), and cross-module integration.
   IPs (e.g., Tor DA IPs) without SNI context are not fully attributed
   under the current model — SNI-based attribution still works for
   most TLS events. Known follow-up.
-- **LLM narrative requires network + API key.** Use `--no-llm` if
-  you only need the deterministic ledger.
+- **LLM narrative needs the `claude` CLI available + network.** Use
+  `--no-llm` if you only need the deterministic ledger.
