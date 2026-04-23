@@ -442,6 +442,35 @@ class TestLedgerToDict:
         assert d["ruleset_drift"]["added_sids"] == [2, 5]
         assert d["ruleset_drift"]["removed_sids"] == [7, 9]
 
+    def test_ledger_to_dict_keys_unchanged_across_rerender(self):
+        # Guard against anyone adding a new key to ledger_to_dict's output
+        # while "just rewiring the renderer". The contract for JSON
+        # consumers (future CI gates, diff scripts) is key-stable.
+        ledger = make_ledger()
+        first = ledger_to_dict(ledger)
+        second = ledger_to_dict(ledger)
+
+        def deep_keys(obj, prefix=""):
+            found = set()
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    path = f"{prefix}.{k}" if prefix else k
+                    found.add(path)
+                    found |= deep_keys(v, path)
+            elif isinstance(obj, list) and obj:
+                # Only descend first element; lists of dicts should be
+                # key-homogeneous.
+                found |= deep_keys(obj[0], f"{prefix}[]")
+            return found
+
+        assert deep_keys(first) == deep_keys(second)
+        # Spot-check expected top-level keys stayed
+        top = set(first.keys())
+        assert {
+            "run_id", "started_at", "ended_at", "victim_ip", "attacks",
+            "ruleset_snapshot", "narrative", "summary",
+        } <= top
+
 
 # ---------------------------------------------------------------------------
 #  write_json
