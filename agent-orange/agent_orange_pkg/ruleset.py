@@ -31,7 +31,11 @@ from typing import Callable
 # Same runner protocol as harvest.py — (command) -> (stdout, stderr, rc).
 SshRunner = Callable[[str], tuple[str, str, int]]
 
-SURICATA_RULES_GLOB = "/etc/suricata/rules/*.rules"
+# Suricata 8 via `suricata-update` on Ubuntu places rules under
+# /var/lib/suricata/rules/, NOT /etc/suricata/rules/. The directory is
+# typically group-readable by `suricata` only, so the glob must expand
+# inside sudo (see build_snapshot_command).
+SURICATA_RULES_GLOB = "/var/lib/suricata/rules/*.rules"
 SID_PATTERN = re.compile(r"\bsid\s*:\s*(\d+)\s*;", re.IGNORECASE)
 
 
@@ -69,22 +73,24 @@ class RulesetDrift:
 # ---------------------------------------------------------------------------
 
 def build_snapshot_command() -> str:
-    """Emit enabled SIDs to stdout, one per line.
+    r"""Emit enabled SIDs to stdout, one per line.
 
-    Uses grep across all .rules files under /etc/suricata/rules/. Handles
-    glob-no-match with `shopt -s nullglob` so an empty directory doesn't
-    fail the whole pipeline. Comment lines (starting with #) are excluded
-    because they aren't enabled rules.
+    Pipeline:
+      1. ``sudo sh -c 'cat /var/lib/suricata/rules/*.rules'`` -- glob
+         expansion runs inside the sudo'd shell because the rules
+         directory is typically group-readable by ``suricata`` only;
+         the ubuntu caller can't list it, so an outside-sudo glob
+         expands to nothing.
+      2. Drop comment lines.
+      3. Extract sid values. Uses POSIX ``[[:space:]]`` because ``\s``
+         is a Perl regex extension that isn't reliably supported by
+         ``grep -E`` across distros.
+      4. ``sort -un`` for determinism.
     """
-    # Single-command pipeline:
-    # 1. concatenate all .rules files (sudo; may be root-owned)
-    # 2. drop comment lines
-    # 3. extract sid values
-    # 4. sort -u for determinism
     return (
-        f"shopt -s nullglob; sudo cat {SURICATA_RULES_GLOB} 2>/dev/null "
-        r"| grep -v '^\s*#' "
-        r"| grep -oE 'sid\s*:\s*[0-9]+' "
+        f"sudo sh -c 'cat {SURICATA_RULES_GLOB} 2>/dev/null' "
+        r"| grep -v '^[[:space:]]*#' "
+        r"| grep -oE 'sid[[:space:]]*:[[:space:]]*[0-9]+' "
         r"| grep -oE '[0-9]+' "
         "| sort -un"
     )
