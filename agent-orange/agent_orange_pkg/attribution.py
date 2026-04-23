@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-# Default grace window (seconds) appended to the attack's probe_end_ts.
+# Default grace window (seconds) appended to the attack's end timestamp.
 # Covers small clock drift between attacker and sensor and slight delay
 # between the attack command returning and the first packet landing on
 # the sensor.
@@ -118,7 +118,10 @@ def filter_events(
     out: list[dict[str, Any]] = []
     for event in events:
         ts = event.get("ts")
-        if not isinstance(ts, (int, float)):
+        # `isinstance(True, int)` is True in Python; explicitly exclude bool
+        # so a harvest bug producing a boolean ts doesn't silently land in
+        # attack windows as epoch 0/1. Mirrors verdict._extract_sids hygiene.
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
             continue
         if not in_time_window(float(ts), attack_start_ts, attack_end_ts, grace_seconds):
             continue

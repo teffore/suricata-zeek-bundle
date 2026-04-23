@@ -105,7 +105,7 @@ attacks:
     timeout: 10
     command: |
       timeout 5 whois -h {{VICTIM_IP}} -p 8443 "Hello from Atomic Red Team test T1105" 2>&1 | head -5 || true
-      echo "whois tunnel probe sent to {{VICTIM_IP}}:8443"
+      echo "whois tunnel attack sent to {{VICTIM_IP}}:8443"
 
   - name: art-rsync-daemon-pull
     mitre: T1105
@@ -284,7 +284,10 @@ attacks:
       value: "{{VICTIM_IP}}"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    # Initial port: verdict set UNDETECTED until real SIDs are enumerated from
+    # an actual lab run. Upgrade to DETECTED_EXPECTED with populated SIDs in a
+    # follow-up once the rule stack's response is observed.
+    expected_verdict: UNDETECTED
     timeout: 20
     command: |
       curl -sS --max-time 3 -A 'HttpBrowser/1.0' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
@@ -303,9 +306,15 @@ attacks:
     art_test: "T1090.003 #3"
     rationale: "Tor client bootstrap -- directory-authority TLS, ET TOR reputation hits"
     target:
+      # Tor bootstrap reaches a small pool of hardcoded directory authorities.
+      # Using `sni` with a torproject.org substring attributes the handshake
+      # events in ssl.log (moria1.torproject.org etc.); Suricata IP-based ET
+      # TOR rules that fire on DA dest_ips without SNI context may miss
+      # attribution under the current (SNI/exact-IP) model -- a known limitation
+      # worth tracking as a future attribution-model enhancement.
       type: sni
-      value: "tor-directory-authorities"
-    expected_sids: []
+      value: "torproject.org"
+    expected_sids: [2400004, 2520110, 2522110, 2522306, 2522710]
     expected_zeek_notices: []
     expected_verdict: DETECTED_EXPECTED
     timeout: 25
@@ -329,7 +338,7 @@ attacks:
       value: "{{VICTIM_IP}}"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    expected_verdict: UNDETECTED
     timeout: 45
     command: |
       timeout 30 ffuf -u "http://{{VICTIM_IP}}:8081/FUZZ" \
@@ -346,7 +355,7 @@ attacks:
       value: "{{VICTIM_IP}}"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    expected_verdict: UNDETECTED
     timeout: 60
     command: |
       timeout 45 slowhttptest -c 500 -H -i 10 -r 200 -t GET \
@@ -362,7 +371,7 @@ attacks:
       value: "{{VICTIM_IP}}"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    expected_verdict: UNDETECTED
     timeout: 30
     command: |
       timeout 20 ab -n 5000 -c 50 -r -q "http://{{VICTIM_IP}}:8081/login.php" 2>&1 | tail -15 || true
@@ -377,7 +386,7 @@ attacks:
       value: "{{VICTIM_IP}}"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    expected_verdict: UNDETECTED
     timeout: 25
     command: |
       timeout 15 dnscat --dns "server={{VICTIM_IP}},port=53" \
@@ -393,7 +402,7 @@ attacks:
       value: "{{VICTIM_IP}}"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    expected_verdict: UNDETECTED
     timeout: 45
     command: |
       printf 'admin\nroot\nftp\nanonymous\n'  > /tmp/art-ftp-users.txt
@@ -405,14 +414,14 @@ attacks:
   - name: art-snmp-community-brute
     mitre: T1110.001
     source: atomic-red-team
-    art_test: "T1110.001 (SNMP community -- community probe)"
+    art_test: "T1110.001 (SNMP community -- community brute)"
     rationale: "SNMP community string enumeration -- ET rules on repeated GetRequest with varying communities"
     target:
       type: victim
       value: "{{VICTIM_IP}}"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    expected_verdict: UNDETECTED
     timeout: 30
     command: |
       for c in public private admin cisco snmp community manager monitor default; do
@@ -429,7 +438,7 @@ attacks:
       value: "anydesk.com,teamviewer.com,master7.teamviewer.com,rustdesk.com,agent.atera.com,instance.screenconnect.com"
     expected_sids: []
     expected_zeek_notices: []
-    expected_verdict: DETECTED_EXPECTED
+    expected_verdict: UNDETECTED
     timeout: 45
     command: |
       for domain in anydesk.com teamviewer.com master7.teamviewer.com \

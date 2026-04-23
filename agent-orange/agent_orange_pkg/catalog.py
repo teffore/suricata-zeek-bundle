@@ -21,7 +21,10 @@ REQUIRED_ATTACK_FIELDS = (
     "target", "expected_sids", "expected_zeek_notices",
     "expected_verdict", "command",
 )
+OPTIONAL_ATTACK_FIELDS = ("timeout",)
+KNOWN_ATTACK_FIELDS = frozenset(REQUIRED_ATTACK_FIELDS) | frozenset(OPTIONAL_ATTACK_FIELDS)
 REQUIRED_TARGET_FIELDS = ("type", "value")
+KNOWN_TARGET_FIELDS = frozenset(REQUIRED_TARGET_FIELDS)
 DEFAULT_TIMEOUT_SECONDS = 45
 
 
@@ -121,6 +124,17 @@ def _parse_entry(entry: Any, idx: int) -> Attack:
             f"attack {name_hint!r} missing required fields: {', '.join(missing)}"
         )
 
+    # Reject unknown fields -- catches typos like `expected_sid:` vs the
+    # correct `expected_sids:` which would otherwise be silently dropped
+    # and produce mysterious verdicts later.
+    unknown = [f for f in entry if f not in KNOWN_ATTACK_FIELDS]
+    if unknown:
+        name_hint = entry.get("name", f"<entry #{idx}>")
+        raise CatalogError(
+            f"attack {name_hint!r} has unknown fields: {', '.join(sorted(unknown))}. "
+            f"Known fields: {', '.join(sorted(KNOWN_ATTACK_FIELDS))}."
+        )
+
     name = _require_str(entry["name"], f"entry #{idx}: name")
     mitre = _require_str(entry["mitre"], f"{name}: mitre")
     source = _require_str(entry["source"], f"{name}: source")
@@ -145,8 +159,29 @@ def _parse_entry(entry: Any, idx: int) -> Attack:
             f"{sorted(VALID_EXPECTED_VERDICTS)}, got {expected_verdict!r}"
         )
 
+    # Cross-validation: expected_verdict must be internally consistent with
+    # the expected signal lists. A DETECTED_EXPECTED attack with empty
+    # expected lists is impossible -- the classifier cannot return
+    # DETECTED_EXPECTED for empty expectations. An UNDETECTED attack with
+    # non-empty expected lists is also contradictory.
+    total_expected = len(expected_sids) + len(expected_zeek_notices)
+    if expected_verdict == "DETECTED_EXPECTED" and total_expected == 0:
+        raise CatalogError(
+            f"{name}: expected_verdict DETECTED_EXPECTED requires at least one "
+            f"expected_sids entry or expected_zeek_notices entry. Populate the "
+            f"SIDs/notices you expect this attack to fire, or switch the verdict "
+            f"to UNDETECTED if the detection is unknown."
+        )
+    if expected_verdict == "UNDETECTED" and total_expected > 0:
+        raise CatalogError(
+            f"{name}: expected_verdict UNDETECTED is inconsistent with non-empty "
+            f"expected signal lists ({len(expected_sids)} SIDs, "
+            f"{len(expected_zeek_notices)} notices). Clear the lists or switch "
+            f"the verdict to DETECTED_EXPECTED."
+        )
+
     timeout = entry.get("timeout", DEFAULT_TIMEOUT_SECONDS)
-    if not isinstance(timeout, int) or timeout <= 0:
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise CatalogError(
             f"{name}: timeout must be a positive int, got {timeout!r}"
         )
@@ -172,6 +207,12 @@ def _parse_target(value: Any, name: str) -> Target:
     missing = [f for f in REQUIRED_TARGET_FIELDS if f not in value]
     if missing:
         raise CatalogError(f"{name}: target missing fields: {', '.join(missing)}")
+    unknown = [f for f in value if f not in KNOWN_TARGET_FIELDS]
+    if unknown:
+        raise CatalogError(
+            f"{name}: target has unknown fields: {', '.join(sorted(unknown))}. "
+            f"Known fields: {', '.join(sorted(KNOWN_TARGET_FIELDS))}."
+        )
     t_type = _require_str(value["type"], f"{name}: target.type")
     if t_type not in VALID_TARGET_TYPES:
         raise CatalogError(

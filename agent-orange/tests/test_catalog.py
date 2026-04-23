@@ -81,12 +81,16 @@ class TestHappyPath:
         assert attacks[0].target == Target(type="sni", value="trycloudflare.com")
 
     def test_expected_verdict_undetected(self, tmp_path: Path):
+        # UNDETECTED requires empty expected lists per the cross-validator.
         content = MINIMAL.replace(
             "expected_verdict: DETECTED_EXPECTED",
             "expected_verdict: UNDETECTED",
+        ).replace(
+            "expected_sids: [2001219]", "expected_sids: []"
         )
         attacks = load_attacks_yaml(_write(tmp_path, content))
         assert attacks[0].expected_verdict == "UNDETECTED"
+        assert attacks[0].expected_sids == ()
 
     def test_multiple_attacks_preserved_in_order(self, tmp_path: Path):
         block_template = dedent(
@@ -164,6 +168,45 @@ class TestRejection:
         with pytest.raises(CatalogError, match="timeout must be a positive int"):
             load_attacks_yaml(_write(tmp_path, bad))
 
+    def test_unknown_attack_field_rejected(self, tmp_path: Path):
+        # A typo like `expected_sid:` (singular) next to the real field should
+        # raise, not silently drop the value.
+        bad = MINIMAL.replace(
+            "    expected_sids: [2001219]\n",
+            "    expected_sids: [2001219]\n    expected_sid: 9999\n",
+        )
+        with pytest.raises(CatalogError, match="unknown fields"):
+            load_attacks_yaml(_write(tmp_path, bad))
+
+    def test_unknown_target_field_rejected(self, tmp_path: Path):
+        bad = MINIMAL.replace(
+            "      value: \"{{VICTIM_IP}}\"\n",
+            "      value: \"{{VICTIM_IP}}\"\n      typo_field: true\n",
+        )
+        with pytest.raises(CatalogError, match="target has unknown fields"):
+            load_attacks_yaml(_write(tmp_path, bad))
+
+    def test_detected_expected_with_empty_lists_rejected(self, tmp_path: Path):
+        # Cross-validation: can't declare DETECTED_EXPECTED with empty
+        # expected lists -- the classifier can't possibly return
+        # DETECTED_EXPECTED under that combination.
+        bad = MINIMAL.replace(
+            "expected_sids: [2001219]", "expected_sids: []"
+        )
+        with pytest.raises(
+            CatalogError, match="DETECTED_EXPECTED requires at least one"
+        ):
+            load_attacks_yaml(_write(tmp_path, bad))
+
+    def test_undetected_with_nonempty_lists_rejected(self, tmp_path: Path):
+        bad = MINIMAL.replace(
+            "expected_verdict: DETECTED_EXPECTED", "expected_verdict: UNDETECTED"
+        )
+        with pytest.raises(
+            CatalogError, match="UNDETECTED is inconsistent with non-empty"
+        ):
+            load_attacks_yaml(_write(tmp_path, bad))
+
     def test_duplicate_names(self, tmp_path: Path):
         # Second list item must sit at col 2 (same as first `- name:` under
         # `attacks:`), with fields at col 4. Do not use dedent() here -- the
@@ -203,3 +246,24 @@ class TestRealAttacksYaml:
         assert len({a.name for a in attacks}) == len(attacks)
         # All have a MITRE technique
         assert all(a.mitre.startswith("T") for a in attacks)
+
+    def test_real_file_verdict_consistency(self):
+        # Every attack's expected_verdict must be internally consistent
+        # with its expected signal lists. The cross-validator in catalog.py
+        # enforces this at load time, so if this test ever fails it means
+        # either the validator regressed or attacks.yaml was edited by
+        # hand without running it through the loader first.
+        real = Path(__file__).resolve().parent.parent / "attacks.yaml"
+        attacks = load_attacks_yaml(real)
+        for a in attacks:
+            total_expected = len(a.expected_sids) + len(a.expected_zeek_notices)
+            if a.expected_verdict == "DETECTED_EXPECTED":
+                assert total_expected > 0, (
+                    f"{a.name}: DETECTED_EXPECTED with no expected signals"
+                )
+            if a.expected_verdict == "UNDETECTED":
+                assert total_expected == 0, (
+                    f"{a.name}: UNDETECTED with non-empty expected lists "
+                    f"({len(a.expected_sids)} SIDs, "
+                    f"{len(a.expected_zeek_notices)} notices)"
+                )

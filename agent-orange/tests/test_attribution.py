@@ -133,6 +133,17 @@ class TestFilterEvents:
         out = filter_events(events, 0, 100, "victim", "1.1.1.1")
         assert out == []
 
+    def test_bool_ts_dropped(self):
+        # `isinstance(True, int)` is True in Python; filter_events must
+        # explicitly reject bool ts so a harvest bug doesn't silently land
+        # in attack windows as epoch 0/1.
+        events = [
+            self._ev(True,  dest_ip="1.1.1.1"),
+            self._ev(False, dest_ip="1.1.1.1"),
+        ]
+        out = filter_events(events, 0, 100, "victim", "1.1.1.1")
+        assert out == []
+
     def test_empty_input(self):
         assert filter_events([], 0, 100, "victim", "1.1.1.1") == []
 

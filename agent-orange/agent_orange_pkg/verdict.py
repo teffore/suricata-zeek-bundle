@@ -62,7 +62,7 @@ def classify(
     expected_notice_set = set(expected_zeek_notices)
 
     # How many of each expected signal fired? Totals include both SID
-    # and notice expectations; a probe can declare both.
+    # and notice expectations; an attack can declare both.
     sid_expected_hit = fired_sids & expected_sid_set
     notice_expected_hit = fired_notices & expected_notice_set
     total_expected = len(expected_sid_set) + len(expected_notice_set)
