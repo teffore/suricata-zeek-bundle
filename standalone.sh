@@ -520,9 +520,14 @@ redef Stats::report_interval = 60 sec;
 # Scan::Port_Scan and Scan::Address_Scan notices. Thresholds tuned down from
 # defaults (25 / 250) for lab sensitivity so short nmap -T4 --top-ports 20
 # bursts produce notices within one probe cycle.
+#
+# local_scan_threshold dropped to 5 (from 50) after a masscan probe with 8
+# target ports repeatedly missed detection — LOCAL_NETS-to-LOCAL_NETS scans in
+# this lab are always adversarial by construction, so a low threshold is safe
+# and catches tight-port scans like `masscan -p 22,80,443,445,3389,8080,8081,8443`.
 @load packages/bro-simple-scan
 redef Scan::scan_threshold = 10;
-redef Scan::local_scan_threshold = 50;
+redef Scan::local_scan_threshold = 5;
 redef Scan::knockknock_threshold = 5;
 redef Scan::scan_timeout = 2 mins;
 
@@ -708,7 +713,14 @@ exit 0
 # histogram by volume). Real ICMP is covered by Suricata's decoder-event
 # rules + ET ICMP + our C2 - Large ICMP payload sig (9000612).
 alert tcp any any -> $HOME_NET 22 (msg:"TEST - SSH connection to HOME_NET"; sid:9000002; rev:2;)
-alert tcp any any -> $HOME_NET any (msg:"TEST - TCP SYN scan detected"; flags:S,12; threshold:type both, track by_src, count 5, seconds 60; sid:9000003; rev:2;)
+# 9000003 suppression window shortened 60s -> 10s (rev:3) because chained
+# scan probes from the same attacker IP (gobuster -> masscan within 60s, as
+# the purple-agent runs them) were getting silently suppressed: only the
+# first tool's alert fired, subsequent scans within 60s fell inside the
+# `type both` suppression window. 10s is long enough to dedupe a single
+# scan burst's rapid-fire SYNs but short enough that the next distinct scan
+# probe gets its own alert. Real adversaries chain scan tools this way too.
+alert tcp any any -> $HOME_NET any (msg:"TEST - TCP SYN scan detected"; flags:S,12; threshold:type both, track by_src, count 5, seconds 10; sid:9000003; rev:3;)
 
 # ========== DNS tunneling detection rules ==========
 
