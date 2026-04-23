@@ -22,6 +22,13 @@ on these events.
 
 SSH I/O is abstracted via a runner callable so tests can inject fake
 harvest responses without touching a real sensor.
+
+Known constraint: Zeek rotates current/*.log hourly. An Agent Orange run
+that crosses the hour boundary may read baseline line counts against a
+freshly rotated file, silently losing events in the baseline-to-rotation
+window. The target scope (a 23-attack ART battery) stays well inside one
+hour, so this is tolerable now. A future fix can detect rotation via
+stat's inode or mtime and fall back to a timestamp-filtered full read.
 """
 
 from __future__ import annotations
@@ -217,20 +224,67 @@ def _normalize_zeek_notice(raw: dict) -> dict | None:
     }
 
 
+def _resolve_dest_ip(raw: dict, log_name: str) -> str | None:
+    """Return the destination IP for a Zeek event, log-name aware.
+
+    Zeek's log schemas vary: most logs use `id.resp_h`, but software.log uses
+    `host`, files.log uses `rx_hosts` (a set of addrs for file receivers),
+    and a few older logs use `dst`. Fall back to the common keys when no
+    per-log mapping applies so we degrade gracefully on future logs.
+    """
+    if log_name == "software.log":
+        host = raw.get("host")
+        return host if isinstance(host, str) else None
+    if log_name == "files.log":
+        rx = raw.get("rx_hosts")
+        if isinstance(rx, list) and rx and isinstance(rx[0], str):
+            return rx[0]
+        return None
+    for key in ("id.resp_h", "dst"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _resolve_sni(raw: dict, log_name: str) -> str | None:
+    """Return the SNI (or equivalent hostname) for a Zeek event.
+
+    Only logs that carry a meaningful hostname field contribute to SNI
+    attribution: ssl.log/x509.log (`server_name`), http.log (`host`),
+    dns.log (`query`). For software.log `host` is an IP, not a hostname,
+    so it must NOT leak into the sni field (earlier versions did -- the
+    reviewer caught this).
+    """
+    if log_name in ("ssl.log", "x509.log"):
+        value = raw.get("server_name")
+        return value if isinstance(value, str) else None
+    if log_name == "http.log":
+        value = raw.get("host")
+        return value if isinstance(value, str) else None
+    if log_name == "dns.log":
+        value = raw.get("query")
+        return value if isinstance(value, str) else None
+    # Default: accept server_name if present, no other guesses.
+    value = raw.get("server_name")
+    return value if isinstance(value, str) else None
+
+
 def _normalize_generic_zeek(raw: dict, log_name: str) -> dict | None:
-    """Best-effort normalization for any Zeek log with id.resp_h-shaped fields."""
+    """Best-effort normalization for any Zeek log.
+
+    Produces a dict with `ts` (epoch float), `dest_ip`, `sni`, a `_log`
+    tag for provenance, and all original fields preserved so report
+    layers can show rich log-specific context without re-reading the
+    source files.
+    """
     ts = parse_zeek_ts(raw.get("ts"))
     if ts is None:
         return None
-    # Pass through the raw log keeping ALL original fields, but injecting
-    # normalized ts/dest_ip/sni for attribution. Preserving original keys
-    # lets the report still display rich log-specific context.
     out = dict(raw)
     out["ts"] = ts
-    if "dest_ip" not in out:
-        out["dest_ip"] = raw.get("id.resp_h") or raw.get("dst") or raw.get("h")
-    if "sni" not in out:
-        out["sni"] = raw.get("server_name") or raw.get("host")
+    out["dest_ip"] = _resolve_dest_ip(raw, log_name)
+    out["sni"] = _resolve_sni(raw, log_name)
     out["_log"] = log_name
     return out
 

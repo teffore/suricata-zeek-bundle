@@ -151,7 +151,10 @@ def run_attack(
         probe_start_ts=start_ts,
         probe_end_ts=end_ts,
         status=status,
-        exit_code=result.exit_code if not result.ssh_error else None,
+        # Preserve raw exit_code even when ssh_error is set; operators
+        # debugging intermittent auth failures want the 255 alongside the
+        # transport-error message, not None.
+        exit_code=result.exit_code,
         stdout=result.stdout,
         stderr=result.stderr,
         error=error,

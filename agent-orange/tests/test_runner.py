@@ -132,7 +132,9 @@ class TestRunAttack:
         run = run_attack(_attack(), "10.0.0.5", fake)
         assert run.status == RUN_STATUS_FAILED
         assert "ssh transport error" in run.error
-        assert run.exit_code is None  # cleared when ssh_error set
+        # exit_code preserved even when ssh_error is set -- operators
+        # debugging intermittent auth failures want the 255 too.
+        assert run.exit_code == 255
 
     def test_nonzero_exit_returns_failed(self):
         def fake(cmd: str, timeout: int) -> AttackResult:

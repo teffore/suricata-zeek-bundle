@@ -194,6 +194,21 @@ class TestParseSections:
         assert "NOT_A_SECTION" not in out
         assert out["REAL"] == ["world"]
 
+    def test_json_payload_matching_section_pattern_is_a_header(self):
+        # Known theoretical edge case: if a log value were literally a line
+        # that started `=== ` and ended ` ===`, parse_sections would treat
+        # it as a section header. No real sensor produces such lines today,
+        # but this test documents the behavior so future hardening (e.g.
+        # switching to a unique marker) has a canary. If this assertion
+        # ever surprises someone, that's the moment to strengthen the
+        # marker contract.
+        raw = "=== HEADER ===\nreal content\n=== UNLIKELY INNER ===\nleaked\n"
+        out = parse_sections(raw)
+        # The "UNLIKELY INNER" line becomes its own section, swallowing
+        # the following line. This is the current behavior, not a goal.
+        assert "HEADER" in out
+        assert "UNLIKELY INNER" in out
+
 
 # ---------------------------------------------------------------------------
 #  Command builders
