@@ -24,3 +24,9 @@ purple-agent/benchmarks/results/*.json
 purple-agent/benchmarks/results/*.log
 !purple-agent/benchmarks/baseline.json
 
+# Agent Orange per-run output directories — noisy in git. Each run is
+# self-contained under agent-orange/runs/<ts>/. A baseline run can be
+# committed by name (e.g., agent-orange/runs/baseline-YYYYMMDD/).
+agent-orange/runs/*/
+!agent-orange/runs/baseline-*/
+
