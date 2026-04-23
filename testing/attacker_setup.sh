@@ -180,9 +180,14 @@ echo "  flightsim: $(flightsim --help 2>&1 | head -1 || echo 'not installed')"
 #   apache2-utils  — T1499.002 ApacheBench flood (ab)
 #   dnscat2        — T1071.004 DNS C2 (/usr/bin/dnscat client,
 #                    /usr/bin/dnscat2-server server)
+#   snmp           — T1110.001 SNMP community-string enum (snmpget/snmpwalk)
+#   enum4linux     — T1087.002 SMB user/share enumeration (legacy perl)
+#   enum4linux-ng  — T1087.002 rewrite of enum4linux with modern protocol support
+#   nbtscan        — T1046 NetBIOS name-service scan
 echo "=== Installing TIER2 atomic-red-team toolkit ==="
 TIER2=(rsync socat masscan gobuster ffuf feroxbuster whois fping arp-scan \
-       slowhttptest dsniff knockd tor rclone apache2-utils dnscat2)
+       slowhttptest dsniff knockd tor rclone apache2-utils dnscat2 snmp \
+       enum4linux enum4linux-ng nbtscan)
 t2_installed=()
 t2_failed=()
 for pkg in "${TIER2[@]}"; do
