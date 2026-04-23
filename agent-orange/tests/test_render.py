@@ -229,6 +229,42 @@ class TestSensorHealth:
         md = render_markdown(ledger)
         assert "Zeek scripts loaded: 3" in md
 
+    def test_markdown_reports_loaded_script_count_json_format(self):
+        # When Zeek has `policy/tuning/json-logs` loaded (standalone.sh
+        # does), loaded_scripts.log contains one JSON object per line
+        # like {"name":"/path/script.zeek"} instead of the TSV-style
+        # path-only format. Real live-lab output hits this case. The
+        # old `^\s*\S+\.(zeek|bro)\s*$` regex matched zero on this input
+        # despite the sensor having captured 576 entries.
+        from agent_orange_pkg.render import render_markdown
+        scripts = (
+            '{"name":"/opt/zeek/share/zeek/base/init-bare.zeek"}\n'
+            '{"name":"  /opt/zeek/share/zeek/base/bif/const.bif.zeek"}\n'
+            '{"name":"/opt/zeek/share/zeek/site/local.zeek"}\n'
+        )
+        ledger = self._ledger_with_diagnostics(scripts_text=scripts)
+        md = render_markdown(ledger)
+        assert "Zeek scripts loaded: 3" in md
+
+    def test_markdown_tolerates_mixed_and_malformed_lines(self):
+        # A real loaded_scripts.log may have preamble lines and stray
+        # whitespace. Defensive: malformed lines are skipped, good ones
+        # count. Supports both JSON and TSV inputs side by side so a
+        # future upstream change doesn't silently regress.
+        from agent_orange_pkg.render import render_markdown
+        scripts = (
+            "# zeek header\n"                                            # skip
+            "\n"                                                         # skip
+            'garbage not a script\n'                                     # skip
+            '{"name":"/path/a.zeek"}\n'                                  # count
+            '{"notname":"missing"}\n'                                    # skip (no name key)
+            'site/local.zeek\n'                                          # count (tsv fallback)
+            '{"name":"/path/b.zeek"}\n'                                  # count
+        )
+        ledger = self._ledger_with_diagnostics(scripts_text=scripts)
+        md = render_markdown(ledger)
+        assert "Zeek scripts loaded: 3" in md
+
     def test_markdown_reports_drops_section(self):
         from agent_orange_pkg.render import render_markdown
         stats = "pkts_dropped=7\npkts_dropped=0\npkts_dropped=100\n"

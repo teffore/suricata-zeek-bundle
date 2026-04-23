@@ -31,7 +31,44 @@ from agent_orange_pkg.ledger import AttackLedgerEntry, Narrative, RunLedger
 # when the sensor dropped packets during the run -- UNDETECTED verdicts
 # deserve an asterisk when capture was lossy.
 _PKTS_DROPPED_RE = re.compile(r"pkts_dropped\s*[=:]\s*(\d+)", re.IGNORECASE)
-_LOADED_SCRIPT_LINE_RE = re.compile(r"^\s*\S+\.(zeek|bro)\s*$", re.MULTILINE)
+# TSV-format path matcher for loaded_scripts.log when json-logs isn't
+# enabled. Lines are just a script path ending in .zeek or .bro.
+_LOADED_SCRIPT_LINE_RE = re.compile(r"^\s*\S+\.(zeek|bro)\s*$")
+
+
+def _count_loaded_scripts(loaded_text: str) -> int:
+    """Count Zeek scripts in a loaded_scripts.log body.
+
+    Handles both formats the sensor may produce:
+
+    - **JSON** (when Zeek has ``policy/tuning/json-logs`` loaded, which
+      standalone.sh does): lines like ``{"name":"/path/script.zeek"}``.
+      Counted if the line parses as a JSON object with a ``name`` key.
+    - **TSV** (Zeek default): lines are just the script path ending in
+      ``.zeek`` or ``.bro``. Counted via _LOADED_SCRIPT_LINE_RE.
+
+    Each line is tried against JSON first (cheap fast-fail if it doesn't
+    start with ``{``), then the TSV regex. Lines that match neither --
+    comments, preamble, whitespace, malformed entries -- are silently
+    skipped. This mirrors the tolerance other harvest normalizers apply
+    to heterogeneous Zeek log shapes.
+    """
+    count = 0
+    for line in loaded_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict) and "name" in obj:
+                count += 1
+                continue
+        if _LOADED_SCRIPT_LINE_RE.match(stripped):
+            count += 1
+    return count
 
 
 def _sensor_health_summary(ledger: RunLedger) -> dict[str, Any]:
@@ -48,9 +85,7 @@ def _sensor_health_summary(ledger: RunLedger) -> dict[str, Any]:
         "captured": bool(stats_text or loaded_text),
         "total_packets_dropped": sum(drops),
         "drop_samples": len(drops),
-        "loaded_scripts_count": len(
-            _LOADED_SCRIPT_LINE_RE.findall(loaded_text)
-        ),
+        "loaded_scripts_count": _count_loaded_scripts(loaded_text),
     }
 
 
