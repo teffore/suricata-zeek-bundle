@@ -852,6 +852,28 @@ def write_html(ledger: RunLedger, out_path: Path) -> None:
 #  Stdout summary
 # ---------------------------------------------------------------------------
 
+def _count_unique_sids(alerts) -> int:
+    if not alerts:
+        return 0
+    out: set[int] = set()
+    for a in alerts:
+        sid = a.get("sid") if isinstance(a, dict) else None
+        if isinstance(sid, int) and not isinstance(sid, bool):
+            out.add(sid)
+    return len(out)
+
+
+def _count_unique_notes(notices) -> int:
+    if not notices:
+        return 0
+    out: set[str] = set()
+    for n in notices:
+        note = n.get("note") if isinstance(n, dict) else None
+        if isinstance(note, str) and note:
+            out.add(note)
+    return len(out)
+
+
 def render_stdout_summary(ledger: RunLedger) -> str:
     """One-screen text summary for operators tailing the terminal."""
     lines: list[str] = []
@@ -869,8 +891,14 @@ def render_stdout_summary(ledger: RunLedger) -> str:
         f"({ledger.detected_count()} detected)"
     )
     vc = ledger.verdict_counts()
+    # Collapse raw tier counts to ASCII-badge-keyed counts so UNEXPECTED
+    # never appears in the terminal summary either.
+    badge_counts: dict[str, int] = {}
+    for tier, count in vc.items():
+        k = format_verdict_badge(tier, "ascii")
+        badge_counts[k] = badge_counts.get(k, 0) + count
     lines.append("verdicts   : " + ", ".join(
-        f"{k}={v}" for k, v in sorted(vc.items())
+        f"{k}={v}" for k, v in sorted(badge_counts.items())
     ))
     lines.append(
         f"ruleset    : {len(ledger.ruleset_snapshot.enabled_sids)} SIDs enabled"
@@ -881,21 +909,22 @@ def render_stdout_summary(ledger: RunLedger) -> str:
             f"-{len(ledger.ruleset_drift.removed_sids)} vs prior run"
         )
     lines.append("")
-    fmt = "{:<3} {:<34} {:<22} {:>7} {}"
-    lines.append(fmt.format("#", "attack", "verdict", "dur(s)", "sids"))
+    fmt = "{:<3} {:<34} {:<22} {:>7} {:>5} {:>5}"
+    lines.append(fmt.format("#", "attack", "verdict", "dur(s)", "suri", "zeek"))
     lines.append("-" * 72)
     for i, entry in enumerate(ledger.attacks, start=1):
         duration = int(entry.run.probe_end_ts - entry.run.probe_start_ts)
-        sids = sorted({
-            str(a.get("sid")) for a in entry.attributed_alerts
-            if a.get("sid") is not None
-        })
-        sids_str = ",".join(sids) if sids else "-"
+        badge = format_verdict_badge(entry.verdict, "ascii")
+        # Count-only for stdout -- the inline SID/notice list blows out
+        # the 72-col layout. Full detail lives in the HTML/MD report.
+        suri_count = _count_unique_sids(entry.attributed_alerts)
+        zeek_count = _count_unique_notes(entry.attributed_notices)
         lines.append(fmt.format(
             i,
             entry.attack.name[:33],
-            entry.verdict[:21],
+            badge[:21],
             duration,
-            sids_str[:20],
+            suri_count,
+            zeek_count,
         ))
     return "\n".join(lines)

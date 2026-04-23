@@ -651,7 +651,50 @@ class TestRenderStdoutSummary:
         assert "agent-orange run:" in out
         assert "attacks    : 2" in out
         assert "coverage   : 50.0%" in out
-        assert "a" in out and "b" in out  # per-attack rows
+
+    def test_per_attack_rows_use_ascii_badge(self):
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("alpha"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("beta"), verdict="DETECTED_UNEXPECTED"),
+            make_entry(make_attack("gamma"), verdict="FAILED", status="FAILED"),
+        ])
+        out = render_stdout_summary(ledger)
+        # ASCII badge in stdout -- no unicode checkmark
+        assert "DETECTED [x]" in out
+        assert "\u2713" not in out
+        # UNEXPECTED word is never emitted
+        assert "UNEXPECTED" not in out
+
+    def test_columns_are_suri_and_zeek_not_sids(self):
+        ledger = make_ledger()
+        out = render_stdout_summary(ledger)
+        assert "suri" in out
+        assert "zeek" in out
+        # Old header "sids" must be gone
+        header_line = next(
+            (line for line in out.splitlines()
+             if "#" in line and "attack" in line),
+            "",
+        )
+        assert "sids" not in header_line
+
+    def test_per_attack_row_shows_suri_and_zeek_counts(self):
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-fires"),
+                verdict="DETECTED_UNEXPECTED",
+                alerts=[{"sid": 1}, {"sid": 2}],
+                notices=[{"note": "A"}],
+            ),
+        ])
+        out = render_stdout_summary(ledger)
+        # Look for a line mentioning art-fires that has both counts
+        row = next(
+            (line for line in out.splitlines() if "art-fires" in line),
+            "",
+        )
+        assert "2" in row  # Suricata count
+        assert "1" in row  # Zeek count
 
 
 # ---------------------------------------------------------------------------
