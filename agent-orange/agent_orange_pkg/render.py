@@ -109,6 +109,43 @@ def format_suricata_cell(alerts) -> str:
     return f"{n} ({head}, +{extra} more)"
 
 
+def format_zeek_cell(notices) -> str:
+    """Format the Zeek column cell for the main attack table.
+
+    Takes an iterable of attributed Zeek notice dicts (each must have a
+    non-empty string `note` field). Intel Framework hits arrive here
+    too -- harvest.py synthesizes "Intel::<tag>" note values for them.
+
+    Output shape:
+      - 0 notices    -> "--"
+      - 1 notice     -> "1 (<note>)"
+      - 2 notices    -> "N (note1, note2)"  (threshold)
+      - 3+ notices   -> "N (note1, note2, +K more)" where K=N-2
+
+    Note type names are longer than SIDs (e.g., "FTP::Bruteforcing_User"),
+    so we truncate at 2 rather than 3 to keep the column scannable.
+
+    Notes are deduplicated and sorted alphabetically for stable output.
+    """
+    if not notices:
+        return "\u2014"
+    names: set[str] = set()
+    for n in notices:
+        note = n.get("note") if isinstance(n, dict) else None
+        if isinstance(note, str) and note:
+            names.add(note)
+    if not names:
+        return "\u2014"
+    sorted_names = sorted(names)
+    count = len(sorted_names)
+    if count <= 2:
+        inline = ", ".join(sorted_names)
+        return f"{count} ({inline})"
+    head = ", ".join(sorted_names[:2])
+    extra = count - 2
+    return f"{count} ({head}, +{extra} more)"
+
+
 def _count_loaded_scripts(loaded_text: str) -> int:
     """Count Zeek scripts in a loaded_scripts.log body.
 

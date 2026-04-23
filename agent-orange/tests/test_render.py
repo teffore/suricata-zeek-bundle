@@ -126,6 +126,71 @@ class TestFormatSuricataCell:
         assert format_suricata_cell(alerts) == "2 (2001219, 9000003)"
 
 
+class TestFormatZeekCell:
+    """Zeek column: '0 or --' / 'N (NoticeType1, NoticeType2)' / 'N (NoticeType1, NoticeType2, +K more)'.
+
+    Truncation threshold is 2 (not 3 like Suricata) because Zeek notice
+    type strings are longer than SIDs.
+    """
+
+    def test_empty_renders_dash(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        assert format_zeek_cell([]) == "\u2014"
+
+    def test_none_input_renders_dash(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        assert format_zeek_cell(None) == "\u2014"
+
+    def test_single_notice(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_two_notices_at_threshold_no_truncation(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}, {"note": "HTTP::SQL_Injection"}]
+        assert format_zeek_cell(notices) == "2 (HTTP::SQL_Injection, Scan::Port_Scan)"
+
+    def test_four_notices_truncate_to_two_plus_more(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [
+            {"note": "A"}, {"note": "B"}, {"note": "C"}, {"note": "D"},
+        ]
+        assert format_zeek_cell(notices) == "4 (A, B, +2 more)"
+
+    def test_intel_synthesized_note_counts_as_regular_notice(self):
+        # harvest.py synthesizes "Intel::<tag>" for Zeek Intel Framework
+        # hits so they classify as notices. They should appear in the
+        # Zeek cell the same as any other notice.
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Intel::DOMAIN"}]
+        assert format_zeek_cell(notices) == "1 (Intel::DOMAIN)"
+
+    def test_duplicate_note_types_deduped(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [
+            {"note": "Scan::Port_Scan"},
+            {"note": "Scan::Port_Scan"},
+            {"note": "Scan::Port_Scan"},
+        ]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_missing_note_field_skipped(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}, {"msg": "no note here"}]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_empty_note_string_skipped(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}, {"note": ""}]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_notes_sorted_alphabetically_for_stable_output(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Zeta"}, {"note": "Alpha"}]
+        assert format_zeek_cell(notices) == "2 (Alpha, Zeta)"
+
+
 # ---------------------------------------------------------------------------
 #  ledger_to_dict
 # ---------------------------------------------------------------------------
