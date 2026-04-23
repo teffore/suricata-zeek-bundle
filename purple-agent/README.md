@@ -164,7 +164,7 @@ taxonomy hits mostly legit SaaS, so `intel.log` stays empty.
 
 ## Customizing the probe pool
 
-`probes.yaml` ships with ~80 probes curated from the wave-1 and wave-2
+`probes.yaml` ships with ~100 probes curated from the wave-1 and wave-2
 research (CVE-2024 signatures, modern C2, SaaS/LLM SNIs, supply-chain,
 cryptominer-live, Zeek-specific signals). Each entry has an
 `expected_verdict` hint the agent uses to classify.

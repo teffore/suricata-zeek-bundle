@@ -295,7 +295,7 @@ probes:
 
   - name: telegram-bot-api-sni
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Telegram Bot API SNI exfil"
     expected_sids: [2033967]
     expected_verdict: DETECTED
@@ -316,7 +316,7 @@ probes:
 
   - name: openai-api-sni-exfil
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "OpenAI API SNI — LLM exfil (KNOWN GAP)"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -328,7 +328,7 @@ probes:
 
   - name: anthropic-api-sni-exfil
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Anthropic Claude API SNI — LLM exfil (KNOWN GAP)"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -340,7 +340,7 @@ probes:
 
   - name: gemini-api-sni-exfil
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Google Gemini SNI — LLM exfil (KNOWN GAP)"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -351,7 +351,7 @@ probes:
 
   - name: huggingface-dataset-pull
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "HuggingFace dataset SNI — LLM model/data exfil"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -373,7 +373,7 @@ probes:
 
   - name: slack-webhook-c2
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Slack incoming webhook SNI"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -406,7 +406,7 @@ probes:
 
   - name: webhook-site-inspection
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "webhook.site SNI — inspection service abuse"
     expected_sids: [2034634, 2067060]
     expected_verdict: DETECTED
@@ -420,8 +420,8 @@ probes:
 
   - name: ngrok-free-app-sni
     category: tunneling
-    mitre: T1090
-    rationale: "ngrok-free.app SNI — tunneling service"
+    mitre: T1090.002
+    rationale: "ngrok-free.app SNI — tunneling service (External Proxy, per MITRE's own T1090.002 example)"
     expected_sids: [9000921, 2066057]
     expected_verdict: DETECTED
     already_in_catalog: true
@@ -533,8 +533,8 @@ probes:
 
   - name: http2-h2c-jndi-header
     category: evasion
-    mitre: T1090
-    rationale: "HTTP/2 h2c prior-knowledge with JNDI in UA — applayer-mismatch + http2-frame"
+    mitre: T1190
+    rationale: "HTTP/2 h2c prior-knowledge carrying a JNDI (Log4Shell) payload in UA — public-facing app exploit; h2c wrapper is the evasion vehicle"
     expected_sids: [2260000, 2290006]
     expected_verdict: DETECTED
     already_in_catalog: true
@@ -1133,9 +1133,9 @@ probes:
 
   - name: art-scp-over-ssh-exfil
     category: exfil
-    mitre: T1048
+    mitre: T1048.002
     source: atomic-red-team
-    art_test: "T1048 #3"
+    art_test: "T1048.002 #3"
     rationale: "scp exfil over SSH — asymmetric flow shape indicative of bulk staging"
     expected_sids: []
     expected_verdict: UNDETECTED

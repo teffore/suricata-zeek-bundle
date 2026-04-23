@@ -6,10 +6,13 @@ of guessed at.
 
 ## Why this exists
 
-A typical run today is ~15 min for 15 probes (~60s/probe). Before we
-optimize, we need a "before" number. This harness pins the probe set and
-emits a comparable JSON so any change (SSH multiplexing, prompt caching,
-parallel probes, etc.) can be measured against the same yardstick.
+A typical run takes ~750–800s for 10 probes (~75s/probe) in the current
+lab — the honest baseline captured 2026-04-23 was 754s / 10 probes /
+50% detection coverage (see `baseline.json`). Before we optimize
+further, we need that "before" number. This harness pins the probe set
+and emits a comparable JSON so any change (SSH multiplexing, prompt
+caching, parallel probes, etc.) can be measured against the same
+yardstick.
 
 ## The 10 probes (pinned)
 
