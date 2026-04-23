@@ -15,6 +15,496 @@ from tests._ledger_fixtures import (
 )
 
 
+class TestFormatVerdictBadge:
+    """Maps internal verdict tiers to visible badges.
+
+    Unicode style for HTML/MD, ASCII for stdout. Only DETECTED_EXPECTED
+    gets a visible mark; all other DETECTED tiers render as plain
+    "DETECTED".
+    """
+
+    def test_detected_expected_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_EXPECTED", "unicode") == "DETECTED \u2713"
+
+    def test_detected_expected_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_EXPECTED", "ascii") == "DETECTED [x]"
+
+    def test_detected_partial_unicode_same_as_unexpected(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_PARTIAL", "unicode") == "DETECTED"
+
+    def test_detected_partial_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_PARTIAL", "ascii") == "DETECTED"
+
+    def test_detected_unexpected_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_UNEXPECTED", "unicode") == "DETECTED"
+
+    def test_detected_unexpected_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_UNEXPECTED", "ascii") == "DETECTED"
+
+    def test_undetected_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("UNDETECTED", "unicode") == "UNDETECTED"
+
+    def test_undetected_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("UNDETECTED", "ascii") == "UNDETECTED"
+
+    def test_failed_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("FAILED", "unicode") == "FAILED"
+
+    def test_failed_ascii(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("FAILED", "ascii") == "FAILED"
+
+    def test_unknown_tier_defaults_to_tier_name(self):
+        # Defensive: if verdict.py ever grows a new tier and render isn't
+        # updated in lockstep, fall back to the raw tier name rather than
+        # crash. Makes the miss visible without breaking the report.
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("BRAND_NEW_TIER", "unicode") == "BRAND_NEW_TIER"
+
+    def test_unknown_style_defaults_to_unicode(self):
+        from agent_orange_pkg.render import format_verdict_badge
+        assert format_verdict_badge("DETECTED_EXPECTED", "html5") == "DETECTED \u2713"
+
+
+class TestFormatSuricataCell:
+    """Suricata column: '0 or --' / 'N (sid1, sid2, sid3)' / 'N (sid1, sid2, +K more)'."""
+
+    def test_empty_renders_dash(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        assert format_suricata_cell([]) == "\u2014"
+
+    def test_none_input_renders_dash(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        # Defensive: ledger might omit the list on some paths; treat as empty.
+        assert format_suricata_cell(None) == "\u2014"
+
+    def test_single_sid(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 2001219}]
+        assert format_suricata_cell(alerts) == "1 (2001219)"
+
+    def test_three_sids_at_threshold_no_truncation(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 1}, {"sid": 2}, {"sid": 3}]
+        assert format_suricata_cell(alerts) == "3 (1, 2, 3)"
+
+    def test_five_sids_truncate_to_three_plus_more(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 1}, {"sid": 2}, {"sid": 3}, {"sid": 4}, {"sid": 5}]
+        assert format_suricata_cell(alerts) == "5 (1, 2, 3, +2 more)"
+
+    def test_duplicate_sids_deduped_in_display(self):
+        # Raw alerts can repeat; cell shows unique SIDs, count reflects unique.
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 9000003}, {"sid": 9000003}, {"sid": 9000003}]
+        assert format_suricata_cell(alerts) == "1 (9000003)"
+
+    def test_missing_sid_field_skipped(self):
+        # Alert without a sid is diagnostic noise; don't count it.
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 2001219}, {"signature": "no sid here"}]
+        assert format_suricata_cell(alerts) == "1 (2001219)"
+
+    def test_non_int_sid_skipped(self):
+        # Same hygiene as verdict.classify -- stringly-typed sid is harvest bug.
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 2001219}, {"sid": "2002383"}]
+        assert format_suricata_cell(alerts) == "1 (2001219)"
+
+    def test_sids_sorted_ascending_for_stable_output(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 9000003}, {"sid": 2001219}]
+        assert format_suricata_cell(alerts) == "2 (2001219, 9000003)"
+
+
+class TestFormatZeekCell:
+    """Zeek column: '0 or --' / 'N (NoticeType1, NoticeType2)' / 'N (NoticeType1, NoticeType2, +K more)'.
+
+    Truncation threshold is 2 (not 3 like Suricata) because Zeek notice
+    type strings are longer than SIDs.
+    """
+
+    def test_empty_renders_dash(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        assert format_zeek_cell([]) == "\u2014"
+
+    def test_none_input_renders_dash(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        assert format_zeek_cell(None) == "\u2014"
+
+    def test_single_notice(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_two_notices_at_threshold_no_truncation(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}, {"note": "HTTP::SQL_Injection"}]
+        assert format_zeek_cell(notices) == "2 (HTTP::SQL_Injection, Scan::Port_Scan)"
+
+    def test_four_notices_truncate_to_two_plus_more(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [
+            {"note": "A"}, {"note": "B"}, {"note": "C"}, {"note": "D"},
+        ]
+        assert format_zeek_cell(notices) == "4 (A, B, +2 more)"
+
+    def test_intel_synthesized_note_counts_as_regular_notice(self):
+        # harvest.py synthesizes "Intel::<tag>" for Zeek Intel Framework
+        # hits so they classify as notices. They should appear in the
+        # Zeek cell the same as any other notice.
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Intel::DOMAIN"}]
+        assert format_zeek_cell(notices) == "1 (Intel::DOMAIN)"
+
+    def test_duplicate_note_types_deduped(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [
+            {"note": "Scan::Port_Scan"},
+            {"note": "Scan::Port_Scan"},
+            {"note": "Scan::Port_Scan"},
+        ]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_missing_note_field_skipped(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}, {"msg": "no note here"}]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_empty_note_string_skipped(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Scan::Port_Scan"}, {"note": ""}]
+        assert format_zeek_cell(notices) == "1 (Scan::Port_Scan)"
+
+    def test_notes_sorted_alphabetically_for_stable_output(self):
+        from agent_orange_pkg.render import format_zeek_cell
+        notices = [{"note": "Zeta"}, {"note": "Alpha"}]
+        assert format_zeek_cell(notices) == "2 (Alpha, Zeta)"
+
+
+class TestCharacterizeObservedLog:
+    """Per-log-type one-liner generator for Evidence block Observed rows.
+
+    For each known log type, extracts a key field; falls back to count
+    only for unknown log types. Always returns a line like
+    '<logname>.log: N entries (<summary>)' or just '<logname>.log: N entries'.
+    """
+
+    def test_empty_events_returns_count_zero_line(self):
+        # Defensive -- caller should have filtered out empty; but if not,
+        # helper must not crash.
+        from agent_orange_pkg.render import _characterize_observed_log
+        assert _characterize_observed_log("http.log", []) == "http.log: 0 entries"
+
+    def test_software_log_extracts_user_agents(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"software_type": "HTTP::BROWSER", "unparsed_version": "gobuster/3.8.2"},
+            {"software_type": "HTTP::BROWSER", "unparsed_version": "gobuster/3.8.2"},
+        ]
+        out = _characterize_observed_log("software.log", events)
+        assert "software.log: 2 entries" in out
+        assert "gobuster/3.8.2" in out
+
+    def test_files_log_extracts_mime_types(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"mime_type": "application/x-dosexec"},
+            {"mime_type": "text/html"},
+        ]
+        out = _characterize_observed_log("files.log", events)
+        assert "files.log: 2 entries" in out
+        assert "x-dosexec" in out or "text/html" in out
+
+    def test_ssl_log_extracts_sni(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"server_name": "trycloudflare.com"},
+            {"server_name": "abc.trycloudflare.com"},
+        ]
+        out = _characterize_observed_log("ssl.log", events)
+        assert "ssl.log: 2 entries" in out
+        assert "trycloudflare.com" in out
+
+    def test_ftp_log_counts_auth_failures(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"command": "PASS", "reply_code": 530},
+            {"command": "PASS", "reply_code": 530},
+            {"command": "USER"},
+        ]
+        out = _characterize_observed_log("ftp.log", events)
+        assert "ftp.log: 3 entries" in out
+        assert "2 auth" in out or "530" in out
+
+    def test_dns_log_extracts_queries(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"query": "evil.example.com"}, {"query": "test.local"}]
+        out = _characterize_observed_log("dns.log", events)
+        assert "dns.log: 2 entries" in out
+        assert "evil.example.com" in out or "test.local" in out
+
+    def test_http_log_extracts_host(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"host": "victim.local", "uri": "/a"}, {"host": "victim.local", "uri": "/b"}]
+        out = _characterize_observed_log("http.log", events)
+        assert "http.log: 2 entries" in out
+        assert "victim.local" in out
+
+    def test_conn_log_counts_flows(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"uid": "C1"}, {"uid": "C2"}, {"uid": "C3"}]
+        out = _characterize_observed_log("conn.log", events)
+        assert "conn.log: 3 entries" in out
+        assert "flow" in out.lower()
+
+    def test_unknown_log_falls_back_to_count_only(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"foo": "bar"}, {"foo": "baz"}]
+        assert _characterize_observed_log("mystery.log", events) == "mystery.log: 2 entries"
+
+    def test_singular_entry_grammar(self):
+        # Code review #4: "1 entries" reads awkwardly.
+        from agent_orange_pkg.render import _characterize_observed_log
+        assert _characterize_observed_log("http.log", [{"host": "a"}]).startswith(
+            "http.log: 1 entry"
+        )
+        assert _characterize_observed_log("conn.log", [{"uid": "C1"}]).startswith(
+            "conn.log: 1 entry"
+        )
+        # conn.log trailing summary also singular
+        assert "1 flow" in _characterize_observed_log("conn.log", [{"uid": "C1"}])
+        assert "1 flows" not in _characterize_observed_log("conn.log", [{"uid": "C1"}])
+        # ftp.log single auth failure
+        ftp = _characterize_observed_log(
+            "ftp.log", [{"command": "PASS", "reply_code": 530}]
+        )
+        assert "1 auth failure" in ftp
+        assert "1 auth failures" not in ftp
+
+
+class TestRenderEvidenceBlock:
+    """Full Evidence subblock: Suricata alerts / Zeek notices / Observed.
+
+    Returns a string with `\\n` line separators (Markdown). HTML rendering
+    happens in the HTML wire-up task; this helper emits Markdown form.
+    """
+
+    def _entry(self, **overrides):
+        from tests._ledger_fixtures import make_attack, make_entry
+        defaults = dict(
+            attack=make_attack(),
+            verdict="DETECTED_UNEXPECTED",
+            alerts=(),
+            notices=(),
+            observed=None,
+        )
+        defaults.update(overrides)
+        # make_entry already returns an AttackLedgerEntry
+        return make_entry(**defaults)
+
+    def test_all_three_subsections_present(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-example"),
+            verdict="DETECTED_EXPECTED",
+            alerts=[{"sid": 2001219, "signature": "ET scan"}],
+            notices=[{"note": "Scan::Port_Scan", "msg": "detected"}],
+            observed={"http.log": ({"host": "victim.local"},)},
+        )
+        out = render_evidence_block(entry)
+        assert "Evidence:" in out
+        assert "Suricata alerts (1)" in out
+        assert "Zeek notices (1)" in out
+        assert "Observed" in out
+        assert "2001219" in out
+        assert "ET scan" in out
+        assert "Scan::Port_Scan" in out
+        assert "http.log" in out
+
+    def test_zeek_only_drops_empty_suricata_subsection(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-zeek-only"),
+            verdict="DETECTED_UNEXPECTED",
+            alerts=[],
+            notices=[{"note": "Scan::Port_Scan"}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Suricata alerts" not in out
+        assert "Zeek notices (1)" in out
+
+    def test_failed_row_entire_block_skipped(self):
+        # When all three subsections empty, block header is also dropped.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-failed"),
+            verdict="FAILED",
+            alerts=[],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert out == ""
+
+    def test_missing_signature_field_renders_sid_alone(self):
+        # No trailing em-dash-quote when signature is absent.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[{"sid": 9000003}],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "SID 9000003" in out
+        assert "SID 9000003 \u2014" not in out  # no em-dash-quote
+        assert 'SID 9000003 "' not in out
+
+    def test_missing_notice_msg_renders_note_alone(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[],
+            notices=[{"note": "HTTP::SQL_Injection"}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "HTTP::SQL_Injection" in out
+        assert "HTTP::SQL_Injection \u2014" not in out
+
+    def test_observed_only_attack_renders_observed_section(self):
+        # OBSERVED is not a verdict -- a probe caught by Zeek protocol
+        # logs but zero rules fired is still UNDETECTED. The Evidence
+        # block must show the observed section so the gap is visible.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-observed-only"),
+            verdict="UNDETECTED",
+            alerts=[],
+            notices=[],
+            observed={"software.log": ({"unparsed_version": "gobuster/3.8.2"},)},
+        )
+        out = render_evidence_block(entry)
+        assert "Observed" in out
+        assert "software.log" in out
+        assert "gobuster" in out
+        assert "Suricata alerts" not in out
+        assert "Zeek notices" not in out
+
+    def test_severity_included_when_present(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[{"sid": 2002383, "signature": "ET SCAN Hydra FTP", "severity": 2}],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "severity 2" in out
+
+    def test_header_count_matches_body_when_malformed_alerts_filtered(self):
+        # Code review #1: header said "Suricata alerts (2):" but body
+        # skipped the two bad entries and rendered zero bullets.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[{"sid": "stringly"}, {"signature": "no sid"}],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        # Entire Suricata subsection should be dropped (zero valid alerts).
+        assert "Suricata alerts" not in out
+
+    def test_header_count_matches_body_when_malformed_notices_filtered(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[],
+            notices=[{"msg": "no note"}, {"note": ""}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Zeek notices" not in out
+
+    def test_header_reflects_unique_not_raw_count(self):
+        # Code review #2: the main-table cell dedups SIDs, so "3 (2001219)"
+        # in the cell shouldn't disagree with "Suricata alerts (3):" in the
+        # Evidence block. Use unique count in both places.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[
+                {"sid": 2001219, "signature": "ET scan"},
+                {"sid": 2001219, "signature": "ET scan"},
+                {"sid": 2001219, "signature": "ET scan"},
+            ],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Suricata alerts (1)" in out
+        # And only one bullet rendered (dedup'd), not three.
+        assert out.count("SID 2001219") == 1
+
+    def test_duplicate_notices_deduped_in_body(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[],
+            notices=[
+                {"note": "Scan::Port_Scan"},
+                {"note": "Scan::Port_Scan"},
+            ],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Zeek notices (1)" in out
+        assert out.count("Scan::Port_Scan") == 1
+
+    def test_evidence_bullets_sorted_for_stable_output(self):
+        # Code review #5: cells sort, body should too, so both views
+        # of the same data line up.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[
+                {"sid": 9000003, "signature": "Z"},
+                {"sid": 2001219, "signature": "A"},
+            ],
+            notices=[{"note": "Zeta"}, {"note": "Alpha"}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        # Suricata: lower sid first
+        assert out.index("SID 2001219") < out.index("SID 9000003")
+        # Zeek: alphabetical
+        assert out.index("Alpha") < out.index("Zeta")
+
+
 # ---------------------------------------------------------------------------
 #  ledger_to_dict
 # ---------------------------------------------------------------------------
@@ -54,6 +544,109 @@ class TestLedgerToDict:
         d = ledger_to_dict(ledger)
         assert d["ruleset_drift"]["added_sids"] == [2, 5]
         assert d["ruleset_drift"]["removed_sids"] == [7, 9]
+
+    def test_ledger_to_dict_shape_is_frozen(self):
+        # Guard against anyone adding or removing a structural key from
+        # ledger_to_dict's output while "just rewiring the renderer".
+        # The JSON contract is stable for downstream consumers
+        # (future CI gates, diff scripts, wiki tooling).
+        #
+        # We deliberately stop descent at paths whose *values* are
+        # content (verdict tier names, log names, alert fields) rather
+        # than structure -- those legitimately vary per run.
+        #
+        # If this test fails: either the structural change is deliberate
+        # (update EXPECTED_KEYS below) or the JSON shape drifted.
+        ledger = make_ledger(
+            entries=[make_entry(
+                make_attack("a"),
+                alerts=[{"sid": 1, "signature": "x"}],
+                notices=[{"note": "N"}],
+                observed={"http.log": ({"host": "h"},)},
+            )],
+            drift=RulesetDrift(
+                added_sids=frozenset({1}),
+                removed_sids=frozenset({2}),
+                hash_changed=True,
+            ),
+        )
+        d = ledger_to_dict(ledger)
+
+        # Paths below these are open-content maps/lists whose internal
+        # keys or dict extras legitimately vary; stop the key-walk there.
+        OPAQUE = {
+            "summary.verdict_counts",
+            "narrative.per_attack_commentary",
+            "narrative.remediation_suggestions",
+            "attacks[].observed_evidence",
+            "attacks[].attributed_alerts[]",
+            "attacks[].attributed_notices[]",
+        }
+
+        def deep_keys(obj, prefix=""):
+            found = set()
+            if prefix in OPAQUE:
+                return found
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    path = f"{prefix}.{k}" if prefix else k
+                    found.add(path)
+                    found |= deep_keys(v, path)
+            elif isinstance(obj, list) and obj:
+                found |= deep_keys(obj[0], f"{prefix}[]")
+            return found
+
+        expected = {
+            "run_id", "started_at", "ended_at", "victim_ip",
+            "sensor_host", "attacker_host",
+            "agent_orange_version", "attacks_yaml_path",
+            "zeek_loaded_scripts", "zeek_stats",
+            "attacks",
+            "attacks[].attack", "attacks[].run",
+            "attacks[].verdict",
+            "attacks[].attributed_alerts", "attacks[].attributed_notices",
+            "attacks[].observed_evidence",
+            "attacks[].attack.name", "attacks[].attack.mitre",
+            "attacks[].attack.source", "attacks[].attack.art_test",
+            "attacks[].attack.rationale", "attacks[].attack.target",
+            "attacks[].attack.expected_sids",
+            "attacks[].attack.expected_zeek_notices",
+            "attacks[].attack.expected_verdict",
+            "attacks[].attack.command", "attacks[].attack.timeout",
+            "attacks[].attack.target.type", "attacks[].attack.target.value",
+            "attacks[].run.attack_name", "attacks[].run.mitre",
+            "attacks[].run.art_test", "attacks[].run.target",
+            "attacks[].run.substituted_command",
+            "attacks[].run.probe_start_ts", "attacks[].run.probe_end_ts",
+            "attacks[].run.status", "attacks[].run.exit_code",
+            "attacks[].run.stdout", "attacks[].run.stderr",
+            "attacks[].run.error", "attacks[].run.timed_out",
+            "attacks[].run.target.type", "attacks[].run.target.value",
+            "ruleset_snapshot",
+            "ruleset_snapshot.enabled_sids",
+            "ruleset_snapshot.hash", "ruleset_snapshot.captured_at",
+            "ruleset_drift",
+            "ruleset_drift.added_sids", "ruleset_drift.removed_sids",
+            "ruleset_drift.hash_changed",
+            "narrative",
+            "narrative.available", "narrative.exec_summary",
+            "narrative.per_attack_commentary",
+            "narrative.remediation_suggestions",
+            "narrative.drift_commentary", "narrative.generated_at",
+            "narrative.model", "narrative.error",
+            "summary",
+            "summary.total_attacks", "summary.detected",
+            "summary.coverage_pct", "summary.total_seconds",
+            "summary.verdict_counts",
+        }
+        got = deep_keys(d)
+        missing = expected - got
+        extra = got - expected
+        assert not missing, f"JSON contract broken -- missing keys: {sorted(missing)}"
+        assert not extra, (
+            "JSON contract broken -- unexpected new keys: "
+            f"{sorted(extra)}. If deliberate, update EXPECTED_KEYS."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +690,33 @@ class TestRenderMarkdown:
         assert "`art-one`" in md
         assert "`art-two`" in md
 
+    def test_attack_table_has_suricata_and_zeek_columns(self):
+        # Main-table column header must be split.
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("art-one"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("art-two"), verdict="UNDETECTED"),
+        ])
+        md = render_markdown(ledger)
+        assert "`art-one`" in md
+        assert "`art-two`" in md
+        assert "Suricata" in md
+        assert "Zeek" in md
+        assert "Fired SIDs" not in md  # old column name must be gone
+
+    def test_verdict_badge_used_not_raw_tier(self):
+        # The visible verdict must use the badge, never the raw tier.
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("a"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("b"), verdict="DETECTED_UNEXPECTED"),
+            make_entry(make_attack("c"), verdict="UNDETECTED"),
+        ])
+        md = render_markdown(ledger)
+        # Exact-match gets the checkmark
+        assert "DETECTED \u2713" in md
+        # UNEXPECTED renders as plain DETECTED, NOT the raw tier name
+        assert "DETECTED_UNEXPECTED" not in md
+        assert "UNDETECTED" in md
+
     def test_unavailable_narrative_renders_notice(self):
         ledger = make_ledger(
             narrative=make_narrative(available=False, error="api key missing"),
@@ -115,6 +735,40 @@ class TestRenderMarkdown:
         assert "## Executive summary" in md
         assert "50% coverage across ART." in md
 
+    def test_evidence_block_appears_for_attacks_with_evidence(self):
+        # Per-attack analysis section must include the new Evidence block.
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-fires"),
+                verdict="DETECTED_UNEXPECTED",
+                alerts=[{"sid": 2001219, "signature": "ET scan"}],
+                notices=[{"note": "Scan::Port_Scan"}],
+            ),
+        ])
+        md = render_markdown(ledger)
+        assert "Evidence:" in md
+        assert "Suricata alerts (1)" in md
+        assert "2001219" in md
+        assert "Scan::Port_Scan" in md
+
+    def test_failed_attack_omits_evidence_block_entirely(self):
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-failed"),
+                verdict="FAILED",
+                status="FAILED",
+                alerts=[],
+                notices=[],
+            ),
+        ])
+        md = render_markdown(ledger)
+        # Evidence header must NOT appear under a FAILED attack with no data
+        attack_section_start = md.find("art-failed")
+        if attack_section_start != -1:
+            # Only look in that attack's section (up to next ### or end)
+            after = md[attack_section_start:]
+            assert "Evidence:" not in after[:500]
+
 
 # ---------------------------------------------------------------------------
 #  render_html
@@ -128,7 +782,8 @@ class TestRenderHtml:
         assert "<style>" in html  # CSS inline
         assert "<link" not in html  # no external sheets
 
-    def test_verdict_css_class_present_per_entry(self):
+    def test_css_classes_still_keyed_off_internal_tier(self):
+        # HTML classes are stable even though visible text changes.
         ledger = make_ledger(entries=[
             make_entry(make_attack("a"), verdict="DETECTED_EXPECTED"),
             make_entry(make_attack("b"), verdict="FAILED"),
@@ -137,15 +792,55 @@ class TestRenderHtml:
         assert "v-DETECTED_EXPECTED" in html
         assert "v-FAILED" in html
 
+    def test_verdict_visible_text_uses_badge_not_raw_tier(self):
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("a"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("b"), verdict="DETECTED_UNEXPECTED"),
+        ])
+        html = render_html(ledger)
+        # The span's displayed text uses the badge
+        assert ">DETECTED \u2713<" in html
+        assert ">DETECTED<" in html
+        # The UNEXPECTED word never appears in visible prose. CSS class
+        # names (v-DETECTED_UNEXPECTED) are allowed -- they're inside
+        # attribute values OR inside <style>...</style> where they're
+        # selectors, not displayed text.
+        import re
+        body_only = re.sub(
+            r"<style>.*?</style>", "", html, flags=re.DOTALL,
+        )
+        assert re.search(r">[^<]*UNEXPECTED[^<]*<", body_only) is None
+
+    def test_attack_table_has_suricata_and_zeek_columns(self):
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("art-one"), verdict="DETECTED_EXPECTED"),
+        ])
+        html = render_html(ledger)
+        assert "<th>Suricata</th>" in html
+        assert "<th>Zeek</th>" in html
+        assert "<th>Fired SIDs</th>" not in html
+
     def test_escapes_attack_name_with_html_special_chars(self):
-        # Defensive: if an attack ever has HTML metacharacters in its
-        # name (unlikely given snake-case convention, but possible for
-        # rationale or commentary) the output must not break.
         attack = make_attack("art-<injection>")
         ledger = make_ledger(entries=[make_entry(attack, verdict="UNDETECTED")])
         html = render_html(ledger)
         assert "art-&lt;injection&gt;" in html
         assert "<injection>" not in html
+
+    def test_evidence_block_appears_in_per_attack_section(self):
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-fires"),
+                verdict="DETECTED_UNEXPECTED",
+                alerts=[{"sid": 2001219, "signature": "ET scan"}],
+                notices=[{"note": "Scan::Port_Scan"}],
+            ),
+        ])
+        html = render_html(ledger)
+        # Evidence markup present (Markdown block rendered inside HTML)
+        assert "Evidence:" in html or "<h4>Evidence" in html
+        assert "2001219" in html
+        assert "Scan::Port_Scan" in html
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +857,50 @@ class TestRenderStdoutSummary:
         assert "agent-orange run:" in out
         assert "attacks    : 2" in out
         assert "coverage   : 50.0%" in out
-        assert "a" in out and "b" in out  # per-attack rows
+
+    def test_per_attack_rows_use_ascii_badge(self):
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("alpha"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("beta"), verdict="DETECTED_UNEXPECTED"),
+            make_entry(make_attack("gamma"), verdict="FAILED", status="FAILED"),
+        ])
+        out = render_stdout_summary(ledger)
+        # ASCII badge in stdout -- no unicode checkmark
+        assert "DETECTED [x]" in out
+        assert "\u2713" not in out
+        # UNEXPECTED word is never emitted
+        assert "UNEXPECTED" not in out
+
+    def test_columns_are_suri_and_zeek_not_sids(self):
+        ledger = make_ledger()
+        out = render_stdout_summary(ledger)
+        assert "suri" in out
+        assert "zeek" in out
+        # Old header "sids" must be gone
+        header_line = next(
+            (line for line in out.splitlines()
+             if "#" in line and "attack" in line),
+            "",
+        )
+        assert "sids" not in header_line
+
+    def test_per_attack_row_shows_suri_and_zeek_counts(self):
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-fires"),
+                verdict="DETECTED_UNEXPECTED",
+                alerts=[{"sid": 1}, {"sid": 2}],
+                notices=[{"note": "A"}],
+            ),
+        ])
+        out = render_stdout_summary(ledger)
+        # Look for a line mentioning art-fires that has both counts
+        row = next(
+            (line for line in out.splitlines() if "art-fires" in line),
+            "",
+        )
+        assert "2" in row  # Suricata count
+        assert "1" in row  # Zeek count
 
 
 # ---------------------------------------------------------------------------
@@ -377,3 +1115,168 @@ class TestSensorHealth:
         md = render_markdown(ledger)
         # 7 + 0 + 100 = 107 total
         assert "107" in md
+
+
+# ---------------------------------------------------------------------------
+#  End-to-end regression against captured real run
+# ---------------------------------------------------------------------------
+
+
+class TestCapturedRunRegression:
+    """Load the first real Agent Orange run's ledger.json and exercise the
+    new renderers against it. Catches field-shape drift between
+    harvest/runner output and render expectations that unit tests miss.
+    """
+
+    FIXTURE_RUN_ID = "20260423T185508Z"
+
+    def _load_captured_ledger(self):
+        from pathlib import Path
+        import json
+        p = (
+            Path(__file__).resolve().parent.parent / "runs"
+            / self.FIXTURE_RUN_ID / "ledger.json"
+        )
+        if not p.exists():
+            import pytest
+            pytest.skip(f"fixture not present: {p}")
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    def _rehydrate_ledger(self, raw):
+        # Minimal rehydration: render functions only need a RunLedger-like
+        # object with the fields they access.
+        from agent_orange_pkg.catalog import Attack, Target
+        from agent_orange_pkg.ledger import (
+            AttackLedgerEntry, Narrative, RunLedger,
+        )
+        from agent_orange_pkg.ruleset import RulesetSnapshot
+        from agent_orange_pkg.runner import AttackRun
+
+        entries = []
+        for a in raw["attacks"]:
+            am = a["attack"]
+            rm = a["run"]
+            attack = Attack(
+                name=am["name"], mitre=am["mitre"],
+                source=am.get("source", "atomic-red-team"),
+                art_test=am.get("art_test", ""),
+                rationale=am.get("rationale", ""),
+                target=Target(
+                    type=am["target"]["type"],
+                    value=am["target"]["value"],
+                ),
+                expected_sids=tuple(am.get("expected_sids") or ()),
+                expected_zeek_notices=tuple(am.get("expected_zeek_notices") or ()),
+                expected_verdict=am.get("expected_verdict", "UNDETECTED"),
+                command=am.get("command", ""),
+                timeout=am.get("timeout", 45),
+            )
+            run = AttackRun(
+                attack_name=rm.get("attack_name", attack.name),
+                mitre=rm.get("mitre", attack.mitre),
+                art_test=rm.get("art_test", attack.art_test),
+                target=Target(
+                    type=rm["target"]["type"],
+                    value=rm["target"]["value"],
+                ),
+                substituted_command=rm.get("substituted_command", ""),
+                probe_start_ts=rm.get("probe_start_ts", 0.0),
+                probe_end_ts=rm.get("probe_end_ts", 0.0),
+                status=rm.get("status", "RAN"),
+                exit_code=rm.get("exit_code"),
+                stdout=rm.get("stdout", ""),
+                stderr=rm.get("stderr", ""),
+                error=rm.get("error", ""),
+                timed_out=rm.get("timed_out", False),
+            )
+            entries.append(AttackLedgerEntry(
+                attack=attack, run=run, verdict=a["verdict"],
+                attributed_alerts=tuple(a.get("attributed_alerts") or ()),
+                attributed_notices=tuple(a.get("attributed_notices") or ()),
+                observed_evidence={
+                    k: tuple(v) for k, v in
+                    (a.get("observed_evidence") or {}).items()
+                },
+            ))
+
+        snap_raw = raw.get("ruleset_snapshot") or {}
+        snapshot = RulesetSnapshot(
+            enabled_sids=frozenset(snap_raw.get("enabled_sids") or ()),
+            hash=snap_raw.get("hash", ""),
+            captured_at=snap_raw.get("captured_at", 0.0),
+        )
+        n_raw = raw.get("narrative") or {}
+        narrative = Narrative(
+            available=bool(n_raw.get("available")),
+            exec_summary=n_raw.get("exec_summary", ""),
+            per_attack_commentary=dict(n_raw.get("per_attack_commentary") or {}),
+            remediation_suggestions=dict(n_raw.get("remediation_suggestions") or {}),
+            drift_commentary=n_raw.get("drift_commentary", ""),
+            generated_at=n_raw.get("generated_at", 0.0),
+            model=n_raw.get("model", ""),
+            error=n_raw.get("error", ""),
+        )
+        return RunLedger(
+            run_id=raw["run_id"],
+            started_at=raw.get("started_at", 0.0),
+            ended_at=raw.get("ended_at", 0.0),
+            victim_ip=raw.get("victim_ip", ""),
+            sensor_host=raw.get("sensor_host", ""),
+            attacker_host=raw.get("attacker_host", ""),
+            attacks=tuple(entries),
+            ruleset_snapshot=snapshot,
+            ruleset_drift=None,
+            zeek_loaded_scripts=raw.get("zeek_loaded_scripts", ""),
+            zeek_stats=raw.get("zeek_stats", ""),
+            narrative=narrative,
+            agent_orange_version=raw.get("agent_orange_version", ""),
+            attacks_yaml_path=raw.get("attacks_yaml_path", ""),
+        )
+
+    def test_markdown_renders_without_error(self):
+        from agent_orange_pkg.render import render_markdown
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        md = render_markdown(ledger)
+        assert len(md) > 0
+        assert ledger.run_id in md
+
+    def test_html_renders_without_error(self):
+        from agent_orange_pkg.render import render_html
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        html = render_html(ledger)
+        assert html.startswith("<!doctype html>")
+        assert html.endswith("</body></html>")
+
+    def test_markdown_attack_table_has_23_rows(self):
+        from agent_orange_pkg.render import render_markdown
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        md = render_markdown(ledger)
+        # count lines that look like "| N | `..." where N is an integer
+        import re
+        row_lines = [
+            ln for ln in md.splitlines()
+            if re.match(r"^\|\s*\d+\s*\|\s*`art-", ln)
+        ]
+        assert len(row_lines) == 23
+
+    def test_every_attack_name_present_in_markdown(self):
+        from agent_orange_pkg.render import render_markdown
+        raw = self._load_captured_ledger()
+        ledger = self._rehydrate_ledger(raw)
+        md = render_markdown(ledger)
+        for a in raw["attacks"]:
+            assert a["attack"]["name"] in md
+
+    def test_every_row_has_suricata_and_zeek_cells(self):
+        # No cell should be blank / missing; "--" is acceptable.
+        from agent_orange_pkg.render import render_markdown
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        md = render_markdown(ledger)
+        import re
+        for ln in md.splitlines():
+            m = re.match(r"^\|\s*\d+\s*\|\s*`art-", ln)
+            if not m:
+                continue
+            # Expected pipes: 8 (leading + between 7 cells + trailing)
+            pipes = ln.count("|")
+            assert pipes == 8, f"row has {pipes} pipes, not 8: {ln!r}"

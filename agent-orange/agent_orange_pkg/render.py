@@ -36,6 +36,284 @@ _PKTS_DROPPED_RE = re.compile(r"pkts_dropped\s*[=:]\s*(\d+)", re.IGNORECASE)
 _LOADED_SCRIPT_LINE_RE = re.compile(r"^\s*\S+\.(zeek|bro)\s*$")
 
 
+# Verdict badge mapping: internal tier -> visible text.
+# `DETECTED_EXPECTED` is the only tier that carries a mark; PARTIAL and
+# UNEXPECTED both render as plain "DETECTED" so the UNEXPECTED word never
+# appears in human-facing output. Full tier still lives in ledger.json.
+_VERDICT_BADGE_UNICODE = {
+    "DETECTED_EXPECTED": "DETECTED \u2713",
+    "DETECTED_PARTIAL": "DETECTED",
+    "DETECTED_UNEXPECTED": "DETECTED",
+    "UNDETECTED": "UNDETECTED",
+    "FAILED": "FAILED",
+}
+_VERDICT_BADGE_ASCII = {
+    "DETECTED_EXPECTED": "DETECTED [x]",
+    "DETECTED_PARTIAL": "DETECTED",
+    "DETECTED_UNEXPECTED": "DETECTED",
+    "UNDETECTED": "UNDETECTED",
+    "FAILED": "FAILED",
+}
+
+
+def format_verdict_badge(tier: str, style: str) -> str:
+    """Return the human-facing badge for an internal verdict tier.
+
+    style:
+      "unicode" -- HTML and Markdown renderers pass this. The mark is
+                   U+2713. Renders cleanly in all major viewers.
+      "ascii"   -- stdout summary passes this. Mark is "[x]". Windows
+                   CMD legacy code pages can't render U+2713 reliably.
+
+    Unknown tier -> returns the tier string unchanged (defensive: lets a
+    future tier-addition in verdict.py surface visibly without crashing
+    the report).
+    Unknown style -> falls back to unicode.
+    """
+    table = _VERDICT_BADGE_ASCII if style == "ascii" else _VERDICT_BADGE_UNICODE
+    return table.get(tier, tier)
+
+
+def format_suricata_cell(alerts) -> str:
+    """Format the Suricata column cell for the main attack table.
+
+    Takes an iterable of attributed Suricata alert dicts (each must have
+    an integer `sid` field; non-int and missing sid fields are skipped
+    defensively, matching verdict._extract_sids hygiene).
+
+    Output shape:
+      - 0 alerts      -> "--"
+      - 1 alert       -> "1 (<sid>)"
+      - 2-3 alerts    -> "N (sid1, sid2, sid3)"
+      - 4+ alerts     -> "N (sid1, sid2, sid3, +K more)" where K=N-3
+
+    SIDs are deduplicated and sorted ascending for stable output across
+    runs (otherwise dict iteration order could shuffle them).
+    """
+    if not alerts:
+        return "\u2014"
+    sids: set[int] = set()
+    for a in alerts:
+        sid = a.get("sid") if isinstance(a, dict) else None
+        if isinstance(sid, int) and not isinstance(sid, bool):
+            sids.add(sid)
+    if not sids:
+        return "\u2014"
+    sorted_sids = sorted(sids)
+    n = len(sorted_sids)
+    if n <= 3:
+        inline = ", ".join(str(s) for s in sorted_sids)
+        return f"{n} ({inline})"
+    head = ", ".join(str(s) for s in sorted_sids[:3])
+    extra = n - 3
+    return f"{n} ({head}, +{extra} more)"
+
+
+def format_zeek_cell(notices) -> str:
+    """Format the Zeek column cell for the main attack table.
+
+    Takes an iterable of attributed Zeek notice dicts (each must have a
+    non-empty string `note` field). Intel Framework hits arrive here
+    too -- harvest.py synthesizes "Intel::<tag>" note values for them.
+
+    Output shape:
+      - 0 notices    -> "--"
+      - 1 notice     -> "1 (<note>)"
+      - 2 notices    -> "N (note1, note2)"  (threshold)
+      - 3+ notices   -> "N (note1, note2, +K more)" where K=N-2
+
+    Note type names are longer than SIDs (e.g., "FTP::Bruteforcing_User"),
+    so we truncate at 2 rather than 3 to keep the column scannable.
+
+    Notes are deduplicated and sorted alphabetically for stable output.
+    """
+    if not notices:
+        return "\u2014"
+    names: set[str] = set()
+    for n in notices:
+        note = n.get("note") if isinstance(n, dict) else None
+        if isinstance(note, str) and note:
+            names.add(note)
+    if not names:
+        return "\u2014"
+    sorted_names = sorted(names)
+    count = len(sorted_names)
+    if count <= 2:
+        inline = ", ".join(sorted_names)
+        return f"{count} ({inline})"
+    head = ", ".join(sorted_names[:2])
+    extra = count - 2
+    return f"{count} ({head}, +{extra} more)"
+
+
+def _characterize_observed_log(logname: str, events) -> str:
+    """Produce a one-line summary for one protocol log's attributed events.
+
+    Returns e.g.:
+      "software.log: 2 entries (gobuster/3.8.2)"
+      "ftp.log: 16 entries (14 auth failures)"
+      "ssl.log: 3 entries (SNI: trycloudflare.com)"
+      "mystery.log: 5 entries"   (fallback when no characterizer named)
+
+    events is an iterable of dicts (normalized Zeek log events).
+    """
+    events = list(events) if events else []
+    n = len(events)
+    noun = "entry" if n == 1 else "entries"
+    base = f"{logname}: {n} {noun}"
+    if n == 0:
+        return base
+
+    if logname == "software.log":
+        versions = {
+            e.get("unparsed_version") for e in events
+            if isinstance(e, dict) and isinstance(e.get("unparsed_version"), str)
+        }
+        versions.discard(None)
+        if versions:
+            sample = sorted(versions)[0]
+            return f"{base} ({sample})"
+        return base
+
+    if logname == "files.log":
+        mimes = {
+            e.get("mime_type") for e in events
+            if isinstance(e, dict) and isinstance(e.get("mime_type"), str)
+        }
+        if mimes:
+            return f"{base} (" + ", ".join(sorted(mimes)) + ")"
+        return base
+
+    if logname in ("ssl.log", "x509.log"):
+        snis = {
+            e.get("server_name") for e in events
+            if isinstance(e, dict) and isinstance(e.get("server_name"), str)
+        }
+        if snis:
+            sample = sorted(snis)[0]
+            return f"{base} (SNI: {sample})"
+        return base
+
+    if logname == "ftp.log":
+        fails = sum(
+            1 for e in events
+            if isinstance(e, dict) and e.get("reply_code") == 530
+        )
+        if fails:
+            fail_noun = "auth failure" if fails == 1 else "auth failures"
+            return f"{base} ({fails} {fail_noun})"
+        return base
+
+    if logname == "dns.log":
+        queries = [
+            e.get("query") for e in events
+            if isinstance(e, dict) and isinstance(e.get("query"), str)
+        ]
+        if queries:
+            sample = queries[0]
+            return f"{base} (query: {sample})"
+        return base
+
+    if logname == "http.log":
+        hosts = {
+            e.get("host") for e in events
+            if isinstance(e, dict) and isinstance(e.get("host"), str)
+        }
+        if hosts:
+            sample = sorted(hosts)[0]
+            return f"{base} (host: {sample})"
+        return base
+
+    if logname == "conn.log":
+        flow_noun = "flow" if n == 1 else "flows"
+        return f"{base} ({n} {flow_noun})"
+
+    return base
+
+
+def render_evidence_block(entry) -> str:
+    """Render the Markdown 'Evidence:' subblock for one attack.
+
+    Returns an empty string when all three subsections are empty
+    (FAILED or fully silent UNDETECTED attacks) -- the caller should
+    simply not include the block in the report.
+
+    Subsections are dropped individually when empty; the surrounding
+    'Evidence:' header is only kept when at least one subsection has
+    content.
+
+    Alerts and notices are deduplicated by SID and note-type respectively
+    to match the main-table cells (which also dedup). The first
+    signature/severity/msg encountered for each unique key wins; sorting
+    is ascending SID / alphabetical note to match cell output.
+    """
+    # Dedup + filter alerts by SID. Keep first seen signature/severity
+    # for each unique SID -- matches how the main-table cell counts.
+    unique_alerts: dict[int, dict] = {}
+    for a in (entry.attributed_alerts or ()):
+        if not isinstance(a, dict):
+            continue
+        sid = a.get("sid")
+        if not isinstance(sid, int) or isinstance(sid, bool):
+            continue
+        if sid not in unique_alerts:
+            unique_alerts[sid] = a
+
+    # Dedup + filter notices by note type. Same rationale.
+    unique_notices: dict[str, dict] = {}
+    for n in (entry.attributed_notices or ()):
+        if not isinstance(n, dict):
+            continue
+        note = n.get("note")
+        if not isinstance(note, str) or not note:
+            continue
+        if note not in unique_notices:
+            unique_notices[note] = n
+
+    # Filter observed to logs that actually have entries (defensive;
+    # harvest already does this, but don't assume).
+    observed = {
+        logname: events for logname, events in (entry.observed_evidence or {}).items()
+        if events
+    }
+
+    if not unique_alerts and not unique_notices and not observed:
+        return ""
+
+    lines: list[str] = ["Evidence:", ""]
+
+    if unique_alerts:
+        lines.append(f"- Suricata alerts ({len(unique_alerts)}):")
+        for sid in sorted(unique_alerts):
+            a = unique_alerts[sid]
+            signature = a.get("signature")
+            severity = a.get("severity")
+            parts = [f"  - SID {sid}"]
+            if isinstance(signature, str) and signature:
+                parts.append(f'\u2014 "{signature}"')
+            if isinstance(severity, int) and not isinstance(severity, bool):
+                parts.append(f"(severity {severity})")
+            lines.append(" ".join(parts))
+
+    if unique_notices:
+        lines.append(f"- Zeek notices ({len(unique_notices)}):")
+        for note in sorted(unique_notices):
+            n = unique_notices[note]
+            msg = n.get("msg")
+            if isinstance(msg, str) and msg:
+                lines.append(f'  - {note} \u2014 "{msg}"')
+            else:
+                lines.append(f"  - {note}")
+
+    if observed:
+        lines.append("- Observed (Zeek protocol logs):")
+        for logname in sorted(observed):
+            line = _characterize_observed_log(logname, observed[logname])
+            lines.append(f"  - {line}")
+
+    return "\n".join(lines)
+
+
 def _count_loaded_scripts(loaded_text: str) -> int:
     """Count Zeek scripts in a loaded_scripts.log body.
 
@@ -187,8 +465,15 @@ def render_markdown(ledger: RunLedger) -> str:
     lines.append(f"- **Attacks run:** {len(ledger.attacks)}")
     lines.append(f"- **Coverage:** {ledger.coverage_pct()}% "
                  f"({ledger.detected_count()} detected)")
+    # Collapse raw tier counts to badge-keyed counts so the
+    # UNEXPECTED/PARTIAL tier names never leak into human-facing prose.
+    badge_counts: dict[str, int] = {}
+    for tier, count in vc.items():
+        badge_counts[format_verdict_badge(tier, "unicode")] = (
+            badge_counts.get(format_verdict_badge(tier, "unicode"), 0) + count
+        )
     lines.append(f"- **Verdicts:** " + ", ".join(
-        f"{k}={v}" for k, v in sorted(vc.items())
+        f"{k}={v}" for k, v in sorted(badge_counts.items())
     ))
     lines.append(
         f"- **Ruleset SIDs enabled:** "
@@ -244,22 +529,20 @@ def render_markdown(ledger: RunLedger) -> str:
     # Per-attack table
     lines.append("## Attacks")
     lines.append("")
-    lines.append("| # | Attack | MITRE | Verdict | Duration (s) | Fired SIDs |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| # | Attack | MITRE | Verdict | Duration (s) | Suricata | Zeek |")
+    lines.append("|---|---|---|---|---|---|---|")
     for i, entry in enumerate(ledger.attacks, start=1):
         duration = int(entry.run.probe_end_ts - entry.run.probe_start_ts)
-        sids = [
-            str(a.get("sid")) for a in entry.attributed_alerts
-            if a.get("sid") is not None
-        ]
-        sids_str = ", ".join(sorted(set(sids))) if sids else "-"
+        badge = format_verdict_badge(entry.verdict, "unicode")
+        suri = format_suricata_cell(entry.attributed_alerts)
+        zeek = format_zeek_cell(entry.attributed_notices)
         lines.append(
             f"| {i} | `{entry.attack.name}` | {entry.attack.mitre} "
-            f"| {entry.verdict} | {duration} | {sids_str} |"
+            f"| {badge} | {duration} | {suri} | {zeek} |"
         )
     lines.append("")
 
-    # Narrative per-attack (if available)
+    # Per-attack analysis
     if ledger.narrative.available and ledger.narrative.per_attack_commentary:
         lines.append("## Per-attack analysis")
         lines.append("")
@@ -267,11 +550,39 @@ def render_markdown(ledger: RunLedger) -> str:
             commentary = ledger.narrative.per_attack_commentary.get(
                 entry.attack.name
             )
-            if not commentary:
+            # Always render a section if there's either commentary OR
+            # evidence to show; skip only if both absent.
+            evidence = render_evidence_block(entry)
+            if not commentary and not evidence:
                 continue
-            lines.append(f"### {entry.attack.name} -- {entry.verdict}")
+            badge = format_verdict_badge(entry.verdict, "unicode")
+            lines.append(f"### {entry.attack.name} \u2014 {badge}")
             lines.append("")
-            lines.append(commentary)
+            if evidence:
+                lines.append(evidence)
+                lines.append("")
+            if commentary:
+                lines.append("Commentary:")
+                lines.append("")
+                lines.append(commentary)
+                lines.append("")
+    else:
+        # No LLM narrative available, but we may still have evidence to show.
+        # Iterate attacks and render a compact per-attack evidence section when
+        # present; skip attacks with no evidence.
+        rendered_any = False
+        for entry in ledger.attacks:
+            evidence = render_evidence_block(entry)
+            if not evidence:
+                continue
+            if not rendered_any:
+                lines.append("## Per-attack analysis")
+                lines.append("")
+                rendered_any = True
+            badge = format_verdict_badge(entry.verdict, "unicode")
+            lines.append(f"### {entry.attack.name} \u2014 {badge}")
+            lines.append("")
+            lines.append(evidence)
             lines.append("")
 
     # Remediation suggestions
@@ -350,6 +661,9 @@ th { background: #e9ecef; }
 .remediation code, pre { background: #f1f3f5; padding: 8px; border-radius: 4px;
                          display: block; white-space: pre-wrap; font-size: .85rem; }
 .muted { color: #6c757d; font-style: italic; }
+.evidence { background: #f8f9fa; border: 1px solid #dee2e6; padding: .6rem .8rem;
+            border-radius: 4px; font-family: ui-monospace, monospace;
+            font-size: .85rem; white-space: pre-wrap; margin: .4rem 0 1rem; }
 """
 
 
@@ -451,41 +765,72 @@ def render_html(ledger: RunLedger) -> str:
     parts.append("<table>")
     parts.append(
         "<thead><tr><th>#</th><th>Attack</th><th>MITRE</th><th>Verdict</th>"
-        "<th>Duration</th><th>Fired SIDs</th></tr></thead><tbody>"
+        "<th>Duration</th><th>Suricata</th><th>Zeek</th></tr></thead><tbody>"
     )
     for i, entry in enumerate(ledger.attacks, start=1):
         duration = int(entry.run.probe_end_ts - entry.run.probe_start_ts)
-        sids = sorted({
-            str(a.get("sid")) for a in entry.attributed_alerts
-            if a.get("sid") is not None
-        })
-        sids_str = ", ".join(sids) if sids else "&mdash;"
+        badge = format_verdict_badge(entry.verdict, "unicode")
+        suri = format_suricata_cell(entry.attributed_alerts)
+        zeek = format_zeek_cell(entry.attributed_notices)
         parts.append(
             f"<tr><td>{i}</td>"
             f"<td><code>{esc(entry.attack.name)}</code></td>"
             f"<td>{esc(entry.attack.mitre)}</td>"
             f"<td><span class='verdict v-{esc(entry.verdict)}'>"
-            f"{esc(entry.verdict)}</span></td>"
+            f"{esc(badge)}</span></td>"
             f"<td>{duration}s</td>"
-            f"<td>{sids_str}</td></tr>"
+            f"<td>{esc(suri)}</td>"
+            f"<td>{esc(zeek)}</td></tr>"
         )
     parts.append("</tbody></table>")
 
-    # Per-attack narrative
-    if ledger.narrative.available and ledger.narrative.per_attack_commentary:
-        parts.append("<h2>Per-attack analysis</h2>")
+    # Per-attack narrative + evidence
+    if ledger.narrative.available:
+        attacks_to_render = []
         for entry in ledger.attacks:
             commentary = ledger.narrative.per_attack_commentary.get(
                 entry.attack.name
             )
-            if not commentary:
-                continue
-            parts.append(
-                f"<h3><code>{esc(entry.attack.name)}</code> &mdash; "
-                f"<span class='verdict v-{esc(entry.verdict)}'>"
-                f"{esc(entry.verdict)}</span></h3>"
-            )
-            parts.append(f"<p>{esc(commentary)}</p>")
+            evidence_md = render_evidence_block(entry)
+            if commentary or evidence_md:
+                attacks_to_render.append((entry, commentary, evidence_md))
+        if attacks_to_render:
+            parts.append("<h2>Per-attack analysis</h2>")
+            for entry, commentary, evidence_md in attacks_to_render:
+                badge = format_verdict_badge(entry.verdict, "unicode")
+                parts.append(
+                    f"<h3><code>{esc(entry.attack.name)}</code> &mdash; "
+                    f"<span class='verdict v-{esc(entry.verdict)}'>"
+                    f"{esc(badge)}</span></h3>"
+                )
+                if evidence_md:
+                    # Evidence block is Markdown-shaped; escape and wrap
+                    # in <pre> to keep line breaks + bullets legible.
+                    parts.append(
+                        f"<pre class='evidence'>{esc(evidence_md)}</pre>"
+                    )
+                if commentary:
+                    parts.append(f"<p>{esc(commentary)}</p>")
+    else:
+        # Narrative unavailable -- still show evidence blocks if present.
+        attacks_with_evidence = [
+            (e, render_evidence_block(e)) for e in ledger.attacks
+        ]
+        attacks_with_evidence = [
+            (e, md) for e, md in attacks_with_evidence if md
+        ]
+        if attacks_with_evidence:
+            parts.append("<h2>Per-attack evidence</h2>")
+            for entry, evidence_md in attacks_with_evidence:
+                badge = format_verdict_badge(entry.verdict, "unicode")
+                parts.append(
+                    f"<h3><code>{esc(entry.attack.name)}</code> &mdash; "
+                    f"<span class='verdict v-{esc(entry.verdict)}'>"
+                    f"{esc(badge)}</span></h3>"
+                )
+                parts.append(
+                    f"<pre class='evidence'>{esc(evidence_md)}</pre>"
+                )
 
     # Remediation
     if ledger.narrative.available and ledger.narrative.remediation_suggestions:
@@ -530,6 +875,28 @@ def write_html(ledger: RunLedger, out_path: Path) -> None:
 #  Stdout summary
 # ---------------------------------------------------------------------------
 
+def _count_unique_sids(alerts) -> int:
+    if not alerts:
+        return 0
+    out: set[int] = set()
+    for a in alerts:
+        sid = a.get("sid") if isinstance(a, dict) else None
+        if isinstance(sid, int) and not isinstance(sid, bool):
+            out.add(sid)
+    return len(out)
+
+
+def _count_unique_notes(notices) -> int:
+    if not notices:
+        return 0
+    out: set[str] = set()
+    for n in notices:
+        note = n.get("note") if isinstance(n, dict) else None
+        if isinstance(note, str) and note:
+            out.add(note)
+    return len(out)
+
+
 def render_stdout_summary(ledger: RunLedger) -> str:
     """One-screen text summary for operators tailing the terminal."""
     lines: list[str] = []
@@ -547,8 +914,14 @@ def render_stdout_summary(ledger: RunLedger) -> str:
         f"({ledger.detected_count()} detected)"
     )
     vc = ledger.verdict_counts()
+    # Collapse raw tier counts to ASCII-badge-keyed counts so UNEXPECTED
+    # never appears in the terminal summary either.
+    badge_counts: dict[str, int] = {}
+    for tier, count in vc.items():
+        k = format_verdict_badge(tier, "ascii")
+        badge_counts[k] = badge_counts.get(k, 0) + count
     lines.append("verdicts   : " + ", ".join(
-        f"{k}={v}" for k, v in sorted(vc.items())
+        f"{k}={v}" for k, v in sorted(badge_counts.items())
     ))
     lines.append(
         f"ruleset    : {len(ledger.ruleset_snapshot.enabled_sids)} SIDs enabled"
@@ -559,21 +932,22 @@ def render_stdout_summary(ledger: RunLedger) -> str:
             f"-{len(ledger.ruleset_drift.removed_sids)} vs prior run"
         )
     lines.append("")
-    fmt = "{:<3} {:<34} {:<22} {:>7} {}"
-    lines.append(fmt.format("#", "attack", "verdict", "dur(s)", "sids"))
+    fmt = "{:<3} {:<34} {:<22} {:>7} {:>5} {:>5}"
+    lines.append(fmt.format("#", "attack", "verdict", "dur(s)", "suri", "zeek"))
     lines.append("-" * 72)
     for i, entry in enumerate(ledger.attacks, start=1):
         duration = int(entry.run.probe_end_ts - entry.run.probe_start_ts)
-        sids = sorted({
-            str(a.get("sid")) for a in entry.attributed_alerts
-            if a.get("sid") is not None
-        })
-        sids_str = ",".join(sids) if sids else "-"
+        badge = format_verdict_badge(entry.verdict, "ascii")
+        # Count-only for stdout -- the inline SID/notice list blows out
+        # the 72-col layout. Full detail lives in the HTML/MD report.
+        suri_count = _count_unique_sids(entry.attributed_alerts)
+        zeek_count = _count_unique_notes(entry.attributed_notices)
         lines.append(fmt.format(
             i,
             entry.attack.name[:33],
-            entry.verdict[:21],
+            badge[:21],
             duration,
-            sids_str[:20],
+            suri_count,
+            zeek_count,
         ))
     return "\n".join(lines)
