@@ -42,6 +42,25 @@ trap 'rm -rf "$WORK"' EXIT
 
 echo "=== standalone install starting ($(date -u +%FT%TZ)) ==="
 
+# ---------- Swap provisioning (OOM protection on small instances) ----------
+# t3.medium (3.8 GB RAM) ships with no swap. Zeek workers + Suricata +
+# capture can peak >2.4 GB anon RSS under scan-heavy load, triggering
+# the OOM-killer (observed 2026-04-23: PID 10833 killed at 15:17 UTC,
+# sensor blind until manual restart ~80 min later). A 2 GB swapfile
+# gives the OOM-killer breathing room without an instance-type change.
+# Idempotent — skipped if swap is already configured.
+if [ "$(swapon --show --noheadings | wc -l)" -eq 0 ]; then
+  echo "Provisioning 2GB swapfile at /swapfile"
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "Swap active: $(swapon --show --noheadings | head -1)"
+else
+  echo "Swap already present, skipping provisioning"
+fi
+
 # ---------- Prior-install detection + backup ----------
 SURICATA_PRESENT=0; ZEEK_PRESENT=0
 command -v suricata >/dev/null 2>&1 && SURICATA_PRESENT=1
@@ -663,8 +682,13 @@ cat > /etc/logrotate.d/zeek <<'LOGROTATE'
 }
 LOGROTATE
 
-# ---------- zeekctl cron (rotation, restart on crash, daily checks) ----------
-echo "0 4 * * * root /opt/zeek/bin/zeekctl cron >/dev/null 2>&1" \
+# ---------- zeekctl cron (rotation, restart on crash, 5-min checks) ----------
+# Run every 5 min, not daily. zeekctl cron is Zeek's native watchdog: it
+# detects crashed workers (e.g. OOM-killed) and restarts them. A daily
+# cadence was silently fatal — a 15:17 UTC OOM-kill stayed unhealed until
+# 04:00 the next day, leaving the sensor blind for ~13h. Every 5 min is
+# the cadence Zeek's own docs recommend.
+echo "*/5 * * * * root /opt/zeek/bin/zeekctl cron >/dev/null 2>&1" \
   > /etc/cron.d/zeek-cron
 chmod 644 /etc/cron.d/zeek-cron
 
