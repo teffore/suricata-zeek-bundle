@@ -146,6 +146,88 @@ def format_zeek_cell(notices) -> str:
     return f"{count} ({head}, +{extra} more)"
 
 
+def _characterize_observed_log(logname: str, events) -> str:
+    """Produce a one-line summary for one protocol log's attributed events.
+
+    Returns e.g.:
+      "software.log: 2 entries (gobuster/3.8.2)"
+      "ftp.log: 16 entries (14 auth failures)"
+      "ssl.log: 3 entries (SNI: trycloudflare.com)"
+      "mystery.log: 5 entries"   (fallback when no characterizer named)
+
+    events is an iterable of dicts (normalized Zeek log events).
+    """
+    events = list(events) if events else []
+    n = len(events)
+    base = f"{logname}: {n} entries"
+    if n == 0:
+        return base
+
+    if logname == "software.log":
+        versions = {
+            e.get("unparsed_version") for e in events
+            if isinstance(e, dict) and isinstance(e.get("unparsed_version"), str)
+        }
+        versions.discard(None)
+        if versions:
+            sample = sorted(versions)[0]
+            return f"{base} ({sample})"
+        return base
+
+    if logname == "files.log":
+        mimes = {
+            e.get("mime_type") for e in events
+            if isinstance(e, dict) and isinstance(e.get("mime_type"), str)
+        }
+        if mimes:
+            return f"{base} (" + ", ".join(sorted(mimes)) + ")"
+        return base
+
+    if logname in ("ssl.log", "x509.log"):
+        snis = {
+            e.get("server_name") for e in events
+            if isinstance(e, dict) and isinstance(e.get("server_name"), str)
+        }
+        if snis:
+            sample = sorted(snis)[0]
+            return f"{base} (SNI: {sample})"
+        return base
+
+    if logname == "ftp.log":
+        fails = sum(
+            1 for e in events
+            if isinstance(e, dict) and e.get("reply_code") == 530
+        )
+        if fails:
+            return f"{base} ({fails} auth failures)"
+        return base
+
+    if logname == "dns.log":
+        queries = [
+            e.get("query") for e in events
+            if isinstance(e, dict) and isinstance(e.get("query"), str)
+        ]
+        if queries:
+            sample = queries[0]
+            return f"{base} (query: {sample})"
+        return base
+
+    if logname == "http.log":
+        hosts = {
+            e.get("host") for e in events
+            if isinstance(e, dict) and isinstance(e.get("host"), str)
+        }
+        if hosts:
+            sample = sorted(hosts)[0]
+            return f"{base} (host: {sample})"
+        return base
+
+    if logname == "conn.log":
+        return f"{base} ({n} flows)"
+
+    return base
+
+
 def _count_loaded_scripts(loaded_text: str) -> int:
     """Count Zeek scripts in a loaded_scripts.log body.
 

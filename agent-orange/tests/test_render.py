@@ -191,6 +191,88 @@ class TestFormatZeekCell:
         assert format_zeek_cell(notices) == "2 (Alpha, Zeta)"
 
 
+class TestCharacterizeObservedLog:
+    """Per-log-type one-liner generator for Evidence block Observed rows.
+
+    For each known log type, extracts a key field; falls back to count
+    only for unknown log types. Always returns a line like
+    '<logname>.log: N entries (<summary>)' or just '<logname>.log: N entries'.
+    """
+
+    def test_empty_events_returns_count_zero_line(self):
+        # Defensive -- caller should have filtered out empty; but if not,
+        # helper must not crash.
+        from agent_orange_pkg.render import _characterize_observed_log
+        assert _characterize_observed_log("http.log", []) == "http.log: 0 entries"
+
+    def test_software_log_extracts_user_agents(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"software_type": "HTTP::BROWSER", "unparsed_version": "gobuster/3.8.2"},
+            {"software_type": "HTTP::BROWSER", "unparsed_version": "gobuster/3.8.2"},
+        ]
+        out = _characterize_observed_log("software.log", events)
+        assert "software.log: 2 entries" in out
+        assert "gobuster/3.8.2" in out
+
+    def test_files_log_extracts_mime_types(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"mime_type": "application/x-dosexec"},
+            {"mime_type": "text/html"},
+        ]
+        out = _characterize_observed_log("files.log", events)
+        assert "files.log: 2 entries" in out
+        assert "x-dosexec" in out or "text/html" in out
+
+    def test_ssl_log_extracts_sni(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"server_name": "trycloudflare.com"},
+            {"server_name": "abc.trycloudflare.com"},
+        ]
+        out = _characterize_observed_log("ssl.log", events)
+        assert "ssl.log: 2 entries" in out
+        assert "trycloudflare.com" in out
+
+    def test_ftp_log_counts_auth_failures(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [
+            {"command": "PASS", "reply_code": 530},
+            {"command": "PASS", "reply_code": 530},
+            {"command": "USER"},
+        ]
+        out = _characterize_observed_log("ftp.log", events)
+        assert "ftp.log: 3 entries" in out
+        assert "2 auth" in out or "530" in out
+
+    def test_dns_log_extracts_queries(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"query": "evil.example.com"}, {"query": "test.local"}]
+        out = _characterize_observed_log("dns.log", events)
+        assert "dns.log: 2 entries" in out
+        assert "evil.example.com" in out or "test.local" in out
+
+    def test_http_log_extracts_host(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"host": "victim.local", "uri": "/a"}, {"host": "victim.local", "uri": "/b"}]
+        out = _characterize_observed_log("http.log", events)
+        assert "http.log: 2 entries" in out
+        assert "victim.local" in out
+
+    def test_conn_log_counts_flows(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"uid": "C1"}, {"uid": "C2"}, {"uid": "C3"}]
+        out = _characterize_observed_log("conn.log", events)
+        assert "conn.log: 3 entries" in out
+        assert "flow" in out.lower()
+
+    def test_unknown_log_falls_back_to_count_only(self):
+        from agent_orange_pkg.render import _characterize_observed_log
+        events = [{"foo": "bar"}, {"foo": "baz"}]
+        assert _characterize_observed_log("mystery.log", events) == "mystery.log: 2 entries"
+
+
 # ---------------------------------------------------------------------------
 #  ledger_to_dict
 # ---------------------------------------------------------------------------
