@@ -484,6 +484,33 @@ class TestRenderMarkdown:
         assert "`art-one`" in md
         assert "`art-two`" in md
 
+    def test_attack_table_has_suricata_and_zeek_columns(self):
+        # Main-table column header must be split.
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("art-one"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("art-two"), verdict="UNDETECTED"),
+        ])
+        md = render_markdown(ledger)
+        assert "`art-one`" in md
+        assert "`art-two`" in md
+        assert "Suricata" in md
+        assert "Zeek" in md
+        assert "Fired SIDs" not in md  # old column name must be gone
+
+    def test_verdict_badge_used_not_raw_tier(self):
+        # The visible verdict must use the badge, never the raw tier.
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("a"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("b"), verdict="DETECTED_UNEXPECTED"),
+            make_entry(make_attack("c"), verdict="UNDETECTED"),
+        ])
+        md = render_markdown(ledger)
+        # Exact-match gets the checkmark
+        assert "DETECTED \u2713" in md
+        # UNEXPECTED renders as plain DETECTED, NOT the raw tier name
+        assert "DETECTED_UNEXPECTED" not in md
+        assert "UNDETECTED" in md
+
     def test_unavailable_narrative_renders_notice(self):
         ledger = make_ledger(
             narrative=make_narrative(available=False, error="api key missing"),
@@ -501,6 +528,40 @@ class TestRenderMarkdown:
         md = render_markdown(ledger)
         assert "## Executive summary" in md
         assert "50% coverage across ART." in md
+
+    def test_evidence_block_appears_for_attacks_with_evidence(self):
+        # Per-attack analysis section must include the new Evidence block.
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-fires"),
+                verdict="DETECTED_UNEXPECTED",
+                alerts=[{"sid": 2001219, "signature": "ET scan"}],
+                notices=[{"note": "Scan::Port_Scan"}],
+            ),
+        ])
+        md = render_markdown(ledger)
+        assert "Evidence:" in md
+        assert "Suricata alerts (1)" in md
+        assert "2001219" in md
+        assert "Scan::Port_Scan" in md
+
+    def test_failed_attack_omits_evidence_block_entirely(self):
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-failed"),
+                verdict="FAILED",
+                status="FAILED",
+                alerts=[],
+                notices=[],
+            ),
+        ])
+        md = render_markdown(ledger)
+        # Evidence header must NOT appear under a FAILED attack with no data
+        attack_section_start = md.find("art-failed")
+        if attack_section_start != -1:
+            # Only look in that attack's section (up to next ### or end)
+            after = md[attack_section_start:]
+            assert "Evidence:" not in after[:500]
 
 
 # ---------------------------------------------------------------------------

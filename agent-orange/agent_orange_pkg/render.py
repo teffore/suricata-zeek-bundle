@@ -442,8 +442,15 @@ def render_markdown(ledger: RunLedger) -> str:
     lines.append(f"- **Attacks run:** {len(ledger.attacks)}")
     lines.append(f"- **Coverage:** {ledger.coverage_pct()}% "
                  f"({ledger.detected_count()} detected)")
+    # Collapse raw tier counts to badge-keyed counts so the
+    # UNEXPECTED/PARTIAL tier names never leak into human-facing prose.
+    badge_counts: dict[str, int] = {}
+    for tier, count in vc.items():
+        badge_counts[format_verdict_badge(tier, "unicode")] = (
+            badge_counts.get(format_verdict_badge(tier, "unicode"), 0) + count
+        )
     lines.append(f"- **Verdicts:** " + ", ".join(
-        f"{k}={v}" for k, v in sorted(vc.items())
+        f"{k}={v}" for k, v in sorted(badge_counts.items())
     ))
     lines.append(
         f"- **Ruleset SIDs enabled:** "
@@ -499,22 +506,20 @@ def render_markdown(ledger: RunLedger) -> str:
     # Per-attack table
     lines.append("## Attacks")
     lines.append("")
-    lines.append("| # | Attack | MITRE | Verdict | Duration (s) | Fired SIDs |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| # | Attack | MITRE | Verdict | Duration (s) | Suricata | Zeek |")
+    lines.append("|---|---|---|---|---|---|---|")
     for i, entry in enumerate(ledger.attacks, start=1):
         duration = int(entry.run.probe_end_ts - entry.run.probe_start_ts)
-        sids = [
-            str(a.get("sid")) for a in entry.attributed_alerts
-            if a.get("sid") is not None
-        ]
-        sids_str = ", ".join(sorted(set(sids))) if sids else "-"
+        badge = format_verdict_badge(entry.verdict, "unicode")
+        suri = format_suricata_cell(entry.attributed_alerts)
+        zeek = format_zeek_cell(entry.attributed_notices)
         lines.append(
             f"| {i} | `{entry.attack.name}` | {entry.attack.mitre} "
-            f"| {entry.verdict} | {duration} | {sids_str} |"
+            f"| {badge} | {duration} | {suri} | {zeek} |"
         )
     lines.append("")
 
-    # Narrative per-attack (if available)
+    # Per-attack analysis
     if ledger.narrative.available and ledger.narrative.per_attack_commentary:
         lines.append("## Per-attack analysis")
         lines.append("")
@@ -522,11 +527,39 @@ def render_markdown(ledger: RunLedger) -> str:
             commentary = ledger.narrative.per_attack_commentary.get(
                 entry.attack.name
             )
-            if not commentary:
+            # Always render a section if there's either commentary OR
+            # evidence to show; skip only if both absent.
+            evidence = render_evidence_block(entry)
+            if not commentary and not evidence:
                 continue
-            lines.append(f"### {entry.attack.name} -- {entry.verdict}")
+            badge = format_verdict_badge(entry.verdict, "unicode")
+            lines.append(f"### {entry.attack.name} \u2014 {badge}")
             lines.append("")
-            lines.append(commentary)
+            if evidence:
+                lines.append(evidence)
+                lines.append("")
+            if commentary:
+                lines.append("Commentary:")
+                lines.append("")
+                lines.append(commentary)
+                lines.append("")
+    else:
+        # No LLM narrative available, but we may still have evidence to show.
+        # Iterate attacks and render a compact per-attack evidence section when
+        # present; skip attacks with no evidence.
+        rendered_any = False
+        for entry in ledger.attacks:
+            evidence = render_evidence_block(entry)
+            if not evidence:
+                continue
+            if not rendered_any:
+                lines.append("## Per-attack analysis")
+                lines.append("")
+                rendered_any = True
+            badge = format_verdict_badge(entry.verdict, "unicode")
+            lines.append(f"### {entry.attack.name} \u2014 {badge}")
+            lines.append("")
+            lines.append(evidence)
             lines.append("")
 
     # Remediation suggestions
