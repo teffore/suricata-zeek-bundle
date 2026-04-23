@@ -638,6 +638,9 @@ th { background: #e9ecef; }
 .remediation code, pre { background: #f1f3f5; padding: 8px; border-radius: 4px;
                          display: block; white-space: pre-wrap; font-size: .85rem; }
 .muted { color: #6c757d; font-style: italic; }
+.evidence { background: #f8f9fa; border: 1px solid #dee2e6; padding: .6rem .8rem;
+            border-radius: 4px; font-family: ui-monospace, monospace;
+            font-size: .85rem; white-space: pre-wrap; margin: .4rem 0 1rem; }
 """
 
 
@@ -739,41 +742,72 @@ def render_html(ledger: RunLedger) -> str:
     parts.append("<table>")
     parts.append(
         "<thead><tr><th>#</th><th>Attack</th><th>MITRE</th><th>Verdict</th>"
-        "<th>Duration</th><th>Fired SIDs</th></tr></thead><tbody>"
+        "<th>Duration</th><th>Suricata</th><th>Zeek</th></tr></thead><tbody>"
     )
     for i, entry in enumerate(ledger.attacks, start=1):
         duration = int(entry.run.probe_end_ts - entry.run.probe_start_ts)
-        sids = sorted({
-            str(a.get("sid")) for a in entry.attributed_alerts
-            if a.get("sid") is not None
-        })
-        sids_str = ", ".join(sids) if sids else "&mdash;"
+        badge = format_verdict_badge(entry.verdict, "unicode")
+        suri = format_suricata_cell(entry.attributed_alerts)
+        zeek = format_zeek_cell(entry.attributed_notices)
         parts.append(
             f"<tr><td>{i}</td>"
             f"<td><code>{esc(entry.attack.name)}</code></td>"
             f"<td>{esc(entry.attack.mitre)}</td>"
             f"<td><span class='verdict v-{esc(entry.verdict)}'>"
-            f"{esc(entry.verdict)}</span></td>"
+            f"{esc(badge)}</span></td>"
             f"<td>{duration}s</td>"
-            f"<td>{sids_str}</td></tr>"
+            f"<td>{esc(suri)}</td>"
+            f"<td>{esc(zeek)}</td></tr>"
         )
     parts.append("</tbody></table>")
 
-    # Per-attack narrative
-    if ledger.narrative.available and ledger.narrative.per_attack_commentary:
-        parts.append("<h2>Per-attack analysis</h2>")
+    # Per-attack narrative + evidence
+    if ledger.narrative.available:
+        attacks_to_render = []
         for entry in ledger.attacks:
             commentary = ledger.narrative.per_attack_commentary.get(
                 entry.attack.name
             )
-            if not commentary:
-                continue
-            parts.append(
-                f"<h3><code>{esc(entry.attack.name)}</code> &mdash; "
-                f"<span class='verdict v-{esc(entry.verdict)}'>"
-                f"{esc(entry.verdict)}</span></h3>"
-            )
-            parts.append(f"<p>{esc(commentary)}</p>")
+            evidence_md = render_evidence_block(entry)
+            if commentary or evidence_md:
+                attacks_to_render.append((entry, commentary, evidence_md))
+        if attacks_to_render:
+            parts.append("<h2>Per-attack analysis</h2>")
+            for entry, commentary, evidence_md in attacks_to_render:
+                badge = format_verdict_badge(entry.verdict, "unicode")
+                parts.append(
+                    f"<h3><code>{esc(entry.attack.name)}</code> &mdash; "
+                    f"<span class='verdict v-{esc(entry.verdict)}'>"
+                    f"{esc(badge)}</span></h3>"
+                )
+                if evidence_md:
+                    # Evidence block is Markdown-shaped; escape and wrap
+                    # in <pre> to keep line breaks + bullets legible.
+                    parts.append(
+                        f"<pre class='evidence'>{esc(evidence_md)}</pre>"
+                    )
+                if commentary:
+                    parts.append(f"<p>{esc(commentary)}</p>")
+    else:
+        # Narrative unavailable -- still show evidence blocks if present.
+        attacks_with_evidence = [
+            (e, render_evidence_block(e)) for e in ledger.attacks
+        ]
+        attacks_with_evidence = [
+            (e, md) for e, md in attacks_with_evidence if md
+        ]
+        if attacks_with_evidence:
+            parts.append("<h2>Per-attack evidence</h2>")
+            for entry, evidence_md in attacks_with_evidence:
+                badge = format_verdict_badge(entry.verdict, "unicode")
+                parts.append(
+                    f"<h3><code>{esc(entry.attack.name)}</code> &mdash; "
+                    f"<span class='verdict v-{esc(entry.verdict)}'>"
+                    f"{esc(badge)}</span></h3>"
+                )
+                parts.append(
+                    f"<pre class='evidence'>{esc(evidence_md)}</pre>"
+                )
 
     # Remediation
     if ledger.narrative.available and ledger.narrative.remediation_suggestions:

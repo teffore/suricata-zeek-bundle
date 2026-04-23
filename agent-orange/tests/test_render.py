@@ -576,7 +576,8 @@ class TestRenderHtml:
         assert "<style>" in html  # CSS inline
         assert "<link" not in html  # no external sheets
 
-    def test_verdict_css_class_present_per_entry(self):
+    def test_css_classes_still_keyed_off_internal_tier(self):
+        # HTML classes are stable even though visible text changes.
         ledger = make_ledger(entries=[
             make_entry(make_attack("a"), verdict="DETECTED_EXPECTED"),
             make_entry(make_attack("b"), verdict="FAILED"),
@@ -585,15 +586,55 @@ class TestRenderHtml:
         assert "v-DETECTED_EXPECTED" in html
         assert "v-FAILED" in html
 
+    def test_verdict_visible_text_uses_badge_not_raw_tier(self):
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("a"), verdict="DETECTED_EXPECTED"),
+            make_entry(make_attack("b"), verdict="DETECTED_UNEXPECTED"),
+        ])
+        html = render_html(ledger)
+        # The span's displayed text uses the badge
+        assert ">DETECTED \u2713<" in html
+        assert ">DETECTED<" in html
+        # The UNEXPECTED word never appears in visible prose. CSS class
+        # names (v-DETECTED_UNEXPECTED) are allowed -- they're inside
+        # attribute values OR inside <style>...</style> where they're
+        # selectors, not displayed text.
+        import re
+        body_only = re.sub(
+            r"<style>.*?</style>", "", html, flags=re.DOTALL,
+        )
+        assert re.search(r">[^<]*UNEXPECTED[^<]*<", body_only) is None
+
+    def test_attack_table_has_suricata_and_zeek_columns(self):
+        ledger = make_ledger(entries=[
+            make_entry(make_attack("art-one"), verdict="DETECTED_EXPECTED"),
+        ])
+        html = render_html(ledger)
+        assert "<th>Suricata</th>" in html
+        assert "<th>Zeek</th>" in html
+        assert "<th>Fired SIDs</th>" not in html
+
     def test_escapes_attack_name_with_html_special_chars(self):
-        # Defensive: if an attack ever has HTML metacharacters in its
-        # name (unlikely given snake-case convention, but possible for
-        # rationale or commentary) the output must not break.
         attack = make_attack("art-<injection>")
         ledger = make_ledger(entries=[make_entry(attack, verdict="UNDETECTED")])
         html = render_html(ledger)
         assert "art-&lt;injection&gt;" in html
         assert "<injection>" not in html
+
+    def test_evidence_block_appears_in_per_attack_section(self):
+        ledger = make_ledger(entries=[
+            make_entry(
+                make_attack("art-fires"),
+                verdict="DETECTED_UNEXPECTED",
+                alerts=[{"sid": 2001219, "signature": "ET scan"}],
+                notices=[{"note": "Scan::Port_Scan"}],
+            ),
+        ])
+        html = render_html(ledger)
+        # Evidence markup present (Markdown block rendered inside HTML)
+        assert "Evidence:" in html or "<h4>Evidence" in html
+        assert "2001219" in html
+        assert "Scan::Port_Scan" in html
 
 
 # ---------------------------------------------------------------------------
