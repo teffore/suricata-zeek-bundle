@@ -1133,9 +1133,9 @@ probes:
 
   - name: art-scp-over-ssh-exfil
     category: exfil
-    mitre: T1048
+    mitre: T1048.002
     source: atomic-red-team
-    art_test: "T1048 #3"
+    art_test: "T1048.002 #3"
     rationale: "scp exfil over SSH — asymmetric flow shape indicative of bulk staging"
     expected_sids: []
     expected_verdict: UNDETECTED
