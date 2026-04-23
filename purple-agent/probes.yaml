@@ -295,7 +295,7 @@ probes:
 
   - name: telegram-bot-api-sni
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Telegram Bot API SNI exfil"
     expected_sids: [2033967]
     expected_verdict: DETECTED
@@ -316,7 +316,7 @@ probes:
 
   - name: openai-api-sni-exfil
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "OpenAI API SNI — LLM exfil (KNOWN GAP)"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -328,7 +328,7 @@ probes:
 
   - name: anthropic-api-sni-exfil
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Anthropic Claude API SNI — LLM exfil (KNOWN GAP)"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -340,7 +340,7 @@ probes:
 
   - name: gemini-api-sni-exfil
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Google Gemini SNI — LLM exfil (KNOWN GAP)"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -351,7 +351,7 @@ probes:
 
   - name: huggingface-dataset-pull
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "HuggingFace dataset SNI — LLM model/data exfil"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -373,7 +373,7 @@ probes:
 
   - name: slack-webhook-c2
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "Slack incoming webhook SNI"
     expected_sids: []
     expected_verdict: UNDETECTED
@@ -406,7 +406,7 @@ probes:
 
   - name: webhook-site-inspection
     category: exfil-saas
-    mitre: T1567
+    mitre: T1567.002
     rationale: "webhook.site SNI — inspection service abuse"
     expected_sids: [2034634, 2067060]
     expected_verdict: DETECTED
