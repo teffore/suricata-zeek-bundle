@@ -533,8 +533,8 @@ probes:
 
   - name: http2-h2c-jndi-header
     category: evasion
-    mitre: T1090
-    rationale: "HTTP/2 h2c prior-knowledge with JNDI in UA — applayer-mismatch + http2-frame"
+    mitre: T1190
+    rationale: "HTTP/2 h2c prior-knowledge carrying a JNDI (Log4Shell) payload in UA — public-facing app exploit; h2c wrapper is the evasion vehicle"
     expected_sids: [2260000, 2290006]
     expected_verdict: DETECTED
     already_in_catalog: true
