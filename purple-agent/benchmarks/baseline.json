@@ -1,0 +1,152 @@
+{
+  "run_id": "20260423T154346Z",
+  "started_at": "2026-04-23T15:43:45Z",
+  "ended_at": "2026-04-23T15:56:19Z",
+  "total_seconds": 754,
+  "probes_expected": 10,
+  "probes_run": 10,
+  "order_honored": true,
+  "expected_order": [
+    "art-masscan-syn-burst",
+    "art-gobuster-dvwa-dir-enum",
+    "art-wget-post-https-exfil",
+    "art-icmpdoor-c2",
+    "art-socat-tls-reverse-shell",
+    "art-cloudflared-tunnel",
+    "art-rclone-s3-sni",
+    "art-hydra-ftp-brute",
+    "art-slowhttptest-slowloris",
+    "art-tor-bootstrap"
+  ],
+  "actual_order": [
+    "art-masscan-syn-burst",
+    "art-gobuster-dvwa-dir-enum",
+    "art-wget-post-https-exfil",
+    "art-icmpdoor-c2",
+    "art-socat-tls-reverse-shell",
+    "art-cloudflared-tunnel",
+    "art-rclone-s3-sni",
+    "art-hydra-ftp-brute",
+    "art-slowhttptest-slowloris",
+    "art-tor-bootstrap"
+  ],
+  "per_probe": [
+    {
+      "order": 1,
+      "expected": "art-masscan-syn-burst",
+      "actual": "art-masscan-syn-burst",
+      "ts": "2026-04-23T15:45:08.745803+00:00",
+      "inferred_duration_s": 57.94,
+      "verdict": "DETECTED",
+      "confidence": "partial",
+      "mitre_id": "T1046"
+    },
+    {
+      "order": 2,
+      "expected": "art-gobuster-dvwa-dir-enum",
+      "actual": "art-gobuster-dvwa-dir-enum",
+      "ts": "2026-04-23T15:46:06.689298+00:00",
+      "inferred_duration_s": 42.7,
+      "verdict": "UNDETECTED",
+      "confidence": "none",
+      "mitre_id": "T1595.003"
+    },
+    {
+      "order": 3,
+      "expected": "art-wget-post-https-exfil",
+      "actual": "art-wget-post-https-exfil",
+      "ts": "2026-04-23T15:46:49.391625+00:00",
+      "inferred_duration_s": 50.23,
+      "verdict": "UNDETECTED",
+      "confidence": "none",
+      "mitre_id": "T1048.002"
+    },
+    {
+      "order": 4,
+      "expected": "art-icmpdoor-c2",
+      "actual": "art-icmpdoor-c2",
+      "ts": "2026-04-23T15:47:39.620164+00:00",
+      "inferred_duration_s": 51.09,
+      "verdict": "UNDETECTED",
+      "confidence": "none",
+      "mitre_id": "T1095"
+    },
+    {
+      "order": 5,
+      "expected": "art-socat-tls-reverse-shell",
+      "actual": "art-socat-tls-reverse-shell",
+      "ts": "2026-04-23T15:48:30.710600+00:00",
+      "inferred_duration_s": 79.97,
+      "verdict": "UNDETECTED",
+      "confidence": "none",
+      "mitre_id": "T1059.004"
+    },
+    {
+      "order": 6,
+      "expected": "art-cloudflared-tunnel",
+      "actual": "art-cloudflared-tunnel",
+      "ts": "2026-04-23T15:49:50.676545+00:00",
+      "inferred_duration_s": 99.23,
+      "verdict": "DETECTED",
+      "confidence": "high",
+      "mitre_id": "T1572"
+    },
+    {
+      "order": 7,
+      "expected": "art-rclone-s3-sni",
+      "actual": "art-rclone-s3-sni",
+      "ts": "2026-04-23T15:51:29.911038+00:00",
+      "inferred_duration_s": 85.04,
+      "verdict": "UNDETECTED",
+      "confidence": "none",
+      "mitre_id": "T1567.002"
+    },
+    {
+      "order": 8,
+      "expected": "art-hydra-ftp-brute",
+      "actual": "art-hydra-ftp-brute",
+      "ts": "2026-04-23T15:52:54.947925+00:00",
+      "inferred_duration_s": 81.81,
+      "verdict": "DETECTED",
+      "confidence": "partial",
+      "mitre_id": "T1110.001"
+    },
+    {
+      "order": 9,
+      "expected": "art-slowhttptest-slowloris",
+      "actual": "art-slowhttptest-slowloris",
+      "ts": "2026-04-23T15:54:16.760435+00:00",
+      "inferred_duration_s": 110.91,
+      "verdict": "DETECTED",
+      "confidence": "partial",
+      "mitre_id": "T1499.002"
+    },
+    {
+      "order": 10,
+      "expected": "art-tor-bootstrap",
+      "actual": "art-tor-bootstrap",
+      "ts": "2026-04-23T15:56:07.670855+00:00",
+      "inferred_duration_s": 11.33,
+      "verdict": "DETECTED",
+      "confidence": "high",
+      "mitre_id": "T1090.003"
+    }
+  ],
+  "detection_summary": {
+    "total": 10,
+    "detected": 5,
+    "undetected": 5,
+    "other": 0,
+    "coverage_pct": 50.0,
+    "verdict_distribution": {
+      "DETECTED": 5,
+      "UNDETECTED": 5
+    }
+  },
+  "accuracy": {
+    "overclaim_count": 2,
+    "structural_issues_count": 0,
+    "sensor_alerts_in_window": 16,
+    "sensor_notices_in_window": 0
+  }
+}
