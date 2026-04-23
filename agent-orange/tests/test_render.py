@@ -75,6 +75,57 @@ class TestFormatVerdictBadge:
         assert format_verdict_badge("DETECTED_EXPECTED", "html5") == "DETECTED \u2713"
 
 
+class TestFormatSuricataCell:
+    """Suricata column: '0 or --' / 'N (sid1, sid2, sid3)' / 'N (sid1, sid2, +K more)'."""
+
+    def test_empty_renders_dash(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        assert format_suricata_cell([]) == "\u2014"
+
+    def test_none_input_renders_dash(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        # Defensive: ledger might omit the list on some paths; treat as empty.
+        assert format_suricata_cell(None) == "\u2014"
+
+    def test_single_sid(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 2001219}]
+        assert format_suricata_cell(alerts) == "1 (2001219)"
+
+    def test_three_sids_at_threshold_no_truncation(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 1}, {"sid": 2}, {"sid": 3}]
+        assert format_suricata_cell(alerts) == "3 (1, 2, 3)"
+
+    def test_five_sids_truncate_to_three_plus_more(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 1}, {"sid": 2}, {"sid": 3}, {"sid": 4}, {"sid": 5}]
+        assert format_suricata_cell(alerts) == "5 (1, 2, 3, +2 more)"
+
+    def test_duplicate_sids_deduped_in_display(self):
+        # Raw alerts can repeat; cell shows unique SIDs, count reflects unique.
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 9000003}, {"sid": 9000003}, {"sid": 9000003}]
+        assert format_suricata_cell(alerts) == "1 (9000003)"
+
+    def test_missing_sid_field_skipped(self):
+        # Alert without a sid is diagnostic noise; don't count it.
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 2001219}, {"signature": "no sid here"}]
+        assert format_suricata_cell(alerts) == "1 (2001219)"
+
+    def test_non_int_sid_skipped(self):
+        # Same hygiene as verdict.classify -- stringly-typed sid is harvest bug.
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 2001219}, {"sid": "2002383"}]
+        assert format_suricata_cell(alerts) == "1 (2001219)"
+
+    def test_sids_sorted_ascending_for_stable_output(self):
+        from agent_orange_pkg.render import format_suricata_cell
+        alerts = [{"sid": 9000003}, {"sid": 2001219}]
+        assert format_suricata_cell(alerts) == "2 (2001219, 9000003)"
+
+
 # ---------------------------------------------------------------------------
 #  ledger_to_dict
 # ---------------------------------------------------------------------------

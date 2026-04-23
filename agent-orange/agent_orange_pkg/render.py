@@ -74,6 +74,41 @@ def format_verdict_badge(tier: str, style: str) -> str:
     return table.get(tier, tier)
 
 
+def format_suricata_cell(alerts) -> str:
+    """Format the Suricata column cell for the main attack table.
+
+    Takes an iterable of attributed Suricata alert dicts (each must have
+    an integer `sid` field; non-int and missing sid fields are skipped
+    defensively, matching verdict._extract_sids hygiene).
+
+    Output shape:
+      - 0 alerts      -> "--"
+      - 1 alert       -> "1 (<sid>)"
+      - 2-3 alerts    -> "N (sid1, sid2, sid3)"
+      - 4+ alerts     -> "N (sid1, sid2, sid3, +K more)" where K=N-3
+
+    SIDs are deduplicated and sorted ascending for stable output across
+    runs (otherwise dict iteration order could shuffle them).
+    """
+    if not alerts:
+        return "\u2014"
+    sids: set[int] = set()
+    for a in alerts:
+        sid = a.get("sid") if isinstance(a, dict) else None
+        if isinstance(sid, int) and not isinstance(sid, bool):
+            sids.add(sid)
+    if not sids:
+        return "\u2014"
+    sorted_sids = sorted(sids)
+    n = len(sorted_sids)
+    if n <= 3:
+        inline = ", ".join(str(s) for s in sorted_sids)
+        return f"{n} ({inline})"
+    head = ", ".join(str(s) for s in sorted_sids[:3])
+    extra = n - 3
+    return f"{n} ({head}, +{extra} more)"
+
+
 def _count_loaded_scripts(loaded_text: str) -> int:
     """Count Zeek scripts in a loaded_scripts.log body.
 
