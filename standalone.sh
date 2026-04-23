@@ -538,6 +538,30 @@ redef Scan::scan_timeout = 2 mins;
 redef Intel::read_files += { "/opt/zeek/intel/intel.dat" };
 EOF
 
+# ---------- Deploy purple-*.zeek behavioral scripts ----------
+# lab-up.sh scp's repo/zeek/site/*.zeek into /tmp/purple-zeek on the
+# sensor (if the directory exists in the repo checkout). Copy them into
+# the Zeek site dir and @load each from local.zeek so they start firing
+# on the next zeekctl deploy below.
+#
+# Scripts shipped here (each a standalone, side-effect-free detector):
+#   - purple-ras-intel.zeek        : Remote Access Software SNI substring
+#   - purple-ua-diversity.zeek     : > N distinct UAs per src in window
+#   - purple-ssh-asymmetry.zeek    : asymmetric-bytes SSH bulk-upload flag
+#
+# No-op if /tmp/purple-zeek is absent (running standalone.sh outside the
+# bundled lab-up.sh flow).
+if [ -d /tmp/purple-zeek ] && ls /tmp/purple-zeek/*.zeek >/dev/null 2>&1; then
+  echo "Installing purple-*.zeek behavioral scripts"
+  cp /tmp/purple-zeek/*.zeek /opt/zeek/share/zeek/site/
+  for s in /tmp/purple-zeek/*.zeek; do
+    name=$(basename "$s" .zeek)
+    if ! grep -q "@load site/$name" /opt/zeek/share/zeek/site/local.zeek; then
+      echo "@load site/$name" >> /opt/zeek/share/zeek/site/local.zeek
+    fi
+  done
+fi
+
 # ---------- Zeek Intel Framework feeds (Iteration 7) ----------
 # Fetch abuse.ch URLhaus (malware URLs, domains) and Feodo Tracker
 # (botnet C2 IPs) feeds. Convert them to Zeek's intel.dat format
