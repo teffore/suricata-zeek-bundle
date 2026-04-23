@@ -122,18 +122,43 @@ class TestComputeDrift:
 # ---------------------------------------------------------------------------
 
 class TestBuildSnapshotCommand:
-    def test_includes_rules_glob(self):
+    def test_includes_correct_rules_path(self):
+        # Suricata 8 via suricata-update on Ubuntu puts rules under
+        # /var/lib/suricata/rules/, NOT /etc/suricata/rules/. The earlier
+        # path regressed the ruleset snapshot to 0 SIDs on live lab runs
+        # because /etc/suricata/rules/ doesn't exist on that install.
         cmd = build_snapshot_command()
-        assert "/etc/suricata/rules/*.rules" in cmd
+        assert "/var/lib/suricata/rules/*.rules" in cmd
+        assert "/etc/suricata/rules/" not in cmd
+
+    def test_glob_expansion_runs_under_sudo(self):
+        # /var/lib/suricata/rules/ is group-readable by `suricata` only,
+        # not world-readable. If the calling shell does the glob expansion
+        # BEFORE sudo, it fails to list the directory and the glob expands
+        # to nothing -- `cat` then reads literal "*.rules" which doesn't
+        # exist, and the whole pipeline returns zero SIDs.
+        #
+        # Wrapping as `sudo sh -c 'cat /path/*.rules'` runs the glob
+        # expansion inside the sudo'd shell with root privs, so it works.
+        cmd = build_snapshot_command()
+        assert "sudo sh -c" in cmd or "sudo bash -c" in cmd
 
     def test_filters_comment_lines(self):
         cmd = build_snapshot_command()
-        # Must drop comment lines so commented-out rules don't leak.
-        assert "grep -v '^\\s*#'" in cmd or "grep -v" in cmd
+        assert "grep -v" in cmd
 
     def test_sorts_unique(self):
         cmd = build_snapshot_command()
         assert "sort -un" in cmd
+
+    def test_regex_uses_portable_space_class(self):
+        # `\s` is a Perl regex extension and not reliably supported by
+        # `grep -E` across distros. POSIX `[[:space:]]` is portable.
+        cmd = build_snapshot_command()
+        # If the command uses \s inside an -E pattern, it may or may not
+        # work depending on the grep implementation. Require [[:space:]]
+        # so we don't play grep-implementation roulette on the sensor.
+        assert "[[:space:]]" in cmd
 
 
 # ---------------------------------------------------------------------------

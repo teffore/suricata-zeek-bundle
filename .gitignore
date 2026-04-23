@@ -28,5 +28,11 @@ purple-agent/benchmarks/results/*.log
 # self-contained under agent-orange/runs/<ts>/. A baseline run can be
 # committed by name (e.g., agent-orange/runs/baseline-YYYYMMDD/).
 agent-orange/runs/*/
+agent-orange/runs/index.json
+agent-orange/runs/*.log
 !agent-orange/runs/baseline-*/
+
+# Python bytecode — agent-orange generates these during tests; never commit.
+__pycache__/
+*.pyc
 
