@@ -191,7 +191,13 @@ echo "=== installing stacks in parallel ($LOG_DIR/) ==="
   scp $SSH_OPTS "$REPO_ROOT/standalone.sh"              ubuntu@"$SENSOR_IP":/tmp/standalone.sh
   scp $SSH_OPTS "$REPO_ROOT/testing/verify_alerts.sh"   ubuntu@"$SENSOR_IP":/tmp/verify_alerts.sh
   scp $SSH_OPTS "$REPO_ROOT/testing/probe_catalog.json" ubuntu@"$SENSOR_IP":/tmp/probe_catalog.json
-  ssh $SSH_OPTS ubuntu@"$SENSOR_IP" "sudo sed -i 's/\r\$//' /tmp/standalone.sh /tmp/verify_alerts.sh"
+  # Bundle the purple-*.zeek behavioral scripts so standalone.sh can install them
+  # into /opt/zeek/share/zeek/site/ and @load them from local.zeek.
+  if [ -d "$REPO_ROOT/zeek/site" ]; then
+    ssh $SSH_OPTS ubuntu@"$SENSOR_IP" "mkdir -p /tmp/purple-zeek"
+    scp $SSH_OPTS "$REPO_ROOT"/zeek/site/*.zeek ubuntu@"$SENSOR_IP":/tmp/purple-zeek/
+  fi
+  ssh $SSH_OPTS ubuntu@"$SENSOR_IP" "sudo sed -i 's/\r\$//' /tmp/standalone.sh /tmp/verify_alerts.sh /tmp/purple-zeek/*.zeek 2>/dev/null || true"
   ssh $SSH_OPTS ubuntu@"$SENSOR_IP" "sudo bash /tmp/standalone.sh --force"
   ssh $SSH_OPTS ubuntu@"$SENSOR_IP" "systemctl is-active suricata && sudo /opt/zeek/bin/zeekctl status && sudo apt-get install -y -qq tcpdump jq"
 ) >"$LOG_DIR/sensor.log" 2>&1 &
