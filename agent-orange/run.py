@@ -18,9 +18,10 @@ Invocation is via run.sh which auto-sources .lab-state; direct use:
 Behavior:
   - sensor + attacker contacted via ssh (subprocess; no paramiko dep)
   - attacks run strictly sequentially
-  - one sensor baseline call at start, one harvest call at end
-  - ruleset snapshot captured at start; drift computed vs. most recent
-    prior run if runs/index.json exists
+  - three sensor SSH calls total: baseline + ruleset snapshot at start,
+    harvest at end. Zero during the attack loop, so Zeek flush timing
+    can't race the verdict.
+  - drift computed vs. most recent prior run if runs/index.json exists
   - LLM narrative unless --no-llm; failure falls back gracefully
   - auto-opens the HTML report unless PURPLE_AGENT_NO_OPEN=1 in env
     (the same escape hatch purple-agent respects)
@@ -31,11 +32,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import subprocess
 import sys
 import webbrowser
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,13 +50,12 @@ from agent_orange_pkg.ledger import (
 )
 from agent_orange_pkg.narrative import generate_narrative
 from agent_orange_pkg.render import (
-    ledger_to_dict, render_stdout_summary,
-    write_html, write_json, write_markdown,
+    render_stdout_summary, write_html, write_json, write_markdown,
 )
 from agent_orange_pkg.ruleset import (
     RulesetDrift, RulesetSnapshot, compute_drift, snapshot_ruleset,
 )
-from agent_orange_pkg.runner import AttackResult, run_attacks
+from agent_orange_pkg.runner import AttackResult, run_attack
 from agent_orange_pkg.verdict import classify
 
 
@@ -75,15 +73,25 @@ def build_sensor_runner(sensor_ip: str, key: str):
 
     Signature: (command: str) -> (stdout, stderr, rc). Matches the
     harvest.SshRunner protocol exactly.
+
+    SSH-transport failures (timeout, connection refused, missing key)
+    are converted to a non-zero rc + populated stderr so callers'
+    HarvestError / RulesetError branches surface a readable message
+    instead of an uncaught subprocess exception mid-run.
     """
     base = _ssh_base(key, "ubuntu", sensor_ip)
 
     def runner(command: str) -> tuple[str, str, int]:
-        result = subprocess.run(
-            base + [command],
-            capture_output=True, text=True, timeout=300,
-        )
-        return result.stdout, result.stderr, result.returncode
+        try:
+            result = subprocess.run(
+                base + [command],
+                capture_output=True, text=True, timeout=300,
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired as exc:
+            return (exc.stdout or "", f"ssh timeout after 300s: {exc}", 124)
+        except OSError as exc:
+            return ("", f"ssh transport error: {exc}", 255)
     return runner
 
 
@@ -458,7 +466,6 @@ def main(argv: list[str] | None = None) -> int:
     runs = []
     for i, attack in enumerate(attacks, start=1):
         print(f"[agent-orange] [{i}/{len(attacks)}] {attack.name} ...", flush=True)
-        from agent_orange_pkg.runner import run_attack
         one = run_attack(attack, args.victim_ip, attacker_ssh)
         duration = int(one.probe_end_ts - one.probe_start_ts)
         print(

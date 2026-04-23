@@ -181,3 +181,58 @@ class TestFileEmission:
         write_html(make_ledger(), out)
         assert out.exists()
         assert "<!doctype html>" in out.read_text(encoding="utf-8").lower()
+
+
+# ---------------------------------------------------------------------------
+#  Sensor-health section
+# ---------------------------------------------------------------------------
+
+class TestSensorHealth:
+    def _ledger_with_diagnostics(self, stats_text="", scripts_text=""):
+        # Build a ledger with custom zeek_stats / zeek_loaded_scripts.
+        from dataclasses import replace
+        base = make_ledger()
+        return replace(base, zeek_stats=stats_text, zeek_loaded_scripts=scripts_text)
+
+    def test_html_shows_dropped_packets_warning(self):
+        from agent_orange_pkg.render import render_html
+        stats = "peer=zeek interval=15 pkts_dropped=42 pkts_link=10000\n"
+        ledger = self._ledger_with_diagnostics(stats_text=stats)
+        html = render_html(ledger)
+        assert "Sensor health" in html
+        assert "42" in html
+        assert "carry an asterisk" in html
+
+    def test_html_zero_drops_shows_clean(self):
+        from agent_orange_pkg.render import render_html
+        stats = "peer=zeek interval=15 pkts_dropped=0 pkts_link=10000\n"
+        ledger = self._ledger_with_diagnostics(stats_text=stats)
+        html = render_html(ledger)
+        assert "Sensor health" in html
+        assert "Packets dropped during run: 0" in html
+
+    def test_html_not_captured_shows_caution(self):
+        ledger = self._ledger_with_diagnostics()  # both empty
+        from agent_orange_pkg.render import render_html
+        html = render_html(ledger)
+        assert "not captured" in html
+        assert "UNDETECTED verdicts below should be read cautiously" in html
+
+    def test_markdown_reports_loaded_script_count(self):
+        from agent_orange_pkg.render import render_markdown
+        scripts = (
+            "site/local.zeek\n"
+            "policy/frameworks/intel/seen.zeek\n"
+            "base/protocols/http/main.zeek\n"
+        )
+        ledger = self._ledger_with_diagnostics(scripts_text=scripts)
+        md = render_markdown(ledger)
+        assert "Zeek scripts loaded: 3" in md
+
+    def test_markdown_reports_drops_section(self):
+        from agent_orange_pkg.render import render_markdown
+        stats = "pkts_dropped=7\npkts_dropped=0\npkts_dropped=100\n"
+        ledger = self._ledger_with_diagnostics(stats_text=stats)
+        md = render_markdown(ledger)
+        # 7 + 0 + 100 = 107 total
+        assert "107" in md

@@ -132,6 +132,60 @@ class TestNormalizeSuricataAlert:
         assert ev["sid"] == 2031502
 
 
+class TestIntelNoteSynthesis:
+    """intel.log events don't natively carry a `note` field, but the
+    verdict classifier picks up notices by that key. _normalize_generic_zeek
+    must synthesize one for intel events so they attribute correctly.
+    """
+
+    def test_matched_first_element_wins(self):
+        from agent_orange_pkg.harvest import _normalize_generic_zeek
+        raw = {
+            "ts": "1776959026.0",
+            "id.resp_h": "192.0.2.1",
+            "matched": ["Intel::DOMAIN", "Intel::ADDR"],
+            "seen.indicator": "evil.com",
+            "seen.indicator_type": "Intel::DOMAIN",
+        }
+        ev = _normalize_generic_zeek(raw, "intel.log")
+        assert ev["note"] == "Intel::DOMAIN"
+
+    def test_falls_back_to_indicator_type(self):
+        from agent_orange_pkg.harvest import _normalize_generic_zeek
+        raw = {
+            "ts": "1776959026.0",
+            "id.resp_h": "192.0.2.1",
+            "seen.indicator": "evil.com",
+            "seen.indicator_type": "Intel::ADDR",
+            # matched missing
+        }
+        ev = _normalize_generic_zeek(raw, "intel.log")
+        assert ev["note"] == "Intel::ADDR"
+
+    def test_generic_fallback_when_no_fields(self):
+        from agent_orange_pkg.harvest import _normalize_generic_zeek
+        raw = {"ts": "1776959026.0", "id.resp_h": "192.0.2.1"}
+        ev = _normalize_generic_zeek(raw, "intel.log")
+        assert ev["note"] == "Intel::HIT"
+
+    def test_not_synthesized_for_non_intel_logs(self):
+        from agent_orange_pkg.harvest import _normalize_generic_zeek
+        raw = {"ts": "1776959026.0", "id.resp_h": "192.0.2.1"}
+        ev = _normalize_generic_zeek(raw, "conn.log")
+        assert "note" not in ev or not ev.get("note")
+
+    def test_existing_note_not_overwritten(self):
+        from agent_orange_pkg.harvest import _normalize_generic_zeek
+        raw = {
+            "ts": "1776959026.0",
+            "id.resp_h": "192.0.2.1",
+            "note": "PreExisting::Note",
+            "matched": ["Intel::DOMAIN"],
+        }
+        ev = _normalize_generic_zeek(raw, "intel.log")
+        assert ev["note"] == "PreExisting::Note"
+
+
 class TestNormalizeZeekNotice:
     def test_happy_path(self):
         raw = {

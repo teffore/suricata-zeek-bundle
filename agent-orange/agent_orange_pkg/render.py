@@ -18,11 +18,40 @@ from __future__ import annotations
 
 import html as html_mod
 import json
+import re
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 from agent_orange_pkg.ledger import AttackLedgerEntry, Narrative, RunLedger
+
+
+# Zeek stats.log format: the interval summary lines include
+# `pkts_dropped=N`. We scrape this to surface a warning in the report
+# when the sensor dropped packets during the run -- UNDETECTED verdicts
+# deserve an asterisk when capture was lossy.
+_PKTS_DROPPED_RE = re.compile(r"pkts_dropped\s*[=:]\s*(\d+)", re.IGNORECASE)
+_LOADED_SCRIPT_LINE_RE = re.compile(r"^\s*\S+\.(zeek|bro)\s*$", re.MULTILINE)
+
+
+def _sensor_health_summary(ledger: RunLedger) -> dict[str, Any]:
+    """Pull a few ops-relevant numbers out of zeek_stats/loaded_scripts.
+
+    Pure function; string-scans the raw capture. If neither log was
+    captured (sensor pre-Zeek-1.0 or rotation edge case), returns zeros
+    with a `captured: False` flag so the renderer can show "n/a".
+    """
+    stats_text = ledger.zeek_stats or ""
+    loaded_text = ledger.zeek_loaded_scripts or ""
+    drops = [int(m.group(1)) for m in _PKTS_DROPPED_RE.finditer(stats_text)]
+    return {
+        "captured": bool(stats_text or loaded_text),
+        "total_packets_dropped": sum(drops),
+        "drop_samples": len(drops),
+        "loaded_scripts_count": len(
+            _LOADED_SCRIPT_LINE_RE.findall(loaded_text)
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +151,31 @@ def render_markdown(ledger: RunLedger) -> str:
         lines.append(
             f"- **Ruleset drift vs prior run:** +{added} / -{removed}"
         )
+    lines.append("")
+
+    # Sensor health
+    health = _sensor_health_summary(ledger)
+    lines.append("## Sensor health")
+    lines.append("")
+    if not health["captured"]:
+        lines.append(
+            "_loaded_scripts.log and stats.log were not captured "
+            "(sensor may not be running or the harvest missed the file). "
+            "UNDETECTED verdicts below should be read cautiously._"
+        )
+    else:
+        drops = health["total_packets_dropped"]
+        lines.append(
+            f"- Zeek scripts loaded: {health['loaded_scripts_count']}"
+        )
+        if drops > 0:
+            lines.append(
+                f"- **Packets dropped during run: {drops}** "
+                f"(across {health['drop_samples']} stats-log samples) "
+                "-- UNDETECTED verdicts below carry an asterisk."
+            )
+        else:
+            lines.append("- Packets dropped during run: 0")
     lines.append("")
 
     if ledger.narrative.available:
@@ -293,6 +347,32 @@ def render_html(ledger: RunLedger) -> str:
             "<div class='label'>Ruleset drift vs prior</div></div>"
         )
     parts.append("</div>")
+
+    # Sensor health
+    health = _sensor_health_summary(ledger)
+    parts.append("<h2>Sensor health</h2>")
+    if not health["captured"]:
+        parts.append(
+            "<p class='muted'>loaded_scripts.log and stats.log were not "
+            "captured. UNDETECTED verdicts below should be read cautiously.</p>"
+        )
+    else:
+        drops = health["total_packets_dropped"]
+        parts.append("<ul>")
+        parts.append(
+            f"<li>Zeek scripts loaded: <strong>"
+            f"{health['loaded_scripts_count']}</strong></li>"
+        )
+        if drops > 0:
+            parts.append(
+                "<li><strong style='color:#dc3545;'>"
+                f"Packets dropped during run: {drops}</strong> "
+                f"(across {health['drop_samples']} stats-log samples) "
+                "&mdash; UNDETECTED verdicts below carry an asterisk.</li>"
+            )
+        else:
+            parts.append("<li>Packets dropped during run: 0</li>")
+        parts.append("</ul>")
 
     # Executive summary
     if ledger.narrative.available:

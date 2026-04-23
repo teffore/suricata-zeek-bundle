@@ -164,8 +164,17 @@ class TestGenerateNarrative:
         assert "attacks" in data
 
     def test_non_json_llm_output_returns_unavailable(self):
+        # Text with no `{` -- extractor returns empty, "no JSON object" branch.
         def invoke(system: str, user: str, model: str) -> str:
             return "this is not json"
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
+        assert n.available is False
+        assert "no JSON object" in n.error
+
+    def test_malformed_json_object_returns_unavailable(self):
+        # Text WITH `{` but malformed JSON inside -- "not valid JSON" branch.
+        def invoke(system: str, user: str, model: str) -> str:
+            return "{this: isn't: valid, json}"
         n = generate_narrative(make_ledger(), None, invoke=invoke)
         assert n.available is False
         assert "not valid JSON" in n.error
@@ -183,3 +192,61 @@ class TestGenerateNarrative:
             make_ledger(), None, invoke=invoke, model="claude-haiku-4-5",
         )
         assert invoke.calls[0]["model"] == "claude-haiku-4-5"  # type: ignore[attr-defined]
+
+    def test_prose_prefixed_json_extracted(self):
+        # Claude sometimes prefixes output with "Here is the analysis:\n\n{...}"
+        # despite the system prompt. The extractor pulls the first balanced
+        # {...} block so this non-fatal pattern doesn't downgrade to unavailable.
+        payload = json.dumps({
+            "exec_summary": "extracted",
+            "per_attack_commentary": {},
+            "remediation_suggestions": {},
+            "drift_commentary": "",
+        })
+
+        def invoke(system: str, user: str, model: str) -> str:
+            return f"Here's the analysis you asked for:\n\n{payload}\n"
+
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
+        assert n.available is True
+        assert n.exec_summary == "extracted"
+
+    def test_nested_braces_in_json_handled(self):
+        # JSON values can themselves contain `{` / `}` (e.g., rule snippets
+        # with curly braces). The extractor uses brace counting so nesting
+        # doesn't confuse it.
+        payload = (
+            '{"exec_summary":"ok","per_attack_commentary":{"a":"cmd {x:1}"},'
+            '"remediation_suggestions":{},"drift_commentary":""}'
+        )
+
+        def invoke(system: str, user: str, model: str) -> str:
+            return f"Analysis:\n\n{payload}"
+
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
+        assert n.available is True
+        assert n.per_attack_commentary == {"a": "cmd {x:1}"}
+
+    def test_empty_exec_summary_downgrades_to_unavailable(self):
+        # Wrong-typed fields are silently coerced to "" / {} by the require
+        # helpers. If exec_summary ends up empty, treat the whole narrative
+        # as unavailable rather than rendering a blank Executive Summary.
+        def invoke(system: str, user: str, model: str) -> str:
+            return json.dumps({
+                "exec_summary": 42,  # wrong type -> coerces to ""
+                "per_attack_commentary": "also wrong type",  # -> {}
+                "remediation_suggestions": {},
+                "drift_commentary": "",
+            })
+
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
+        assert n.available is False
+        assert "empty/malformed" in n.error
+
+    def test_no_json_at_all_returns_unavailable(self):
+        def invoke(system: str, user: str, model: str) -> str:
+            return "I don't know how to answer that."
+
+        n = generate_narrative(make_ledger(), None, invoke=invoke)
+        assert n.available is False
+        assert "no JSON object" in n.error

@@ -30,13 +30,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from agent_orange_pkg.ledger import AttackLedgerEntry, Narrative, RunLedger
 
 
-DEFAULT_MODEL = "claude-opus-4-7"
+# Default can be overridden with `AGENT_ORANGE_MODEL` for ops who want to
+# pin to a specific version or experiment with haiku for cheaper runs.
+DEFAULT_MODEL = os.environ.get("AGENT_ORANGE_MODEL", "claude-opus-4-7")
 # Cap evidence passed to the LLM per attack so very noisy probes don't
 # blow the context window. Full evidence stays in the ledger; LLM just
 # gets a representative slice.
@@ -126,17 +129,32 @@ def generate_narrative(
     except Exception as exc:
         return _unavailable(f"LLM call failed: {exc}")
 
+    json_blob = _extract_json_object(text)
+    if not json_blob:
+        return _unavailable(
+            f"LLM output had no JSON object; first 200 chars: {text[:200]!r}"
+        )
     try:
-        data = json.loads(text)
+        data = json.loads(json_blob)
     except json.JSONDecodeError as exc:
         return _unavailable(
             f"LLM output was not valid JSON: {exc}; first 200 chars: "
-            f"{text[:200]!r}"
+            f"{json_blob[:200]!r}"
+        )
+
+    exec_summary = _require_str(data, "exec_summary")
+    if not exec_summary.strip():
+        # The helpers silently coerce wrong-typed fields to "". A completely
+        # empty exec_summary means the model returned nothing useful -- fall
+        # back to unavailable rather than rendering a successful-looking
+        # narrative with no content.
+        return _unavailable(
+            "LLM returned JSON with empty/malformed exec_summary"
         )
 
     return Narrative(
         available=True,
-        exec_summary=_require_str(data, "exec_summary"),
+        exec_summary=exec_summary,
         per_attack_commentary=_require_dict_str(data, "per_attack_commentary"),
         remediation_suggestions=_require_dict_str(data, "remediation_suggestions"),
         drift_commentary=_require_str(data, "drift_commentary"),
@@ -144,6 +162,43 @@ def generate_narrative(
         model=model,
         error="",
     )
+
+
+def _extract_json_object(text: str) -> str:
+    """Return the first balanced `{...}` block in text, or empty string.
+
+    Claude occasionally prefixes its output with prose ("Here is the
+    analysis:\\n\\n{...}") despite instructions. Trying json.loads on the
+    raw text fails in those cases, so we scan for the first balanced
+    object and hand only that to the parser. Brace-counting (not regex)
+    because JSON can nest.
+    """
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_str:
+            escape = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return ""
 
 
 # ---------------------------------------------------------------------------

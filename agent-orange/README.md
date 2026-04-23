@@ -94,9 +94,10 @@ used for drift comparison.
 9. Render JSON + HTML + MD. Update runs/index.json. Open HTML.
 ```
 
-Two SSH calls to sensor total. Attribution happens entirely after the
-run — no per-attack sensor queries, so Zeek's bucket-flush behavior
-can't cause false UNDETECTED results.
+Three SSH calls to sensor total (baseline, ruleset snapshot, harvest).
+**Zero during the attack loop.** Attribution happens entirely after
+the run — no per-attack sensor queries, so Zeek's bucket-flush
+behavior can't cause false UNDETECTED results.
 
 ## Verdicts
 
