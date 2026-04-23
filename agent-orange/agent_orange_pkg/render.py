@@ -31,26 +31,75 @@ from agent_orange_pkg.ledger import AttackLedgerEntry, Narrative, RunLedger
 # when the sensor dropped packets during the run -- UNDETECTED verdicts
 # deserve an asterisk when capture was lossy.
 _PKTS_DROPPED_RE = re.compile(r"pkts_dropped\s*[=:]\s*(\d+)", re.IGNORECASE)
-_LOADED_SCRIPT_LINE_RE = re.compile(r"^\s*\S+\.(zeek|bro)\s*$", re.MULTILINE)
+# TSV-format path matcher for loaded_scripts.log when json-logs isn't
+# enabled. Lines are just a script path ending in .zeek or .bro.
+_LOADED_SCRIPT_LINE_RE = re.compile(r"^\s*\S+\.(zeek|bro)\s*$")
+
+
+def _count_loaded_scripts(loaded_text: str) -> int:
+    """Count Zeek scripts in a loaded_scripts.log body.
+
+    Handles both formats the sensor may produce:
+
+    - **JSON** (when Zeek has ``policy/tuning/json-logs`` loaded, which
+      standalone.sh does): lines like ``{"name":"/path/script.zeek"}``.
+      Counted if the line parses as a JSON object with a ``name`` key.
+    - **TSV** (Zeek default): lines are just the script path ending in
+      ``.zeek`` or ``.bro``. Counted via _LOADED_SCRIPT_LINE_RE.
+
+    Each line is tried against JSON first (cheap fast-fail if it doesn't
+    start with ``{``), then the TSV regex. Lines that match neither --
+    comments, preamble, whitespace, malformed entries -- are silently
+    skipped. This mirrors the tolerance other harvest normalizers apply
+    to heterogeneous Zeek log shapes.
+    """
+    count = 0
+    for line in loaded_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            # JSON-shaped lines are EXCLUSIVELY in the JSON path; if the
+            # parse fails or the object lacks a `name` key, skip entirely.
+            # The TSV fallback is only for genuine TSV input, so letting
+            # a broken-JSON line fall through and happen to match the
+            # `.zeek$` regex (e.g., `{not-valid-json.zeek`) would be an
+            # asymmetric false positive.
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and "name" in obj:
+                count += 1
+            continue
+        if _LOADED_SCRIPT_LINE_RE.match(stripped):
+            count += 1
+    return count
 
 
 def _sensor_health_summary(ledger: RunLedger) -> dict[str, Any]:
     """Pull a few ops-relevant numbers out of zeek_stats/loaded_scripts.
 
-    Pure function; string-scans the raw capture. If neither log was
-    captured (sensor pre-Zeek-1.0 or rotation edge case), returns zeros
-    with a `captured: False` flag so the renderer can show "n/a".
+    Pure function; string-scans the raw capture.
+
+    Two "captured" flags so the renderer can distinguish:
+      - `captured`            : either diagnostic log has content
+      - `loaded_scripts_captured` : specifically loaded_scripts.log had
+        content. Zeek rotates this log into the daily archive once per
+        Zeek-start; runs after that rotation get an empty capture even
+        though Zeek is healthy. Without this flag the report shows
+        "Zeek scripts loaded: 0" which misleads operators into thinking
+        no scripts are loaded.
     """
     stats_text = ledger.zeek_stats or ""
     loaded_text = ledger.zeek_loaded_scripts or ""
     drops = [int(m.group(1)) for m in _PKTS_DROPPED_RE.finditer(stats_text)]
     return {
         "captured": bool(stats_text or loaded_text),
+        "loaded_scripts_captured": bool(loaded_text.strip()),
         "total_packets_dropped": sum(drops),
         "drop_samples": len(drops),
-        "loaded_scripts_count": len(
-            _LOADED_SCRIPT_LINE_RE.findall(loaded_text)
-        ),
+        "loaded_scripts_count": _count_loaded_scripts(loaded_text),
     }
 
 
@@ -165,9 +214,17 @@ def render_markdown(ledger: RunLedger) -> str:
         )
     else:
         drops = health["total_packets_dropped"]
-        lines.append(
-            f"- Zeek scripts loaded: {health['loaded_scripts_count']}"
-        )
+        if health["loaded_scripts_captured"]:
+            lines.append(
+                f"- Zeek scripts loaded: {health['loaded_scripts_count']}"
+            )
+        else:
+            lines.append(
+                "- Zeek scripts loaded: n/a "
+                "(loaded_scripts.log not captured -- likely rotated after "
+                "Zeek startup; script count still available from the first "
+                "run's ledger if one exists)"
+            )
         if drops > 0:
             lines.append(
                 f"- **Packets dropped during run: {drops}** "
@@ -359,10 +416,17 @@ def render_html(ledger: RunLedger) -> str:
     else:
         drops = health["total_packets_dropped"]
         parts.append("<ul>")
-        parts.append(
-            f"<li>Zeek scripts loaded: <strong>"
-            f"{health['loaded_scripts_count']}</strong></li>"
-        )
+        if health["loaded_scripts_captured"]:
+            parts.append(
+                f"<li>Zeek scripts loaded: <strong>"
+                f"{health['loaded_scripts_count']}</strong></li>"
+            )
+        else:
+            parts.append(
+                "<li>Zeek scripts loaded: <em>n/a</em> "
+                "<span class='muted'>(loaded_scripts.log not captured "
+                "&mdash; likely rotated after Zeek startup)</span></li>"
+            )
         if drops > 0:
             parts.append(
                 "<li><strong style='color:#dc3545;'>"

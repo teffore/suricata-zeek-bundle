@@ -187,6 +187,75 @@ class TestFileEmission:
 #  Sensor-health section
 # ---------------------------------------------------------------------------
 
+class TestCountLoadedScripts:
+    """Direct unit tests for the loaded-scripts counter helper.
+
+    Complements the end-to-end TestSensorHealth tests which go through
+    render_markdown; unit tests make failure localization faster and
+    catch helper-level regressions that wouldn't surface in the
+    rendered-string-shape assertions.
+    """
+
+    def _count(self, s: str) -> int:
+        from agent_orange_pkg.render import _count_loaded_scripts
+        return _count_loaded_scripts(s)
+
+    def test_empty_input(self):
+        assert self._count("") == 0
+
+    def test_whitespace_only(self):
+        assert self._count("\n  \n\t\n") == 0
+
+    def test_json_only(self):
+        text = (
+            '{"name":"/a.zeek"}\n'
+            '{"name":"/b.zeek"}\n'
+            '{"name":"/c.zeek"}\n'
+        )
+        assert self._count(text) == 3
+
+    def test_tsv_only(self):
+        text = (
+            "site/local.zeek\n"
+            "base/main.zeek\n"
+            "policy/protocols/ssh/software.zeek\n"
+        )
+        assert self._count(text) == 3
+
+    def test_only_malformed(self):
+        text = (
+            "# header comment\n"
+            "random prose\n"
+            '{"no-name-field":"x"}\n'
+            "{not-valid-json\n"
+        )
+        assert self._count(text) == 0
+
+    def test_crlf_line_endings(self):
+        # Windows CRLF occasionally sneaks in via tools that rewrite
+        # captured text. splitlines() handles CR/LF/CRLF uniformly;
+        # this test locks that in.
+        text = '{"name":"/a.zeek"}\r\nsite/local.zeek\r\n'
+        assert self._count(text) == 2
+
+    def test_json_with_extra_whitespace_in_value(self):
+        # Real Zeek indents nested scripts in the name field via
+        # whitespace; leading spaces in the value shouldn't affect
+        # the count.
+        text = '{"name":"  /opt/zeek/share/zeek/base/bif/const.bif.zeek"}\n'
+        assert self._count(text) == 1
+
+    def test_mixed_json_and_tsv_dedup_not_required(self):
+        # The counter is a straight tally, not a dedupe. Same script
+        # name seen twice = count 2. This is intentional: we're
+        # measuring Zeek's output volume, not unique scripts.
+        text = (
+            '{"name":"/a.zeek"}\n'
+            "a.zeek\n"
+        )
+        assert self._count(text) == 2
+
+
 class TestSensorHealth:
     def _ledger_with_diagnostics(self, stats_text="", scripts_text=""):
         # Build a ledger with custom zeek_stats / zeek_loaded_scripts.
@@ -218,12 +287,84 @@ class TestSensorHealth:
         assert "not captured" in html
         assert "UNDETECTED verdicts below should be read cautiously" in html
 
+    def test_loaded_scripts_missing_but_stats_present_shows_na(self):
+        # Common reality: Zeek rotates loaded_scripts.log to the daily
+        # archive at the first hour boundary after zeek_init and never
+        # recreates it. Runs after that rotation capture stats.log
+        # fine but loaded_scripts.log is empty. Report must NOT say
+        # "Zeek scripts loaded: 0" -- that misleadingly implies nothing
+        # is loaded when really the log just isn't available to harvest.
+        from agent_orange_pkg.render import render_markdown, render_html
+        stats = "peer=zeek interval=15 pkts_dropped=0 pkts_link=10000\n"
+        ledger = self._ledger_with_diagnostics(
+            stats_text=stats, scripts_text="",
+        )
+        md = render_markdown(ledger)
+        html = render_html(ledger)
+        # Must not assert a concrete count when the log wasn't captured.
+        assert "Zeek scripts loaded: 0" not in md
+        assert "Zeek scripts loaded: 0" not in html
+        # Must communicate that the log wasn't available.
+        assert "n/a" in md or "not available" in md or "not captured" in md
+        assert "n/a" in html or "not available" in html or "not captured" in html
+
     def test_markdown_reports_loaded_script_count(self):
         from agent_orange_pkg.render import render_markdown
         scripts = (
             "site/local.zeek\n"
             "policy/frameworks/intel/seen.zeek\n"
             "base/protocols/http/main.zeek\n"
+        )
+        ledger = self._ledger_with_diagnostics(scripts_text=scripts)
+        md = render_markdown(ledger)
+        assert "Zeek scripts loaded: 3" in md
+
+    def test_markdown_reports_loaded_script_count_json_format(self):
+        # When Zeek has `policy/tuning/json-logs` loaded (standalone.sh
+        # does), loaded_scripts.log contains one JSON object per line
+        # like {"name":"/path/script.zeek"} instead of the TSV-style
+        # path-only format. Real live-lab output hits this case. The
+        # old `^\s*\S+\.(zeek|bro)\s*$` regex matched zero on this input
+        # despite the sensor having captured 576 entries.
+        from agent_orange_pkg.render import render_markdown
+        scripts = (
+            '{"name":"/opt/zeek/share/zeek/base/init-bare.zeek"}\n'
+            '{"name":"  /opt/zeek/share/zeek/base/bif/const.bif.zeek"}\n'
+            '{"name":"/opt/zeek/share/zeek/site/local.zeek"}\n'
+        )
+        ledger = self._ledger_with_diagnostics(scripts_text=scripts)
+        md = render_markdown(ledger)
+        assert "Zeek scripts loaded: 3" in md
+
+    def test_json_shaped_garbage_does_not_fall_through_to_tsv(self):
+        # A line starting with `{` but not parsing as JSON with a name
+        # key should NOT be counted via the TSV fallback -- JSON-shaped
+        # lines are exclusively in the JSON path per the docstring.
+        # Real Zeek never emits this, but the asymmetry matters for
+        # the contract.
+        from agent_orange_pkg.render import render_markdown
+        scripts = (
+            '{not-valid-json.zeek\n'           # must NOT count
+            '{"name":"/path/good.zeek"}\n'     # counts via JSON
+        )
+        ledger = self._ledger_with_diagnostics(scripts_text=scripts)
+        md = render_markdown(ledger)
+        assert "Zeek scripts loaded: 1" in md
+
+    def test_markdown_tolerates_mixed_and_malformed_lines(self):
+        # A real loaded_scripts.log may have preamble lines and stray
+        # whitespace. Defensive: malformed lines are skipped, good ones
+        # count. Supports both JSON and TSV inputs side by side so a
+        # future upstream change doesn't silently regress.
+        from agent_orange_pkg.render import render_markdown
+        scripts = (
+            "# zeek header\n"                                            # skip
+            "\n"                                                         # skip
+            'garbage not a script\n'                                     # skip
+            '{"name":"/path/a.zeek"}\n'                                  # count
+            '{"notname":"missing"}\n'                                    # skip (no name key)
+            'site/local.zeek\n'                                          # count (tsv fallback)
+            '{"name":"/path/b.zeek"}\n'                                  # count
         )
         ledger = self._ledger_with_diagnostics(scripts_text=scripts)
         md = render_markdown(ledger)
