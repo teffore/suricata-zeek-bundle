@@ -909,3 +909,168 @@ class TestSensorHealth:
         md = render_markdown(ledger)
         # 7 + 0 + 100 = 107 total
         assert "107" in md
+
+
+# ---------------------------------------------------------------------------
+#  End-to-end regression against captured real run
+# ---------------------------------------------------------------------------
+
+
+class TestCapturedRunRegression:
+    """Load the first real Agent Orange run's ledger.json and exercise the
+    new renderers against it. Catches field-shape drift between
+    harvest/runner output and render expectations that unit tests miss.
+    """
+
+    FIXTURE_RUN_ID = "20260423T185508Z"
+
+    def _load_captured_ledger(self):
+        from pathlib import Path
+        import json
+        p = (
+            Path(__file__).resolve().parent.parent / "runs"
+            / self.FIXTURE_RUN_ID / "ledger.json"
+        )
+        if not p.exists():
+            import pytest
+            pytest.skip(f"fixture not present: {p}")
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    def _rehydrate_ledger(self, raw):
+        # Minimal rehydration: render functions only need a RunLedger-like
+        # object with the fields they access.
+        from agent_orange_pkg.catalog import Attack, Target
+        from agent_orange_pkg.ledger import (
+            AttackLedgerEntry, Narrative, RunLedger,
+        )
+        from agent_orange_pkg.ruleset import RulesetSnapshot
+        from agent_orange_pkg.runner import AttackRun
+
+        entries = []
+        for a in raw["attacks"]:
+            am = a["attack"]
+            rm = a["run"]
+            attack = Attack(
+                name=am["name"], mitre=am["mitre"],
+                source=am.get("source", "atomic-red-team"),
+                art_test=am.get("art_test", ""),
+                rationale=am.get("rationale", ""),
+                target=Target(
+                    type=am["target"]["type"],
+                    value=am["target"]["value"],
+                ),
+                expected_sids=tuple(am.get("expected_sids") or ()),
+                expected_zeek_notices=tuple(am.get("expected_zeek_notices") or ()),
+                expected_verdict=am.get("expected_verdict", "UNDETECTED"),
+                command=am.get("command", ""),
+                timeout=am.get("timeout", 45),
+            )
+            run = AttackRun(
+                attack_name=rm.get("attack_name", attack.name),
+                mitre=rm.get("mitre", attack.mitre),
+                art_test=rm.get("art_test", attack.art_test),
+                target=Target(
+                    type=rm["target"]["type"],
+                    value=rm["target"]["value"],
+                ),
+                substituted_command=rm.get("substituted_command", ""),
+                probe_start_ts=rm.get("probe_start_ts", 0.0),
+                probe_end_ts=rm.get("probe_end_ts", 0.0),
+                status=rm.get("status", "RAN"),
+                exit_code=rm.get("exit_code"),
+                stdout=rm.get("stdout", ""),
+                stderr=rm.get("stderr", ""),
+                error=rm.get("error", ""),
+                timed_out=rm.get("timed_out", False),
+            )
+            entries.append(AttackLedgerEntry(
+                attack=attack, run=run, verdict=a["verdict"],
+                attributed_alerts=tuple(a.get("attributed_alerts") or ()),
+                attributed_notices=tuple(a.get("attributed_notices") or ()),
+                observed_evidence={
+                    k: tuple(v) for k, v in
+                    (a.get("observed_evidence") or {}).items()
+                },
+            ))
+
+        snap_raw = raw.get("ruleset_snapshot") or {}
+        snapshot = RulesetSnapshot(
+            enabled_sids=frozenset(snap_raw.get("enabled_sids") or ()),
+            hash=snap_raw.get("hash", ""),
+            captured_at=snap_raw.get("captured_at", 0.0),
+        )
+        n_raw = raw.get("narrative") or {}
+        narrative = Narrative(
+            available=bool(n_raw.get("available")),
+            exec_summary=n_raw.get("exec_summary", ""),
+            per_attack_commentary=dict(n_raw.get("per_attack_commentary") or {}),
+            remediation_suggestions=dict(n_raw.get("remediation_suggestions") or {}),
+            drift_commentary=n_raw.get("drift_commentary", ""),
+            generated_at=n_raw.get("generated_at", 0.0),
+            model=n_raw.get("model", ""),
+            error=n_raw.get("error", ""),
+        )
+        return RunLedger(
+            run_id=raw["run_id"],
+            started_at=raw.get("started_at", 0.0),
+            ended_at=raw.get("ended_at", 0.0),
+            victim_ip=raw.get("victim_ip", ""),
+            sensor_host=raw.get("sensor_host", ""),
+            attacker_host=raw.get("attacker_host", ""),
+            attacks=tuple(entries),
+            ruleset_snapshot=snapshot,
+            ruleset_drift=None,
+            zeek_loaded_scripts=raw.get("zeek_loaded_scripts", ""),
+            zeek_stats=raw.get("zeek_stats", ""),
+            narrative=narrative,
+            agent_orange_version=raw.get("agent_orange_version", ""),
+            attacks_yaml_path=raw.get("attacks_yaml_path", ""),
+        )
+
+    def test_markdown_renders_without_error(self):
+        from agent_orange_pkg.render import render_markdown
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        md = render_markdown(ledger)
+        assert len(md) > 0
+        assert ledger.run_id in md
+
+    def test_html_renders_without_error(self):
+        from agent_orange_pkg.render import render_html
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        html = render_html(ledger)
+        assert html.startswith("<!doctype html>")
+        assert html.endswith("</body></html>")
+
+    def test_markdown_attack_table_has_23_rows(self):
+        from agent_orange_pkg.render import render_markdown
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        md = render_markdown(ledger)
+        # count lines that look like "| N | `..." where N is an integer
+        import re
+        row_lines = [
+            ln for ln in md.splitlines()
+            if re.match(r"^\|\s*\d+\s*\|\s*`art-", ln)
+        ]
+        assert len(row_lines) == 23
+
+    def test_every_attack_name_present_in_markdown(self):
+        from agent_orange_pkg.render import render_markdown
+        raw = self._load_captured_ledger()
+        ledger = self._rehydrate_ledger(raw)
+        md = render_markdown(ledger)
+        for a in raw["attacks"]:
+            assert a["attack"]["name"] in md
+
+    def test_every_row_has_suricata_and_zeek_cells(self):
+        # No cell should be blank / missing; "--" is acceptable.
+        from agent_orange_pkg.render import render_markdown
+        ledger = self._rehydrate_ledger(self._load_captured_ledger())
+        md = render_markdown(ledger)
+        import re
+        for ln in md.splitlines():
+            m = re.match(r"^\|\s*\d+\s*\|\s*`art-", ln)
+            if not m:
+                continue
+            # Expected pipes: 8 (leading + between 7 cells + trailing)
+            pipes = ln.count("|")
+            assert pipes == 8, f"row has {pipes} pipes, not 8: {ln!r}"
