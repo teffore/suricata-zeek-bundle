@@ -187,7 +187,7 @@ echo "  flightsim: $(flightsim --help 2>&1 | head -1 || echo 'not installed')"
 echo "=== Installing TIER2 atomic-red-team toolkit ==="
 TIER2=(rsync socat masscan gobuster ffuf feroxbuster whois fping arp-scan \
        slowhttptest dsniff knockd tor rclone apache2-utils dnscat2 snmp \
-       enum4linux enum4linux-ng nbtscan)
+       enum4linux enum4linux-ng nbtscan dirb)
 t2_installed=()
 t2_failed=()
 for pkg in "${TIER2[@]}"; do

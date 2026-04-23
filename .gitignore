@@ -21,5 +21,6 @@ update-iam-role.ps1
 # keeps the directory tracked; baseline.json is explicitly committed when
 # a new baseline is captured.
 purple-agent/benchmarks/results/*.json
+purple-agent/benchmarks/results/*.log
 !purple-agent/benchmarks/baseline.json
 

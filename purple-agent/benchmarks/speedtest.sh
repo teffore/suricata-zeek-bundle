@@ -48,14 +48,25 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------- auto-fill from .lab-state if needed ----------
+# .lab-state exposes VICTIM_IP (public) + VICTIM_PRIVATE (VPC). purple_agent.py
+# requires the PRIVATE IP because the SG only allows attacker->victim over the
+# VPC private network. Explicit CLI args always win; when we fall back to the
+# state file, prefer VICTIM_PRIVATE. An earlier version used `:=` defaulting,
+# which silently kept the public IP set by `source` and caused every probe
+# requiring a victim listener to time out (SG-blocked WAN->victim).
 if [ -z "$ATTACKER_IP" ] || [ -z "$SENSOR_IP" ] || [ -z "$VICTIM_IP" ] || [ -z "$KEY" ]; then
   if [ -f "$STATE_FILE" ]; then
+    _cli_attacker="$ATTACKER_IP"
+    _cli_sensor="$SENSOR_IP"
+    _cli_victim="$VICTIM_IP"
+    _cli_key="$KEY"
     # shellcheck disable=SC1090
     source "$STATE_FILE"
-    : "${ATTACKER_IP:=${ATTACKER_IP:-}}"
-    : "${SENSOR_IP:=${SENSOR_IP:-}}"
-    : "${VICTIM_IP:=${VICTIM_PRIVATE:-${VICTIM_IP:-}}}"
-    : "${KEY:=${KEY_FILE:-}}"
+    ATTACKER_IP="${_cli_attacker:-${ATTACKER_IP:-}}"
+    SENSOR_IP="${_cli_sensor:-${SENSOR_IP:-}}"
+    VICTIM_IP="${_cli_victim:-${VICTIM_PRIVATE:-${VICTIM_IP:-}}}"
+    KEY="${_cli_key:-${KEY_FILE:-}}"
+    unset _cli_attacker _cli_sensor _cli_victim _cli_key
   fi
 fi
 
@@ -71,6 +82,16 @@ fi
 
 [ -f "$POOL" ]      || { echo "speedtest.sh: pool not found: $POOL"       >&2; exit 1; }
 [ -f "$SUMMARIZE" ] || { echo "speedtest.sh: summarizer not found: $SUMMARIZE" >&2; exit 1; }
+
+# purple_agent.py expects the victim's VPC private address. If VICTIM_IP is
+# outside RFC1918, the SG almost certainly blocks attacker->victim and every
+# listener-dependent probe will time out. Warn loudly so a misconfigured run
+# fails visibly instead of silently producing a garbage baseline.
+if ! [[ "$VICTIM_IP" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+  echo "speedtest.sh: WARNING VICTIM_IP=$VICTIM_IP is not RFC1918." >&2
+  echo "  purple_agent.py expects the victim's VPC private IP; public IPs" >&2
+  echo "  are typically SG-blocked and every listener probe will error." >&2
+fi
 
 mkdir -p "$RESULTS_DIR"
 
