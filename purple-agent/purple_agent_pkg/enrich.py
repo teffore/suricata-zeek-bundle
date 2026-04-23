@@ -54,6 +54,7 @@ MITRE_LOOKUP = {
     "T1210": {"tactic": "Lateral Movement", "name": "Exploitation of Remote Services", "url": "https://attack.mitre.org/techniques/T1210/"},
     "T1041": {"tactic": "Exfiltration", "name": "Exfiltration Over C2 Channel", "url": "https://attack.mitre.org/techniques/T1041/"},
     "T1048.001": {"tactic": "Exfiltration", "name": "Exfiltration Over Alternative Protocol: Symmetric Encrypted Non-C2", "url": "https://attack.mitre.org/techniques/T1048/001/"},
+    "T1048.002": {"tactic": "Exfiltration", "name": "Exfiltration Over Alternative Protocol: Asymmetric Encrypted Non-C2", "url": "https://attack.mitre.org/techniques/T1048/002/"},
     "T1567": {"tactic": "Exfiltration", "name": "Exfiltration Over Web Service", "url": "https://attack.mitre.org/techniques/T1567/"},
     "T1567.002": {"tactic": "Exfiltration", "name": "Exfiltration Over Web Service: Exfil to Cloud Storage", "url": "https://attack.mitre.org/techniques/T1567/002/"},
     "T1102": {"tactic": "Command and Control", "name": "Web Service", "url": "https://attack.mitre.org/techniques/T1102/"},
@@ -64,6 +65,8 @@ MITRE_LOOKUP = {
     "T1595.002": {"tactic": "Reconnaissance", "name": "Active Scanning: Vulnerability Scanning", "url": "https://attack.mitre.org/techniques/T1595/002/"},
     "T1496": {"tactic": "Impact", "name": "Resource Hijacking", "url": "https://attack.mitre.org/techniques/T1496/"},
     "T1498": {"tactic": "Impact", "name": "Network Denial of Service", "url": "https://attack.mitre.org/techniques/T1498/"},
+    "T1499.002": {"tactic": "Impact", "name": "Endpoint Denial of Service: Service Exhaustion Flood", "url": "https://attack.mitre.org/techniques/T1499/002/"},
+    "T1499.003": {"tactic": "Impact", "name": "Endpoint Denial of Service: Application Exhaustion Flood", "url": "https://attack.mitre.org/techniques/T1499/003/"},
     "T1046": {"tactic": "Discovery", "name": "Network Service Discovery", "url": "https://attack.mitre.org/techniques/T1046/"},
     "T1595.001": {"tactic": "Reconnaissance", "name": "Active Scanning: Scanning IP Blocks", "url": "https://attack.mitre.org/techniques/T1595/001/"},
     "T1110.001": {"tactic": "Credential Access", "name": "Brute Force: Password Guessing", "url": "https://attack.mitre.org/techniques/T1110/001/"},
@@ -103,6 +106,7 @@ MITRE_LOOKUP = {
     "T1212": {"tactic": "Credential Access", "name": "Exploitation for Credential Access", "url": "https://attack.mitre.org/techniques/T1212/"},
     "T1530": {"tactic": "Collection", "name": "Data from Cloud Storage", "url": "https://attack.mitre.org/techniques/T1530/"},
     "T1613": {"tactic": "Discovery", "name": "Container and Resource Discovery", "url": "https://attack.mitre.org/techniques/T1613/"},
+    "T1205.001": {"tactic": "Defense Evasion", "name": "Traffic Signaling: Port Knocking", "url": "https://attack.mitre.org/techniques/T1205/001/"},
 }
 
 # Severity derivation: for UNDETECTED findings, map MITRE tactic to risk severity.
