@@ -41,6 +41,7 @@ MITRE_LOOKUP = {
     "T1071.001": {"tactic": "Command and Control", "name": "Application Layer Protocol: Web Protocols", "url": "https://attack.mitre.org/techniques/T1071/001/"},
     "T1071.004": {"tactic": "Command and Control", "name": "Application Layer Protocol: DNS", "url": "https://attack.mitre.org/techniques/T1071/004/"},
     "T1090": {"tactic": "Command and Control", "name": "Proxy", "url": "https://attack.mitre.org/techniques/T1090/"},
+    "T1090.002": {"tactic": "Command and Control", "name": "Proxy: External Proxy", "url": "https://attack.mitre.org/techniques/T1090/002/"},
     "T1090.003": {"tactic": "Command and Control", "name": "Proxy: Multi-hop Proxy", "url": "https://attack.mitre.org/techniques/T1090/003/"},
     "T1105": {"tactic": "Command and Control", "name": "Ingress Tool Transfer", "url": "https://attack.mitre.org/techniques/T1105/"},
     "T1219": {"tactic": "Command and Control", "name": "Remote Access Software", "url": "https://attack.mitre.org/techniques/T1219/"},

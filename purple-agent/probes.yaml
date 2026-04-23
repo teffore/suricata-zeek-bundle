@@ -420,8 +420,8 @@ probes:
 
   - name: ngrok-free-app-sni
     category: tunneling
-    mitre: T1090
-    rationale: "ngrok-free.app SNI — tunneling service"
+    mitre: T1090.002
+    rationale: "ngrok-free.app SNI — tunneling service (External Proxy, per MITRE's own T1090.002 example)"
     expected_sids: [9000921, 2066057]
     expected_verdict: DETECTED
     already_in_catalog: true
