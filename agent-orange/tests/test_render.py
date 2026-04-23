@@ -273,6 +273,135 @@ class TestCharacterizeObservedLog:
         assert _characterize_observed_log("mystery.log", events) == "mystery.log: 2 entries"
 
 
+class TestRenderEvidenceBlock:
+    """Full Evidence subblock: Suricata alerts / Zeek notices / Observed.
+
+    Returns a string with `\\n` line separators (Markdown). HTML rendering
+    happens in the HTML wire-up task; this helper emits Markdown form.
+    """
+
+    def _entry(self, **overrides):
+        from tests._ledger_fixtures import make_attack, make_entry
+        defaults = dict(
+            attack=make_attack(),
+            verdict="DETECTED_UNEXPECTED",
+            alerts=(),
+            notices=(),
+            observed=None,
+        )
+        defaults.update(overrides)
+        # make_entry already returns an AttackLedgerEntry
+        return make_entry(**defaults)
+
+    def test_all_three_subsections_present(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-example"),
+            verdict="DETECTED_EXPECTED",
+            alerts=[{"sid": 2001219, "signature": "ET scan"}],
+            notices=[{"note": "Scan::Port_Scan", "msg": "detected"}],
+            observed={"http.log": ({"host": "victim.local"},)},
+        )
+        out = render_evidence_block(entry)
+        assert "Evidence:" in out
+        assert "Suricata alerts (1)" in out
+        assert "Zeek notices (1)" in out
+        assert "Observed" in out
+        assert "2001219" in out
+        assert "ET scan" in out
+        assert "Scan::Port_Scan" in out
+        assert "http.log" in out
+
+    def test_zeek_only_drops_empty_suricata_subsection(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-zeek-only"),
+            verdict="DETECTED_UNEXPECTED",
+            alerts=[],
+            notices=[{"note": "Scan::Port_Scan"}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Suricata alerts" not in out
+        assert "Zeek notices (1)" in out
+
+    def test_failed_row_entire_block_skipped(self):
+        # When all three subsections empty, block header is also dropped.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-failed"),
+            verdict="FAILED",
+            alerts=[],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert out == ""
+
+    def test_missing_signature_field_renders_sid_alone(self):
+        # No trailing em-dash-quote when signature is absent.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[{"sid": 9000003}],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "SID 9000003" in out
+        assert "SID 9000003 \u2014" not in out  # no em-dash-quote
+        assert 'SID 9000003 "' not in out
+
+    def test_missing_notice_msg_renders_note_alone(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[],
+            notices=[{"note": "HTTP::SQL_Injection"}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "HTTP::SQL_Injection" in out
+        assert "HTTP::SQL_Injection \u2014" not in out
+
+    def test_observed_only_attack_renders_observed_section(self):
+        # OBSERVED is not a verdict -- a probe caught by Zeek protocol
+        # logs but zero rules fired is still UNDETECTED. The Evidence
+        # block must show the observed section so the gap is visible.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-observed-only"),
+            verdict="UNDETECTED",
+            alerts=[],
+            notices=[],
+            observed={"software.log": ({"unparsed_version": "gobuster/3.8.2"},)},
+        )
+        out = render_evidence_block(entry)
+        assert "Observed" in out
+        assert "software.log" in out
+        assert "gobuster" in out
+        assert "Suricata alerts" not in out
+        assert "Zeek notices" not in out
+
+    def test_severity_included_when_present(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[{"sid": 2002383, "signature": "ET SCAN Hydra FTP", "severity": 2}],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "severity 2" in out
+
+
 # ---------------------------------------------------------------------------
 #  ledger_to_dict
 # ---------------------------------------------------------------------------

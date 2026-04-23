@@ -228,6 +228,69 @@ def _characterize_observed_log(logname: str, events) -> str:
     return base
 
 
+def render_evidence_block(entry) -> str:
+    """Render the Markdown 'Evidence:' subblock for one attack.
+
+    Returns an empty string when all three subsections are empty
+    (FAILED or fully silent UNDETECTED attacks) -- the caller should
+    simply not include the block in the report.
+
+    Subsections are dropped individually when empty; the surrounding
+    'Evidence:' header is only kept when at least one subsection has
+    content.
+    """
+    alerts = tuple(entry.attributed_alerts or ())
+    notices = tuple(entry.attributed_notices or ())
+    observed = dict(entry.observed_evidence or {})
+
+    # Filter observed to logs that actually have entries (defensive;
+    # harvest already does this, but don't assume).
+    observed = {
+        logname: events for logname, events in observed.items()
+        if events
+    }
+
+    if not alerts and not notices and not observed:
+        return ""
+
+    lines: list[str] = ["Evidence:", ""]
+
+    if alerts:
+        lines.append(f"- Suricata alerts ({len(alerts)}):")
+        for a in alerts:
+            sid = a.get("sid") if isinstance(a, dict) else None
+            if not isinstance(sid, int) or isinstance(sid, bool):
+                continue
+            signature = a.get("signature") if isinstance(a, dict) else None
+            severity = a.get("severity") if isinstance(a, dict) else None
+            parts = [f"  - SID {sid}"]
+            if isinstance(signature, str) and signature:
+                parts.append(f'\u2014 "{signature}"')
+            if isinstance(severity, int) and not isinstance(severity, bool):
+                parts.append(f"(severity {severity})")
+            lines.append(" ".join(parts))
+
+    if notices:
+        lines.append(f"- Zeek notices ({len(notices)}):")
+        for n in notices:
+            note = n.get("note") if isinstance(n, dict) else None
+            if not isinstance(note, str) or not note:
+                continue
+            msg = n.get("msg") if isinstance(n, dict) else None
+            if isinstance(msg, str) and msg:
+                lines.append(f'  - {note} \u2014 "{msg}"')
+            else:
+                lines.append(f"  - {note}")
+
+    if observed:
+        lines.append("- Observed (Zeek protocol logs):")
+        for logname in sorted(observed):
+            line = _characterize_observed_log(logname, observed[logname])
+            lines.append(f"  - {line}")
+
+    return "\n".join(lines)
+
+
 def _count_loaded_scripts(loaded_text: str) -> int:
     """Count Zeek scripts in a loaded_scripts.log body.
 
