@@ -272,6 +272,25 @@ class TestCharacterizeObservedLog:
         events = [{"foo": "bar"}, {"foo": "baz"}]
         assert _characterize_observed_log("mystery.log", events) == "mystery.log: 2 entries"
 
+    def test_singular_entry_grammar(self):
+        # Code review #4: "1 entries" reads awkwardly.
+        from agent_orange_pkg.render import _characterize_observed_log
+        assert _characterize_observed_log("http.log", [{"host": "a"}]).startswith(
+            "http.log: 1 entry"
+        )
+        assert _characterize_observed_log("conn.log", [{"uid": "C1"}]).startswith(
+            "conn.log: 1 entry"
+        )
+        # conn.log trailing summary also singular
+        assert "1 flow" in _characterize_observed_log("conn.log", [{"uid": "C1"}])
+        assert "1 flows" not in _characterize_observed_log("conn.log", [{"uid": "C1"}])
+        # ftp.log single auth failure
+        ftp = _characterize_observed_log(
+            "ftp.log", [{"command": "PASS", "reply_code": 530}]
+        )
+        assert "1 auth failure" in ftp
+        assert "1 auth failures" not in ftp
+
 
 class TestRenderEvidenceBlock:
     """Full Evidence subblock: Suricata alerts / Zeek notices / Observed.
@@ -401,6 +420,90 @@ class TestRenderEvidenceBlock:
         out = render_evidence_block(entry)
         assert "severity 2" in out
 
+    def test_header_count_matches_body_when_malformed_alerts_filtered(self):
+        # Code review #1: header said "Suricata alerts (2):" but body
+        # skipped the two bad entries and rendered zero bullets.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[{"sid": "stringly"}, {"signature": "no sid"}],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        # Entire Suricata subsection should be dropped (zero valid alerts).
+        assert "Suricata alerts" not in out
+
+    def test_header_count_matches_body_when_malformed_notices_filtered(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[],
+            notices=[{"msg": "no note"}, {"note": ""}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Zeek notices" not in out
+
+    def test_header_reflects_unique_not_raw_count(self):
+        # Code review #2: the main-table cell dedups SIDs, so "3 (2001219)"
+        # in the cell shouldn't disagree with "Suricata alerts (3):" in the
+        # Evidence block. Use unique count in both places.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[
+                {"sid": 2001219, "signature": "ET scan"},
+                {"sid": 2001219, "signature": "ET scan"},
+                {"sid": 2001219, "signature": "ET scan"},
+            ],
+            notices=[],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Suricata alerts (1)" in out
+        # And only one bullet rendered (dedup'd), not three.
+        assert out.count("SID 2001219") == 1
+
+    def test_duplicate_notices_deduped_in_body(self):
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[],
+            notices=[
+                {"note": "Scan::Port_Scan"},
+                {"note": "Scan::Port_Scan"},
+            ],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        assert "Zeek notices (1)" in out
+        assert out.count("Scan::Port_Scan") == 1
+
+    def test_evidence_bullets_sorted_for_stable_output(self):
+        # Code review #5: cells sort, body should too, so both views
+        # of the same data line up.
+        from agent_orange_pkg.render import render_evidence_block
+        from tests._ledger_fixtures import make_attack, make_entry
+        entry = make_entry(
+            make_attack("art-x"),
+            alerts=[
+                {"sid": 9000003, "signature": "Z"},
+                {"sid": 2001219, "signature": "A"},
+            ],
+            notices=[{"note": "Zeta"}, {"note": "Alpha"}],
+            observed=None,
+        )
+        out = render_evidence_block(entry)
+        # Suricata: lower sid first
+        assert out.index("SID 2001219") < out.index("SID 9000003")
+        # Zeek: alphabetical
+        assert out.index("Alpha") < out.index("Zeta")
+
 
 # ---------------------------------------------------------------------------
 #  ledger_to_dict
@@ -442,34 +545,108 @@ class TestLedgerToDict:
         assert d["ruleset_drift"]["added_sids"] == [2, 5]
         assert d["ruleset_drift"]["removed_sids"] == [7, 9]
 
-    def test_ledger_to_dict_keys_unchanged_across_rerender(self):
-        # Guard against anyone adding a new key to ledger_to_dict's output
-        # while "just rewiring the renderer". The contract for JSON
-        # consumers (future CI gates, diff scripts) is key-stable.
-        ledger = make_ledger()
-        first = ledger_to_dict(ledger)
-        second = ledger_to_dict(ledger)
+    def test_ledger_to_dict_shape_is_frozen(self):
+        # Guard against anyone adding or removing a structural key from
+        # ledger_to_dict's output while "just rewiring the renderer".
+        # The JSON contract is stable for downstream consumers
+        # (future CI gates, diff scripts, wiki tooling).
+        #
+        # We deliberately stop descent at paths whose *values* are
+        # content (verdict tier names, log names, alert fields) rather
+        # than structure -- those legitimately vary per run.
+        #
+        # If this test fails: either the structural change is deliberate
+        # (update EXPECTED_KEYS below) or the JSON shape drifted.
+        ledger = make_ledger(
+            entries=[make_entry(
+                make_attack("a"),
+                alerts=[{"sid": 1, "signature": "x"}],
+                notices=[{"note": "N"}],
+                observed={"http.log": ({"host": "h"},)},
+            )],
+            drift=RulesetDrift(
+                added_sids=frozenset({1}),
+                removed_sids=frozenset({2}),
+                hash_changed=True,
+            ),
+        )
+        d = ledger_to_dict(ledger)
+
+        # Paths below these are open-content maps/lists whose internal
+        # keys or dict extras legitimately vary; stop the key-walk there.
+        OPAQUE = {
+            "summary.verdict_counts",
+            "narrative.per_attack_commentary",
+            "narrative.remediation_suggestions",
+            "attacks[].observed_evidence",
+            "attacks[].attributed_alerts[]",
+            "attacks[].attributed_notices[]",
+        }
 
         def deep_keys(obj, prefix=""):
             found = set()
+            if prefix in OPAQUE:
+                return found
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     path = f"{prefix}.{k}" if prefix else k
                     found.add(path)
                     found |= deep_keys(v, path)
             elif isinstance(obj, list) and obj:
-                # Only descend first element; lists of dicts should be
-                # key-homogeneous.
                 found |= deep_keys(obj[0], f"{prefix}[]")
             return found
 
-        assert deep_keys(first) == deep_keys(second)
-        # Spot-check expected top-level keys stayed
-        top = set(first.keys())
-        assert {
-            "run_id", "started_at", "ended_at", "victim_ip", "attacks",
-            "ruleset_snapshot", "narrative", "summary",
-        } <= top
+        expected = {
+            "run_id", "started_at", "ended_at", "victim_ip",
+            "sensor_host", "attacker_host",
+            "agent_orange_version", "attacks_yaml_path",
+            "zeek_loaded_scripts", "zeek_stats",
+            "attacks",
+            "attacks[].attack", "attacks[].run",
+            "attacks[].verdict",
+            "attacks[].attributed_alerts", "attacks[].attributed_notices",
+            "attacks[].observed_evidence",
+            "attacks[].attack.name", "attacks[].attack.mitre",
+            "attacks[].attack.source", "attacks[].attack.art_test",
+            "attacks[].attack.rationale", "attacks[].attack.target",
+            "attacks[].attack.expected_sids",
+            "attacks[].attack.expected_zeek_notices",
+            "attacks[].attack.expected_verdict",
+            "attacks[].attack.command", "attacks[].attack.timeout",
+            "attacks[].attack.target.type", "attacks[].attack.target.value",
+            "attacks[].run.attack_name", "attacks[].run.mitre",
+            "attacks[].run.art_test", "attacks[].run.target",
+            "attacks[].run.substituted_command",
+            "attacks[].run.probe_start_ts", "attacks[].run.probe_end_ts",
+            "attacks[].run.status", "attacks[].run.exit_code",
+            "attacks[].run.stdout", "attacks[].run.stderr",
+            "attacks[].run.error", "attacks[].run.timed_out",
+            "attacks[].run.target.type", "attacks[].run.target.value",
+            "ruleset_snapshot",
+            "ruleset_snapshot.enabled_sids",
+            "ruleset_snapshot.hash", "ruleset_snapshot.captured_at",
+            "ruleset_drift",
+            "ruleset_drift.added_sids", "ruleset_drift.removed_sids",
+            "ruleset_drift.hash_changed",
+            "narrative",
+            "narrative.available", "narrative.exec_summary",
+            "narrative.per_attack_commentary",
+            "narrative.remediation_suggestions",
+            "narrative.drift_commentary", "narrative.generated_at",
+            "narrative.model", "narrative.error",
+            "summary",
+            "summary.total_attacks", "summary.detected",
+            "summary.coverage_pct", "summary.total_seconds",
+            "summary.verdict_counts",
+        }
+        got = deep_keys(d)
+        missing = expected - got
+        extra = got - expected
+        assert not missing, f"JSON contract broken -- missing keys: {sorted(missing)}"
+        assert not extra, (
+            "JSON contract broken -- unexpected new keys: "
+            f"{sorted(extra)}. If deliberate, update EXPECTED_KEYS."
+        )
 
 
 # ---------------------------------------------------------------------------

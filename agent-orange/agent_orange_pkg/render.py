@@ -159,7 +159,8 @@ def _characterize_observed_log(logname: str, events) -> str:
     """
     events = list(events) if events else []
     n = len(events)
-    base = f"{logname}: {n} entries"
+    noun = "entry" if n == 1 else "entries"
+    base = f"{logname}: {n} {noun}"
     if n == 0:
         return base
 
@@ -199,7 +200,8 @@ def _characterize_observed_log(logname: str, events) -> str:
             if isinstance(e, dict) and e.get("reply_code") == 530
         )
         if fails:
-            return f"{base} ({fails} auth failures)"
+            fail_noun = "auth failure" if fails == 1 else "auth failures"
+            return f"{base} ({fails} {fail_noun})"
         return base
 
     if logname == "dns.log":
@@ -223,7 +225,8 @@ def _characterize_observed_log(logname: str, events) -> str:
         return base
 
     if logname == "conn.log":
-        return f"{base} ({n} flows)"
+        flow_noun = "flow" if n == 1 else "flows"
+        return f"{base} ({n} {flow_noun})"
 
     return base
 
@@ -238,31 +241,53 @@ def render_evidence_block(entry) -> str:
     Subsections are dropped individually when empty; the surrounding
     'Evidence:' header is only kept when at least one subsection has
     content.
+
+    Alerts and notices are deduplicated by SID and note-type respectively
+    to match the main-table cells (which also dedup). The first
+    signature/severity/msg encountered for each unique key wins; sorting
+    is ascending SID / alphabetical note to match cell output.
     """
-    alerts = tuple(entry.attributed_alerts or ())
-    notices = tuple(entry.attributed_notices or ())
-    observed = dict(entry.observed_evidence or {})
+    # Dedup + filter alerts by SID. Keep first seen signature/severity
+    # for each unique SID -- matches how the main-table cell counts.
+    unique_alerts: dict[int, dict] = {}
+    for a in (entry.attributed_alerts or ()):
+        if not isinstance(a, dict):
+            continue
+        sid = a.get("sid")
+        if not isinstance(sid, int) or isinstance(sid, bool):
+            continue
+        if sid not in unique_alerts:
+            unique_alerts[sid] = a
+
+    # Dedup + filter notices by note type. Same rationale.
+    unique_notices: dict[str, dict] = {}
+    for n in (entry.attributed_notices or ()):
+        if not isinstance(n, dict):
+            continue
+        note = n.get("note")
+        if not isinstance(note, str) or not note:
+            continue
+        if note not in unique_notices:
+            unique_notices[note] = n
 
     # Filter observed to logs that actually have entries (defensive;
     # harvest already does this, but don't assume).
     observed = {
-        logname: events for logname, events in observed.items()
+        logname: events for logname, events in (entry.observed_evidence or {}).items()
         if events
     }
 
-    if not alerts and not notices and not observed:
+    if not unique_alerts and not unique_notices and not observed:
         return ""
 
     lines: list[str] = ["Evidence:", ""]
 
-    if alerts:
-        lines.append(f"- Suricata alerts ({len(alerts)}):")
-        for a in alerts:
-            sid = a.get("sid") if isinstance(a, dict) else None
-            if not isinstance(sid, int) or isinstance(sid, bool):
-                continue
-            signature = a.get("signature") if isinstance(a, dict) else None
-            severity = a.get("severity") if isinstance(a, dict) else None
+    if unique_alerts:
+        lines.append(f"- Suricata alerts ({len(unique_alerts)}):")
+        for sid in sorted(unique_alerts):
+            a = unique_alerts[sid]
+            signature = a.get("signature")
+            severity = a.get("severity")
             parts = [f"  - SID {sid}"]
             if isinstance(signature, str) and signature:
                 parts.append(f'\u2014 "{signature}"')
@@ -270,13 +295,11 @@ def render_evidence_block(entry) -> str:
                 parts.append(f"(severity {severity})")
             lines.append(" ".join(parts))
 
-    if notices:
-        lines.append(f"- Zeek notices ({len(notices)}):")
-        for n in notices:
-            note = n.get("note") if isinstance(n, dict) else None
-            if not isinstance(note, str) or not note:
-                continue
-            msg = n.get("msg") if isinstance(n, dict) else None
+    if unique_notices:
+        lines.append(f"- Zeek notices ({len(unique_notices)}):")
+        for note in sorted(unique_notices):
+            n = unique_notices[note]
+            msg = n.get("msg")
             if isinstance(msg, str) and msg:
                 lines.append(f'  - {note} \u2014 "{msg}"')
             else:
