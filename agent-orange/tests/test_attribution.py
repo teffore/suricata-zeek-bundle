@@ -514,3 +514,117 @@ class TestAttributeAll:
         assert attribute_all(events, windows)["a"] == []
         # Widen to 5s -> inside [95, 100)
         assert len(attribute_all(events, windows, pre_start_grace_seconds=5)["a"]) == 1
+
+    # Flow-aware attribution (by community_id / uid / flow_id) -------------
+
+    def test_flow_events_attribute_together_to_first_owner(self):
+        # Two events share a community_id. The earliest (ts=105, in a's
+        # strict window) anchors the flow. The later event (ts=125, inside
+        # b's strict window) would by time alone attribute to b -- but
+        # because it's the SAME flow as the earlier event, it goes to a.
+        # This is the whois-tunnel scenario: Zeek's late ProtocolDetector
+        # notice belongs to the flow that whois opened, even though the
+        # emission timestamp lands in icmpdoor's window.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="COMM1", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="COMM1", note="Protocol_Found"),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+        assert out["b"] == []
+
+    def test_flow_earliest_event_used_for_attribution_anchor(self):
+        # Events arrive out of order in the input list; attribute_all must
+        # still pick the EARLIEST event's ts as the flow anchor.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="C", note="n1"),  # late first
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="C", sid=1),      # early second
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+
+    def test_uid_used_as_flow_key_when_community_id_absent(self):
+        # Zeek events typically carry `uid` (always) and `community_id`
+        # (when policy/protocols/conn/community-id is loaded). uid is the
+        # reliable fallback.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", uid="CXXX", note="n1"),
+            self._ev(125.0, dest_ip="172.31.76.116", uid="CXXX", note="n2"),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+
+    def test_suricata_flow_id_used_as_flow_key(self):
+        # Suricata eve.json alerts carry `flow_id` (integer). If neither
+        # community_id nor uid present, flow_id is the fallback.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", flow_id=12345, sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", flow_id=12345, sid=2),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+
+    def test_events_with_different_flow_ids_attribute_independently(self):
+        # Two unrelated flows running at the same time -> each attributes
+        # to its own time-window owner.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="FLOW1", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="FLOW2", sid=2),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert len(out["b"]) == 1
+
+    def test_event_with_no_flow_id_falls_back_to_time_attribution(self):
+        # Backward compat: events without any flow identifier use the old
+        # 3-tier time-based attribution logic. Must not regress.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [self._ev(125.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["b"]) == 1  # no flow_id -> pure time attribution
+
+    def test_flow_with_unmatchable_anchor_falls_back_per_event(self):
+        # If the flow's earliest event falls outside all windows (even
+        # with graces), we shouldn't drop the whole flow. Fall back to
+        # per-event time-based attribution as if there were no flow group.
+        windows = [self._w("a", 100, 110)]
+        events = [
+            self._ev(50.0, dest_ip="172.31.76.116", community_id="C", sid=1),  # orphan anchor
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="C", sid=2),  # in a's strict
+        ]
+        out = attribute_all(events, windows)
+        # Anchor at 50 unassignable; fall back per-event.
+        # 50 has no home; 105 lands in a.
+        assert len(out["a"]) == 1
+        assert out["a"][0]["sid"] == 2
+
+    def test_mixed_events_flow_and_singleton(self):
+        # Three events: two share a flow, one is standalone.
+        # Flow anchor at ts=105 -> a. Singleton at ts=125 -> b.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="FX", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="FX", note="n"),
+            self._ev(122.0, dest_ip="172.31.76.116", sid=9),  # no flow_id
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2   # flow FX
+        assert len(out["b"]) == 1   # singleton sid=9
+
+    def test_flow_key_precedence_community_id_wins_over_uid(self):
+        # When both are present, community_id is preferred because it's
+        # consistent between Suricata and Zeek (same 5-tuple hash). uid
+        # is Zeek-specific. Two events with the SAME community_id but
+        # DIFFERENT uids are still the same flow.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="C", uid="U1", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="C", uid="U2", sid=2),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2  # one flow via community_id

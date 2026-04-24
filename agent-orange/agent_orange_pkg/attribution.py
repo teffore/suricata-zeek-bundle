@@ -188,6 +188,79 @@ def filter_events(
     return out
 
 
+def _flow_key(event: dict[str, Any]) -> str | None:
+    """Return a flow identifier for an event, or None if no per-flow field.
+
+    Preference order:
+      1. community_id -- Suricata + Zeek produce the same value when both
+         have community-id loaded, giving cross-tool flow correlation.
+      2. uid -- Zeek's per-connection identifier; always present on
+         Zeek events.
+      3. flow_id -- Suricata's per-flow integer; always present on alerts.
+
+    Returns a string so values from different sources compose consistently
+    into dict keys. A Zeek uid "CxxxXX" and a Suricata flow_id 12345 will
+    never collide because they occupy disjoint string spaces (one is a
+    20-char random identifier, the other is the str() of a 64-bit int).
+    """
+    cid = event.get("community_id")
+    if isinstance(cid, str) and cid:
+        return cid
+    uid = event.get("uid")
+    if isinstance(uid, str) and uid:
+        return uid
+    flow_id = event.get("flow_id")
+    if isinstance(flow_id, (int, str)) and not isinstance(flow_id, bool) and flow_id != "":
+        return str(flow_id)
+    return None
+
+
+def _match_event_to_window(
+    event: dict[str, Any],
+    windows_list: list["AttackWindow"],
+    grace_seconds: float,
+    pre_start_grace_seconds: float,
+) -> str | None:
+    """Run the 3-tier priority (strict > post-grace > pre-grace) on one
+    event. Returns the winning window.name or None.
+
+    Extracted from attribute_all so it can be called both per-event
+    (fallback path) and per-flow (anchor matching).
+    """
+    ts = event.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    ts_f = float(ts)
+    dest_ip = event.get("dest_ip")
+    sni = event.get("sni")
+
+    strict = [
+        w for w in windows_list
+        if w.start_ts <= ts_f <= w.end_ts
+        and matches_target(dest_ip, sni, w.target_type, w.target_value)
+    ]
+    if strict:
+        return max(strict, key=lambda w: (w.start_ts, w.name)).name
+
+    post_grace = [
+        w for w in windows_list
+        if w.end_ts < ts_f <= w.end_ts + grace_seconds
+        and matches_target(dest_ip, sni, w.target_type, w.target_value)
+    ]
+    if post_grace:
+        return max(post_grace, key=lambda w: (w.end_ts, w.name)).name
+
+    pre_grace = [
+        w for w in windows_list
+        if w.start_ts - pre_start_grace_seconds <= ts_f < w.start_ts
+        and matches_target(dest_ip, sni, w.target_type, w.target_value)
+    ]
+    if pre_grace:
+        return min(pre_grace, key=lambda w: (w.start_ts, w.name)).name
+
+    return None
+
+
 def attribute_all(
     events: Iterable[dict[str, Any]],
     attack_windows: Iterable[AttackWindow],
@@ -252,45 +325,59 @@ def attribute_all(
     windows_list = list(attack_windows)
     result: dict[str, list[dict[str, Any]]] = {w.name: [] for w in windows_list}
 
+    # Group events by flow identifier. Events without any identifier
+    # (no community_id, no uid, no flow_id) become singletons attributed
+    # individually.
+    flows: dict[str, list[dict[str, Any]]] = {}
+    singletons: list[dict[str, Any]] = []
     for event in events:
-        ts = event.get("ts")
-        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-            continue
-        ts_f = float(ts)
-        dest_ip = event.get("dest_ip")
-        sni = event.get("sni")
+        fkey = _flow_key(event)
+        if fkey is None:
+            singletons.append(event)
+        else:
+            flows.setdefault(fkey, []).append(event)
 
-        # Tier 1: strict (no-grace) matches.
-        strict = [
-            w for w in windows_list
-            if w.start_ts <= ts_f <= w.end_ts
-            and matches_target(dest_ip, sni, w.target_type, w.target_value)
+    # For each flow, anchor attribution on the event with the earliest
+    # numeric ts -- that's the packet closest to the flow's actual
+    # start, and the one least affected by downstream emission delays
+    # (Zeek service-detection lag, Suricata threshold bucketing).
+    # If the anchor attributes, ALL events in the flow go to the same
+    # attack (a flow has one cause). If the anchor doesn't attribute
+    # (e.g., its ts is outside every window), fall back to per-event
+    # attribution so no events are dropped by flow grouping alone.
+    for flow_events in flows.values():
+        timed = [
+            e for e in flow_events
+            if isinstance(e.get("ts"), (int, float))
+            and not isinstance(e.get("ts"), bool)
         ]
-        if strict:
-            chosen = max(strict, key=lambda w: (w.start_ts, w.name))
-            result[chosen.name].append(event)
+        if not timed:
             continue
+        anchor = min(timed, key=lambda e: float(e["ts"]))
+        winner = _match_event_to_window(
+            anchor, windows_list, grace_seconds, pre_start_grace_seconds,
+        )
+        if winner is not None:
+            # All flow events go to the anchor's winner.
+            result[winner].extend(flow_events)
+        else:
+            # Anchor couldn't attribute -- degrade gracefully to per-event
+            # attribution rather than dropping the whole flow.
+            for ev in flow_events:
+                w = _match_event_to_window(
+                    ev, windows_list, grace_seconds, pre_start_grace_seconds,
+                )
+                if w is not None:
+                    result[w].append(ev)
 
-        # Tier 2: post-end grace (Suricata threshold delay).
-        post_grace = [
-            w for w in windows_list
-            if w.end_ts < ts_f <= w.end_ts + grace_seconds
-            and matches_target(dest_ip, sni, w.target_type, w.target_value)
-        ]
-        if post_grace:
-            chosen = max(post_grace, key=lambda w: (w.end_ts, w.name))
-            result[chosen.name].append(event)
-            continue
-
-        # Tier 3: pre-start grace (clock skew correction).
-        pre_grace = [
-            w for w in windows_list
-            if w.start_ts - pre_start_grace_seconds <= ts_f < w.start_ts
-            and matches_target(dest_ip, sni, w.target_type, w.target_value)
-        ]
-        if pre_grace:
-            # Earliest start = closest boundary to the pre-start event.
-            chosen = min(pre_grace, key=lambda w: (w.start_ts, w.name))
-            result[chosen.name].append(event)
+    # Singletons: legacy path, per-event attribution. Identical to pre-
+    # flow-grouping behavior so callers supplying flow-less events (e.g.,
+    # events built by hand in tests) see no regression.
+    for ev in singletons:
+        w = _match_event_to_window(
+            ev, windows_list, grace_seconds, pre_start_grace_seconds,
+        )
+        if w is not None:
+            result[w].append(ev)
 
     return result
