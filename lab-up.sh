@@ -22,7 +22,7 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
 STATE_FILE="$SCRIPT_DIR/.lab-state"
 KEY_FILE="$SCRIPT_DIR/.lab-key"
 LOG_DIR="$SCRIPT_DIR/.install-logs"

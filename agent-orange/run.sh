@@ -25,7 +25,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-STATE_FILE="$REPO_ROOT/purple-agent/.lab-state"
+STATE_FILE="$REPO_ROOT/.lab-state"
 RUN_PY="$SCRIPT_DIR/run.py"
 
 ATTACKER_IP="${ATTACKER_IP:-}"
