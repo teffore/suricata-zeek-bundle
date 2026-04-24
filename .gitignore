@@ -17,12 +17,12 @@ id_ed25519.*
 # kept out of the repo so forks don't pick it up
 update-iam-role.ps1
 
-# Benchmark run outputs — timestamped per run, noisy in git. The .gitkeep
-# keeps the directory tracked; baseline.json is explicitly committed when
-# a new baseline is captured.
-purple-agent/benchmarks/results/*.json
-purple-agent/benchmarks/results/*.log
-!purple-agent/benchmarks/baseline.json
+# Lab state — SSH private key + ephemeral AWS resource IDs. Must never be committed.
+# Managed by lab-up.sh / lab-down.sh at repo root.
+.lab-state
+.lab-key
+.lab-key.pub
+.install-logs/
 
 # Agent Orange per-run output directories — noisy in git. Each run is
 # self-contained under agent-orange/runs/<ts>/. A baseline run can be

@@ -23,8 +23,7 @@ Behavior:
     can't race the verdict.
   - drift computed vs. most recent prior run if runs/index.json exists
   - LLM narrative unless --no-llm; failure falls back gracefully
-  - auto-opens the HTML report unless PURPLE_AGENT_NO_OPEN=1 in env
-    (the same escape hatch purple-agent respects)
+  - auto-opens the HTML report unless AGENT_ORANGE_NO_OPEN=1 in env
 """
 
 from __future__ import annotations
@@ -534,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"[agent-orange] artifacts: {run_dir}")
 
-    if not args.no_open and os.environ.get("PURPLE_AGENT_NO_OPEN") != "1":
+    if not args.no_open and os.environ.get("AGENT_ORANGE_NO_OPEN") != "1":
         try:
             webbrowser.open((run_dir / "report.html").as_uri())
         except Exception:  # pragma: no cover
