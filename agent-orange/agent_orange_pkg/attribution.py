@@ -164,25 +164,36 @@ def attribute_all(
     disambiguator is useless and back-to-back attacks double-count
     every alert whose timestamp straddles two windows.
 
-    Algorithm: sort windows by start_ts (stable, deterministic). For
-    each event, scan windows in that order; assign to the FIRST one
-    whose time-window AND target BOTH match. Break ties toward earlier
-    attacks -- consistent with the "alert is caused by the attack that
-    triggered it, not the one that happened to run next."
+    Priority rule (two-tier, discovered empirically in validation run
+    20260424T205801Z):
+
+    1. STRICT match preferred. If the event's timestamp falls within
+       ANY attack's real [start_ts, end_ts] window (no grace) and the
+       target matches, attribute there. If multiple attacks strict-match
+       (overlapping windows, shouldn't happen with sequential runs but
+       defensive), pick the LATEST start_ts -- most recent activity.
+
+    2. GRACE match fallback. Only when no attack strict-matches:
+       consider attacks where the event falls within [start_ts,
+       end_ts + grace]. The grace window accounts for Suricata emitting
+       alerts slightly after the triggering packet (threshold bucketing,
+       flow aging). If multiple graces match, pick the LATEST end_ts
+       -- the most recently finished attack is most likely the cause.
+
+    Why "latest" not "first"? A late-arriving alert caused by a recent
+    attack would be wrongly credited to an earlier attack whose grace
+    happens to still overlap. Run 20260424T205801Z: icmpdoor [312-321]
+    grace -> 324 covered an alert at 323.07 that actually came from
+    masscan [322-325] strict window. First-match gave it to icmpdoor
+    (wrong -- icmpdoor is ICMP, can't trip a SYN-scan rule); strict-
+    beats-grace gives it to masscan (right).
 
     Returns a dict keyed by window.name, with every supplied window
     appearing in the result (empty list if no events attributed).
-    Events matching no window are silently dropped (caller can detect
-    this by summing list lengths vs. input events).
-
-    Windows with duplicate names are tolerated but result in a single
-    dict entry per name -- the caller is responsible for ensuring
-    uniqueness if that matters.
+    Events matching no window are silently dropped. Windows with
+    duplicate names are tolerated but collapse to one dict entry.
     """
     windows_list = list(attack_windows)
-    # Stable sort by start_ts for deterministic first-match.
-    sorted_windows = sorted(windows_list, key=lambda w: w.start_ts)
-
     result: dict[str, list[dict[str, Any]]] = {w.name: [] for w in windows_list}
 
     for event in events:
@@ -192,12 +203,28 @@ def attribute_all(
         ts_f = float(ts)
         dest_ip = event.get("dest_ip")
         sni = event.get("sni")
-        for w in sorted_windows:
-            if not in_time_window(ts_f, w.start_ts, w.end_ts, grace_seconds):
-                continue
-            if not matches_target(dest_ip, sni, w.target_type, w.target_value):
-                continue
-            # First match wins; don't bleed to any subsequent window.
-            result[w.name].append(event)
-            break
+
+        # Tier 1: strict (no-grace) matches.
+        strict = [
+            w for w in windows_list
+            if w.start_ts <= ts_f <= w.end_ts
+            and matches_target(dest_ip, sni, w.target_type, w.target_value)
+        ]
+        if strict:
+            # Latest start_ts wins. Stable across input reordering because
+            # we're selecting by a property of the window, not position.
+            chosen = max(strict, key=lambda w: w.start_ts)
+            result[chosen.name].append(event)
+            continue
+
+        # Tier 2: grace fallback.
+        grace = [
+            w for w in windows_list
+            if w.start_ts <= ts_f <= w.end_ts + grace_seconds
+            and matches_target(dest_ip, sni, w.target_type, w.target_value)
+        ]
+        if grace:
+            chosen = max(grace, key=lambda w: w.end_ts)
+            result[chosen.name].append(event)
+
     return result

@@ -221,22 +221,56 @@ class TestAttributeAll:
         assert len(out["a"]) == 1
         assert out["a"][0]["sid"] == 1
 
-    def test_event_in_overlapping_windows_goes_to_first(self):
-        # a: [100, 120], b: [105, 115]. Event at 110 is inside both by time
-        # and both target the same victim. First-by-start wins -> 'a'.
-        windows = [self._w("a", 100, 120), self._w("b", 105, 115)]
-        events = [self._ev(110.0, dest_ip="172.31.76.116", sid=9000003)]
+    def test_strict_match_beats_grace_match(self):
+        # Core correctness rule: an event falling inside attack B's REAL
+        # window AND attack A's grace extension is attributed to B (the
+        # attack that was actually running when the alert fired).
+        # Scenario from run 20260424T205801Z: icmpdoor [312.14, 321.12]
+        # + grace=3 -> 324.12 covers 323.07. masscan [322, 325] strictly
+        # covers 323.07. Attribute to masscan (strict wins over grace).
+        windows = [
+            self._w("icmpdoor", 312.14, 321.12),
+            self._w("masscan", 322.0, 325.0),
+        ]
+        events = [self._ev(323.07, dest_ip="172.31.76.116", sid=9000003)]
         out = attribute_all(events, windows)
-        assert len(out["a"]) == 1
-        assert out["b"] == []
+        assert len(out["masscan"]) == 1
+        assert out["icmpdoor"] == []
 
-    def test_first_by_start_even_if_windows_passed_out_of_order(self):
-        # Deterministic: attribute_all sorts windows by start_ts internally.
-        windows = [self._w("second", 105, 115), self._w("first", 100, 120)]
+    def test_overlapping_strict_windows_latest_start_wins(self):
+        # Defensive: sequential runs shouldn't produce overlapping real
+        # windows, but if a caller passes overlapping windows, latest
+        # start wins (most recent activity likely caused the alert).
+        windows = [self._w("a", 100, 120), self._w("b", 105, 115)]
         events = [self._ev(110.0, dest_ip="172.31.76.116", sid=1)]
         out = attribute_all(events, windows)
-        assert len(out["first"]) == 1
-        assert out["second"] == []
+        assert len(out["b"]) == 1   # b starts later
+        assert out["a"] == []
+
+    def test_latest_end_wins_among_grace_only_matches(self):
+        # Both attacks ended; event falls only in their grace windows.
+        # Pick the LATEST end_ts (most recent activity).
+        # a: [100, 110] grace -> 113. b: [105, 111] grace -> 114.
+        # Event at 113.5 is in b's grace only (not a's: 113.5 > 113).
+        # Regression: event at 112 is in both graces -> pick b (end=111 > 110).
+        windows = [self._w("a", 100, 110), self._w("b", 105, 111)]
+        events = [self._ev(112.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["b"]) == 1
+        assert out["a"] == []
+
+    def test_window_input_order_does_not_matter(self):
+        # Whatever priority rule is in effect must be independent of the
+        # iteration order of the input list.
+        w_second = self._w("second", 105, 115)
+        w_first = self._w("first", 100, 120)
+        events = [self._ev(110.0, dest_ip="172.31.76.116", sid=1)]
+        # Event at 110 strict-matches both windows; latest start = "second"
+        # (105 > 100). Answer must be "second" regardless of input order.
+        out1 = attribute_all(events, [w_first, w_second])
+        out2 = attribute_all(events, [w_second, w_first])
+        assert out1["second"] == out2["second"]
+        assert len(out1["second"]) == 1
 
     def test_target_mismatch_on_first_falls_through_to_second(self):
         # Event targets VICTIM-2. First window's target is VICTIM-1
@@ -288,19 +322,18 @@ class TestAttributeAll:
         assert [e["sid"] for e in out["b"]] == [2]
         assert [e["sid"] for e in out["c"]] == [3]
 
-    def test_event_in_grace_of_a_exclusive_from_b(self):
-        # The key bug scenario from run 20260424T201700Z: back-to-back
-        # attacks where a late alert from attack A (still in A's grace
-        # window) happens to also fall within B's start.
+    def test_event_in_grace_of_a_and_strict_of_b_goes_to_b(self):
+        # Back-to-back attacks: a ends, b starts next, alert arrives during
+        # b's real window but within a's grace.
         # a: [100, 110] + 3s grace = valid up to 113.
         # b: [112, 122] starts at 112.
-        # Event at 112.5 is in both. First-match (a) wins. With default
-        # filter_events, both would have matched, producing bleed.
+        # Event at 112.5 is in a's grace (112.5 <= 113) AND b's strict
+        # window (112 <= 112.5 <= 122). Strict beats grace -> b.
         windows = [self._w("a", 100, 110), self._w("b", 112, 122)]
         events = [self._ev(112.5, dest_ip="172.31.76.116", sid=9000003)]
         out = attribute_all(events, windows)
-        assert len(out["a"]) == 1
-        assert out["b"] == []
+        assert out["a"] == []
+        assert len(out["b"]) == 1
 
     def test_empty_windows_returns_empty_dict(self):
         out = attribute_all([{"ts": 100, "dest_ip": "1.1.1.1"}], [])
