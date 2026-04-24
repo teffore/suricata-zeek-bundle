@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_orange_pkg import __version__ as AO_VERSION
-from agent_orange_pkg.attribution import filter_events
+from agent_orange_pkg.attribution import AttackWindow, attribute_all
 from agent_orange_pkg.catalog import Attack, load_attacks_yaml
 from agent_orange_pkg.harvest import (
     SensorHarvest, capture_baseline, harvest,
@@ -182,10 +182,36 @@ def build_ledger(
     """
     entries: list[AttackLedgerEntry] = []
 
-    # Pre-flatten protocol logs into a flat list so observed-evidence
-    # attribution is a single filter pass; we'll re-bucket by log name
-    # per entry at the end.
     protocol_logs_by_name = harvest_result.zeek_protocol_logs
+
+    # Build one AttackWindow per RAN attack. FAILED attacks are excluded
+    # from attribution: they produced no traffic, so any events landing
+    # in their original time slot belong to a temporally-adjacent RAN
+    # attack (attribute_all's first-match sort will assign them there).
+    windows = [
+        AttackWindow(
+            name=attack.name,
+            start_ts=run.probe_start_ts,
+            end_ts=run.probe_end_ts,
+            target_type=run.target.type,
+            target_value=run.target.value,
+        )
+        for attack, run in zip(attacks, runs)
+        if run.status != "FAILED"
+    ]
+
+    # Exclusive attribution across the whole run: each event is assigned
+    # to at most one attack (first-match by start_ts + target). Prevents
+    # the "same SID attributed to 8 attacks" bleed when many attacks all
+    # target the same victim IP.
+    alerts_by_attack = attribute_all(harvest_result.suricata_alerts, windows)
+    notices_by_attack = attribute_all(harvest_result.zeek_notices, windows)
+    # Intel hits are Zeek-side detection signals equivalent to notices.
+    intel_by_attack = attribute_all(harvest_result.zeek_intel, windows)
+    observed_by_log = {
+        logname: attribute_all(events, windows)
+        for logname, events in protocol_logs_by_name.items()
+    }
 
     for attack, run in zip(attacks, runs):
         if run.status == "FAILED":
@@ -196,29 +222,14 @@ def build_ledger(
             ))
             continue
 
-        t_start = run.probe_start_ts
-        t_end = run.probe_end_ts
-        t_type = run.target.type
-        t_value = run.target.value
-
-        alerts = tuple(filter_events(
-            harvest_result.suricata_alerts, t_start, t_end, t_type, t_value,
-        ))
-        notices = tuple(filter_events(
-            harvest_result.zeek_notices, t_start, t_end, t_type, t_value,
-        ))
-        # Intel hits land in zeek_intel (separate log); they count as
-        # Zeek-side detection signals equivalent to notices for attribution.
-        intel = tuple(filter_events(
-            harvest_result.zeek_intel, t_start, t_end, t_type, t_value,
-        ))
+        alerts = tuple(alerts_by_attack.get(attack.name, []))
+        notices = tuple(notices_by_attack.get(attack.name, []))
+        intel = tuple(intel_by_attack.get(attack.name, []))
         notices = notices + intel
 
         observed: dict[str, tuple[dict[str, Any], ...]] = {}
-        for logname, events in protocol_logs_by_name.items():
-            filtered = tuple(filter_events(
-                events, t_start, t_end, t_type, t_value,
-            ))
+        for logname, by_attack in observed_by_log.items():
+            filtered = tuple(by_attack.get(attack.name, []))
             if filtered:
                 observed[logname] = filtered
 

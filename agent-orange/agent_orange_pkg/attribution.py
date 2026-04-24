@@ -25,6 +25,7 @@ matches_target to classify it as attributable. Missing both => no match.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 # Default grace window (seconds) appended to the attack's end timestamp.
@@ -32,6 +33,21 @@ from typing import Any, Iterable
 # between the attack command returning and the first packet landing on
 # the sensor.
 DEFAULT_GRACE_SECONDS = 3.0
+
+
+@dataclass(frozen=True)
+class AttackWindow:
+    """Attribution parameters for one attack, bundled for attribute_all.
+
+    Instances are frozen + hashable so callers can build them once from
+    the ledger's AttackRun entries and pass them into attribute_all
+    repeatedly (per log stream) without re-deriving the fields.
+    """
+    name: str
+    start_ts: float
+    end_ts: float
+    target_type: str
+    target_value: str
 
 
 def in_time_window(
@@ -131,3 +147,57 @@ def filter_events(
             continue
         out.append(event)
     return out
+
+
+def attribute_all(
+    events: Iterable[dict[str, Any]],
+    attack_windows: Iterable[AttackWindow],
+    grace_seconds: float = DEFAULT_GRACE_SECONDS,
+) -> dict[str, list[dict[str, Any]]]:
+    """Exclusive attribution -- each event to AT MOST ONE attack.
+
+    The run-level entry point. filter_events is still available for
+    per-attack single-pass filtering (used by narrative-only code paths
+    and tests) but for pipelining the whole ledger, callers should use
+    this instead to avoid the same-event-in-N-windows bleed problem:
+    when 20 of 23 attacks all target VICTIM_IP, the dest-match
+    disambiguator is useless and back-to-back attacks double-count
+    every alert whose timestamp straddles two windows.
+
+    Algorithm: sort windows by start_ts (stable, deterministic). For
+    each event, scan windows in that order; assign to the FIRST one
+    whose time-window AND target BOTH match. Break ties toward earlier
+    attacks -- consistent with the "alert is caused by the attack that
+    triggered it, not the one that happened to run next."
+
+    Returns a dict keyed by window.name, with every supplied window
+    appearing in the result (empty list if no events attributed).
+    Events matching no window are silently dropped (caller can detect
+    this by summing list lengths vs. input events).
+
+    Windows with duplicate names are tolerated but result in a single
+    dict entry per name -- the caller is responsible for ensuring
+    uniqueness if that matters.
+    """
+    windows_list = list(attack_windows)
+    # Stable sort by start_ts for deterministic first-match.
+    sorted_windows = sorted(windows_list, key=lambda w: w.start_ts)
+
+    result: dict[str, list[dict[str, Any]]] = {w.name: [] for w in windows_list}
+
+    for event in events:
+        ts = event.get("ts")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            continue
+        ts_f = float(ts)
+        dest_ip = event.get("dest_ip")
+        sni = event.get("sni")
+        for w in sorted_windows:
+            if not in_time_window(ts_f, w.start_ts, w.end_ts, grace_seconds):
+                continue
+            if not matches_target(dest_ip, sni, w.target_type, w.target_value):
+                continue
+            # First match wins; don't bleed to any subsequent window.
+            result[w.name].append(event)
+            break
+    return result

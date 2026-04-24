@@ -12,7 +12,9 @@ from __future__ import annotations
 import pytest
 
 from agent_orange_pkg.attribution import (
+    AttackWindow,
     DEFAULT_GRACE_SECONDS,
+    attribute_all,
     filter_events,
     in_time_window,
     matches_target,
@@ -159,3 +161,186 @@ class TestFilterEvents:
         # If someone changes DEFAULT_GRACE_SECONDS, the test that depends on
         # the 3-second boundary should move with it. Fail loudly otherwise.
         assert DEFAULT_GRACE_SECONDS == 3.0
+
+
+# ---------------------------------------------------------------------------
+#  Exclusive attribution (Fix 2: one event, one attack)
+# ---------------------------------------------------------------------------
+
+class TestAttackWindow:
+    """AttackWindow is an immutable record bundling the per-attack data
+    attribute_all needs: name, time boundaries, and target anchor."""
+
+    def test_constructs_with_all_fields(self):
+        w = AttackWindow(
+            name="art-x",
+            start_ts=100.0,
+            end_ts=110.0,
+            target_type="victim",
+            target_value="172.31.76.116",
+        )
+        assert w.name == "art-x"
+        assert w.start_ts == 100.0
+        assert w.end_ts == 110.0
+        assert w.target_type == "victim"
+        assert w.target_value == "172.31.76.116"
+
+    def test_is_frozen(self):
+        w = AttackWindow("a", 0, 1, "victim", "x")
+        with pytest.raises((AttributeError, Exception)):
+            w.name = "b"  # frozen dataclass -> FrozenInstanceError
+
+
+class TestAttributeAll:
+    """attribute_all maps each event to AT MOST ONE attack window. The
+    first window (by start_ts) whose time-window AND target BOTH match
+    wins the event. Other windows that would have also matched are
+    denied -- this eliminates the 'same SID attributed to 8 attacks'
+    bleed problem that filter_events can't prevent on its own.
+    """
+
+    def _ev(self, ts, dest_ip=None, sni=None, **extras):
+        return {"ts": ts, "dest_ip": dest_ip, "sni": sni, **extras}
+
+    def _w(self, name, start, end, ttype="victim", tval="172.31.76.116"):
+        return AttackWindow(
+            name=name, start_ts=start, end_ts=end,
+            target_type=ttype, target_value=tval,
+        )
+
+    def test_returns_dict_keyed_by_window_name(self):
+        windows = [self._w("a", 0, 10), self._w("b", 20, 30)]
+        out = attribute_all([], windows)
+        assert set(out.keys()) == {"a", "b"}
+        assert out["a"] == [] and out["b"] == []
+
+    def test_single_event_single_match(self):
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(105.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["a"][0]["sid"] == 1
+
+    def test_event_in_overlapping_windows_goes_to_first(self):
+        # a: [100, 120], b: [105, 115]. Event at 110 is inside both by time
+        # and both target the same victim. First-by-start wins -> 'a'.
+        windows = [self._w("a", 100, 120), self._w("b", 105, 115)]
+        events = [self._ev(110.0, dest_ip="172.31.76.116", sid=9000003)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_first_by_start_even_if_windows_passed_out_of_order(self):
+        # Deterministic: attribute_all sorts windows by start_ts internally.
+        windows = [self._w("second", 105, 115), self._w("first", 100, 120)]
+        events = [self._ev(110.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["first"]) == 1
+        assert out["second"] == []
+
+    def test_target_mismatch_on_first_falls_through_to_second(self):
+        # Event targets VICTIM-2. First window's target is VICTIM-1
+        # (mismatch), second window is VICTIM-2. Event goes to second
+        # (target match matters, not just time).
+        windows = [
+            self._w("a", 100, 120, tval="172.31.76.1"),
+            self._w("b", 100, 120, tval="172.31.76.2"),
+        ]
+        events = [self._ev(110.0, dest_ip="172.31.76.2", sid=1)]
+        out = attribute_all(events, windows)
+        assert out["a"] == []
+        assert len(out["b"]) == 1
+
+    def test_event_outside_all_windows_dropped(self):
+        # Attribution is exclusive but not required -- events that don't
+        # match any window at all are simply unassigned.
+        windows = [self._w("a", 100, 110), self._w("b", 200, 210)]
+        events = [self._ev(150.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert out["a"] == []
+        assert out["b"] == []
+
+    def test_bad_ts_events_dropped(self):
+        windows = [self._w("a", 0, 1000)]
+        events = [
+            self._ev(None, dest_ip="172.31.76.116", sid=1),
+            self._ev("str", dest_ip="172.31.76.116", sid=2),
+            self._ev(True, dest_ip="172.31.76.116", sid=3),  # bool excluded
+            self._ev(False, dest_ip="172.31.76.116", sid=4),
+        ]
+        out = attribute_all(events, windows)
+        assert out["a"] == []
+
+    def test_multiple_events_distributed_correctly(self):
+        # Three sequential windows, alerts landing in each. Nothing bleeds.
+        windows = [
+            self._w("a", 100, 110),
+            self._w("b", 120, 130),
+            self._w("c", 140, 150),
+        ]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", sid=1),   # -> a
+            self._ev(125.0, dest_ip="172.31.76.116", sid=2),   # -> b
+            self._ev(145.0, dest_ip="172.31.76.116", sid=3),   # -> c
+        ]
+        out = attribute_all(events, windows)
+        assert [e["sid"] for e in out["a"]] == [1]
+        assert [e["sid"] for e in out["b"]] == [2]
+        assert [e["sid"] for e in out["c"]] == [3]
+
+    def test_event_in_grace_of_a_exclusive_from_b(self):
+        # The key bug scenario from run 20260424T201700Z: back-to-back
+        # attacks where a late alert from attack A (still in A's grace
+        # window) happens to also fall within B's start.
+        # a: [100, 110] + 3s grace = valid up to 113.
+        # b: [112, 122] starts at 112.
+        # Event at 112.5 is in both. First-match (a) wins. With default
+        # filter_events, both would have matched, producing bleed.
+        windows = [self._w("a", 100, 110), self._w("b", 112, 122)]
+        events = [self._ev(112.5, dest_ip="172.31.76.116", sid=9000003)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_empty_windows_returns_empty_dict(self):
+        out = attribute_all([{"ts": 100, "dest_ip": "1.1.1.1"}], [])
+        assert out == {}
+
+    def test_custom_grace_honored(self):
+        # Same 3-parameter shape as filter_events; grace extends end_ts.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(115.0, dest_ip="172.31.76.116", sid=1)]
+        # Default grace 3s -> 115 outside [100, 113]
+        assert attribute_all(events, windows)["a"] == []
+        # Custom grace 10s -> inside [100, 120]
+        assert len(attribute_all(events, windows, grace_seconds=10)["a"]) == 1
+
+    def test_sni_target_works(self):
+        windows = [self._w(
+            "a", 100, 110, ttype="sni", tval="trycloudflare.com",
+        )]
+        events = [self._ev(105.0, sni="abc.trycloudflare.com", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+
+    def test_preserves_event_order_within_one_window(self):
+        windows = [self._w("a", 100, 200)]
+        events = [
+            self._ev(110.0, dest_ip="172.31.76.116", sid=1),
+            self._ev(105.0, dest_ip="172.31.76.116", sid=2),
+            self._ev(150.0, dest_ip="172.31.76.116", sid=3),
+        ]
+        out = attribute_all(events, windows)
+        # Iteration order of input preserved (not sorted by ts).
+        assert [e["sid"] for e in out["a"]] == [1, 2, 3]
+
+    def test_same_name_duplicate_windows_last_wins_in_result_dict(self):
+        # Defensive: duplicate names are a caller bug, but don't crash.
+        # The result dict has ONE entry per name; whichever window
+        # received the event matters.
+        windows = [self._w("a", 100, 110), self._w("a", 200, 210)]
+        events = [self._ev(105.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        # Only one "a" key; we don't require specific contents for
+        # pathological duplicate-name input, just don't crash.
+        assert "a" in out
