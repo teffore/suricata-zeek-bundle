@@ -261,11 +261,63 @@ def _match_event_to_window(
     return None
 
 
+def compute_flow_owners(
+    events: Iterable[dict[str, Any]],
+    attack_windows: Iterable[AttackWindow],
+    grace_seconds: float = DEFAULT_GRACE_SECONDS,
+    pre_start_grace_seconds: float = DEFAULT_PRE_START_GRACE_SECONDS,
+) -> dict[str, str]:
+    """Build a flow_key -> attack_name ownership map from all events.
+
+    Used by run.py to unify flow attribution ACROSS streams (Suricata
+    alerts + Zeek notices + intel + per-protocol logs). A single flow
+    that produces both a Suricata alert and a Zeek notice needs to
+    attribute both to the same attack -- but attribute_all is called
+    once per stream, so the flow grouping inside each call can't see
+    cross-stream events.
+
+    This helper solves that by taking ALL events in one shot, grouping
+    them by flow_key, and choosing each flow's owning attack via the
+    earliest-event anchor rule (same as attribute_all's internal logic).
+    run.py calls this once and passes the result to every
+    attribute_all() call for the rest of the run.
+
+    Flows whose anchor can't attribute (ts outside every window after
+    graces, or target mismatch) are omitted from the map -- callers
+    fall back to per-event attribution for those events.
+    """
+    windows_list = list(attack_windows)
+    flows: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        fkey = _flow_key(event)
+        if fkey is None:
+            continue
+        flows.setdefault(fkey, []).append(event)
+
+    owners: dict[str, str] = {}
+    for fkey, flow_events in flows.items():
+        timed = [
+            e for e in flow_events
+            if isinstance(e.get("ts"), (int, float))
+            and not isinstance(e.get("ts"), bool)
+        ]
+        if not timed:
+            continue
+        anchor = min(timed, key=lambda e: float(e["ts"]))
+        winner = _match_event_to_window(
+            anchor, windows_list, grace_seconds, pre_start_grace_seconds,
+        )
+        if winner is not None:
+            owners[fkey] = winner
+    return owners
+
+
 def attribute_all(
     events: Iterable[dict[str, Any]],
     attack_windows: Iterable[AttackWindow],
     grace_seconds: float = DEFAULT_GRACE_SECONDS,
     pre_start_grace_seconds: float = DEFAULT_PRE_START_GRACE_SECONDS,
+    flow_owners: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Exclusive attribution -- each event to AT MOST ONE attack.
 
@@ -324,6 +376,7 @@ def attribute_all(
     """
     windows_list = list(attack_windows)
     result: dict[str, list[dict[str, Any]]] = {w.name: [] for w in windows_list}
+    valid_names = set(result.keys())
 
     # Group events by flow identifier. Events without any identifier
     # (no community_id, no uid, no flow_id) become singletons attributed
@@ -337,32 +390,40 @@ def attribute_all(
         else:
             flows.setdefault(fkey, []).append(event)
 
-    # For each flow, anchor attribution on the event with the earliest
-    # numeric ts -- that's the packet closest to the flow's actual
-    # start, and the one least affected by downstream emission delays
-    # (Zeek service-detection lag, Suricata threshold bucketing).
-    # If the anchor attributes, ALL events in the flow go to the same
-    # attack (a flow has one cause). If the anchor doesn't attribute
-    # (e.g., its ts is outside every window), fall back to per-event
-    # attribution so no events are dropped by flow grouping alone.
-    for flow_events in flows.values():
-        timed = [
-            e for e in flow_events
-            if isinstance(e.get("ts"), (int, float))
-            and not isinstance(e.get("ts"), bool)
-        ]
-        if not timed:
-            continue
-        anchor = min(timed, key=lambda e: float(e["ts"]))
-        winner = _match_event_to_window(
-            anchor, windows_list, grace_seconds, pre_start_grace_seconds,
-        )
-        if winner is not None:
-            # All flow events go to the anchor's winner.
-            result[winner].extend(flow_events)
+    # For each flow, decide the owning attack in priority order:
+    #   1. If flow_owners was supplied (run.py pre-computed it across
+    #      all streams), look up the flow_key there -- this unifies
+    #      attribution for a flow whose events live in different
+    #      streams (e.g., Suricata alert + Zeek notice with same
+    #      community_id).
+    #   2. Else anchor on the earliest-ts event in THIS stream's flow
+    #      group. Works when flow is single-stream or caller didn't
+    #      pre-compute owners.
+    # If no decision can be made, fall back to per-event attribution
+    # so we never drop an event purely because of flow grouping.
+    for fkey, flow_events in flows.items():
+        owner = None
+        if flow_owners and fkey in flow_owners:
+            owner_candidate = flow_owners[fkey]
+            # Defensive: owner name must be one of the windows we know.
+            # Protects against stale flow_owners maps from prior runs.
+            if owner_candidate in valid_names:
+                owner = owner_candidate
+        if owner is None:
+            timed = [
+                e for e in flow_events
+                if isinstance(e.get("ts"), (int, float))
+                and not isinstance(e.get("ts"), bool)
+            ]
+            if timed:
+                anchor = min(timed, key=lambda e: float(e["ts"]))
+                owner = _match_event_to_window(
+                    anchor, windows_list, grace_seconds, pre_start_grace_seconds,
+                )
+        if owner is not None:
+            result[owner].extend(flow_events)
         else:
-            # Anchor couldn't attribute -- degrade gracefully to per-event
-            # attribution rather than dropping the whole flow.
+            # Neither mapping nor anchor worked -- degrade to per-event.
             for ev in flow_events:
                 w = _match_event_to_window(
                     ev, windows_list, grace_seconds, pre_start_grace_seconds,

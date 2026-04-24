@@ -41,7 +41,7 @@ from typing import Any
 
 from agent_orange_pkg import __version__ as AO_VERSION
 from agent_orange_pkg.attribution import (
-    DEFAULT_GRACE_SECONDS, AttackWindow, attribute_all,
+    DEFAULT_GRACE_SECONDS, AttackWindow, attribute_all, compute_flow_owners,
 )
 from agent_orange_pkg.catalog import Attack, load_attacks_yaml
 from agent_orange_pkg.harvest import (
@@ -205,17 +205,35 @@ def build_ledger(
     ]
 
     # Exclusive attribution across the whole run: each event is assigned
-    # to at most one attack via attribute_all's two-tier priority
-    # (strict [start, end] match beats grace [end, end+grace] match;
-    # latest start_ts / latest end_ts tiebreak). Prevents the
-    # "same SID attributed to 8 attacks" bleed when many attacks all
-    # target the same victim IP.
-    alerts_by_attack = attribute_all(harvest_result.suricata_alerts, windows)
-    notices_by_attack = attribute_all(harvest_result.zeek_notices, windows)
+    # to at most one attack via attribute_all's 3-tier priority.
+    #
+    # First pre-compute a flow_owners map across ALL streams so a flow
+    # that produces both a Suricata alert AND a Zeek notice (sharing
+    # community_id) attributes to the same attack. Without this, each
+    # attribute_all call only sees its own stream's events and can
+    # split a single flow's evidence across multiple attacks -- the
+    # whois-tunnel vs icmpdoor-c2 bug surfaced in run 20260424T221848Z.
+    all_events_for_flow_grouping = (
+        list(harvest_result.suricata_alerts)
+        + list(harvest_result.zeek_notices)
+        + list(harvest_result.zeek_intel)
+    )
+    for events in protocol_logs_by_name.values():
+        all_events_for_flow_grouping.extend(events)
+    flow_owners = compute_flow_owners(all_events_for_flow_grouping, windows)
+
+    alerts_by_attack = attribute_all(
+        harvest_result.suricata_alerts, windows, flow_owners=flow_owners,
+    )
+    notices_by_attack = attribute_all(
+        harvest_result.zeek_notices, windows, flow_owners=flow_owners,
+    )
     # Intel hits are Zeek-side detection signals equivalent to notices.
-    intel_by_attack = attribute_all(harvest_result.zeek_intel, windows)
+    intel_by_attack = attribute_all(
+        harvest_result.zeek_intel, windows, flow_owners=flow_owners,
+    )
     observed_by_log = {
-        logname: attribute_all(events, windows)
+        logname: attribute_all(events, windows, flow_owners=flow_owners)
         for logname, events in protocol_logs_by_name.items()
     }
 

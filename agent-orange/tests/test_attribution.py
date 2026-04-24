@@ -16,6 +16,7 @@ from agent_orange_pkg.attribution import (
     DEFAULT_GRACE_SECONDS,
     DEFAULT_PRE_START_GRACE_SECONDS,
     attribute_all,
+    compute_flow_owners,
     filter_events,
     in_time_window,
     matches_target,
@@ -628,3 +629,111 @@ class TestAttributeAll:
         ]
         out = attribute_all(events, windows)
         assert len(out["a"]) == 2  # one flow via community_id
+
+
+class TestComputeFlowOwners:
+    """compute_flow_owners maps each unique flow key to the attack that
+    owns it, looking at events ACROSS streams. run.py calls this once
+    before running attribute_all per-stream; each stream then reuses
+    the shared owner map so a Suricata alert and a Zeek notice with
+    the same community_id land on the same attack.
+    """
+
+    def _ev(self, ts, **kw):
+        return {"ts": ts, "dest_ip": kw.pop("dest_ip", None),
+                "sni": kw.pop("sni", None), **kw}
+
+    def _w(self, name, start, end, ttype="victim", tval="172.31.76.116"):
+        return AttackWindow(
+            name=name, start_ts=start, end_ts=end,
+            target_type=ttype, target_value=tval,
+        )
+
+    def test_empty_events_returns_empty_map(self):
+        assert compute_flow_owners([], [self._w("a", 0, 10)]) == {}
+
+    def test_single_flow_single_owner(self):
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(105.0, dest_ip="172.31.76.116", community_id="FX", sid=1)]
+        assert compute_flow_owners(events, windows) == {"FX": "a"}
+
+    def test_cross_stream_same_community_id_one_flow(self):
+        # The whois scenario that motivated this fix: a Suricata alert
+        # and a Zeek notice share community_id. compute_flow_owners sees
+        # BOTH in its input and returns a single mapping.
+        windows = [self._w("whois", 100, 101), self._w("icmp", 102, 110)]
+        events = [
+            # Suricata alert during whois's window
+            self._ev(100.5, dest_ip="172.31.76.116", community_id="SAME", sid=2260002),
+            # Zeek notice for the same flow, late-emitted during icmp's window
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="SAME", note="Protocol_Found"),
+        ]
+        owners = compute_flow_owners(events, windows)
+        assert owners == {"SAME": "whois"}
+
+    def test_events_without_flow_key_ignored(self):
+        windows = [self._w("a", 100, 110)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", sid=1),           # no flow key
+            self._ev(106.0, dest_ip="172.31.76.116", community_id="X", sid=2),
+        ]
+        assert compute_flow_owners(events, windows) == {"X": "a"}
+
+    def test_flow_anchor_outside_any_window_omitted(self):
+        # A flow whose earliest event is outside all windows isn't
+        # included in the map (the attribute_all fallback will deal
+        # with its events individually).
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(50.0, dest_ip="172.31.76.116", community_id="ORPHAN", sid=1)]
+        assert compute_flow_owners(events, windows) == {}
+
+
+class TestAttributeAllWithFlowOwners:
+    """attribute_all accepts an optional pre-computed flow_owners map.
+    When provided, it overrides the local flow-grouping decision for
+    events whose flow_key is in the map. Events without a flow_key
+    (or with an unmapped one) still fall back to the 3-tier time rule.
+    """
+
+    def _ev(self, ts, dest_ip=None, **kw):
+        return {"ts": ts, "dest_ip": dest_ip, "sni": None, **kw}
+
+    def _w(self, name, start, end):
+        return AttackWindow(
+            name=name, start_ts=start, end_ts=end,
+            target_type="victim", target_value="172.31.76.116",
+        )
+
+    def test_flow_owners_override_time_attribution(self):
+        # Without flow_owners, the event at ts=125 in b's window would
+        # go to b. With flow_owners mapping its community_id to "a",
+        # it lands on a instead.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [self._ev(125.0, dest_ip="172.31.76.116",
+                           community_id="FX", note="late")]
+        owners = {"FX": "a"}
+        out = attribute_all(events, windows, flow_owners=owners)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_flow_key_not_in_owners_falls_back_to_time(self):
+        # Event has a flow_key but it's not in the map (e.g., this is
+        # the only event with that key and its anchor couldn't
+        # attribute). Use per-event time attribution.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [self._ev(125.0, dest_ip="172.31.76.116",
+                           community_id="UNKNOWN", sid=1)]
+        out = attribute_all(events, windows, flow_owners={"OTHER": "a"})
+        assert out["a"] == []
+        assert len(out["b"]) == 1
+
+    def test_empty_flow_owners_same_as_no_flow_owners(self):
+        # Regression: passing {} should behave identically to passing None.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(105.0, dest_ip="172.31.76.116",
+                           community_id="X", sid=1)]
+        out_none = attribute_all(events, windows)
+        out_empty = attribute_all(events, windows, flow_owners={})
+        # Both should attribute the event to 'a' via internal flow grouping.
+        assert len(out_none["a"]) == 1
+        assert len(out_empty["a"]) == 1
