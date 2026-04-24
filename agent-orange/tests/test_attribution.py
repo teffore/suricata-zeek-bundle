@@ -14,6 +14,7 @@ import pytest
 from agent_orange_pkg.attribution import (
     AttackWindow,
     DEFAULT_GRACE_SECONDS,
+    DEFAULT_PRE_START_GRACE_SECONDS,
     attribute_all,
     filter_events,
     in_time_window,
@@ -25,8 +26,10 @@ class TestInTimeWindow:
     def test_inside_window(self):
         assert in_time_window(event_ts=100.5, attack_start_ts=100.0, attack_end_ts=101.0)
 
-    def test_before_window_rejected(self):
-        assert not in_time_window(99.9, 100.0, 101.0)
+    def test_before_window_beyond_pre_grace_rejected(self):
+        # Events outside the pre-start grace (default 2s) are rejected.
+        # A 3s-early event is beyond the default pre-grace.
+        assert not in_time_window(97.0, 100.0, 101.0)
 
     def test_after_window_plus_grace_rejected(self):
         # 101 + 3 (default grace) = 104; 104.5 is outside
@@ -47,6 +50,33 @@ class TestInTimeWindow:
     def test_custom_grace_zero(self):
         # With grace=0, post-end events are rejected
         assert not in_time_window(101.5, 100.0, 101.0, grace_seconds=0.0)
+
+    def test_pre_start_grace_default_is_2_seconds(self):
+        # Absorbs clock skew between controller (records probe_start_ts
+        # on local clock) and sensor (stamps events on its own clock).
+        # Default is sized for typical NTP-synced hosts (~0.1-1s skew).
+        assert DEFAULT_PRE_START_GRACE_SECONDS == 2.0
+
+    def test_event_1s_before_start_accepted_with_default_pre_grace(self):
+        # Clock-skew case: sensor timestamp is 1s earlier than the
+        # controller's recorded probe_start_ts. Within default 2s pre-grace.
+        assert in_time_window(99.0, 100.0, 101.0)
+
+    def test_event_3s_before_start_rejected(self):
+        # Beyond default 2s pre-grace -> not attributable (too early).
+        assert not in_time_window(97.0, 100.0, 101.0)
+
+    def test_event_at_pre_start_grace_boundary_accepted(self):
+        # start - pre_grace = 98.0; equality counts as inside.
+        assert in_time_window(98.0, 100.0, 101.0)
+
+    def test_custom_pre_start_grace_honored(self):
+        # Caller can widen the pre-grace if they know skew is larger.
+        assert in_time_window(95.0, 100.0, 101.0, pre_start_grace_seconds=10)
+
+    def test_pre_start_grace_zero_rejects_all_pre_events(self):
+        # Disables the new behavior for callers that want the old semantics.
+        assert not in_time_window(99.5, 100.0, 101.0, pre_start_grace_seconds=0.0)
 
 
 class TestMatchesTarget:
@@ -116,11 +146,13 @@ class TestFilterEvents:
         return {"ts": ts, "dest_ip": dest_ip, "sni": sni, **extras}
 
     def test_combined_time_and_target(self):
+        # Use ts=96.0 for "too early" -- beyond the default 2s pre-grace
+        # (old test used 99.0 back when there was no pre-grace).
         events = [
             self._ev(100.5, dest_ip="172.31.76.116", sid=2001219),  # in window, right ip
-            self._ev(99.0,  dest_ip="172.31.76.116", sid=2001219),  # too early
+            self._ev(96.0,  dest_ip="172.31.76.116", sid=2001219),  # too early (outside pre-grace)
             self._ev(100.5, dest_ip="10.0.0.1",       sid=2001219),  # wrong ip
-            self._ev(103.0, dest_ip="172.31.76.116", sid=2031502),  # in grace, right ip
+            self._ev(103.0, dest_ip="172.31.76.116", sid=2031502),  # in post-grace, right ip
         ]
         out = filter_events(events, 100.0, 101.0, "victim", "172.31.76.116")
         assert len(out) == 2
@@ -377,3 +409,86 @@ class TestAttributeAll:
         # Only one "a" key; we don't require specific contents for
         # pathological duplicate-name input, just don't crash.
         assert "a" in out
+
+    # Pre-start grace tier ---------------------------------------------------
+
+    def test_pre_start_grace_event_attributed(self):
+        # Clock-skew case: sensor stamps a packet at ts=99.5 even though
+        # the controller recorded probe_start_ts=100. With 2s pre-grace,
+        # the event still attributes to window 'a'.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=2260002)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+
+    def test_pre_start_grace_beyond_window_not_attributed(self):
+        # 5s before start is beyond the 2s pre-grace -- unattributed.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(95.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert out["a"] == []
+
+    def test_strict_beats_pre_start_grace(self):
+        # Event at ts=99.5 is in A's strict window [90, 100] AND within
+        # B's pre-grace (B.start=100, pre_grace=2 -> pre span 98..100).
+        # Strict (A) must win.
+        windows = [self._w("a", 90, 100), self._w("b", 100, 110)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=9000003)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_post_end_grace_beats_pre_start_grace(self):
+        # Event at ts=99.5 is in A's post-end grace (A=[90,98]+3 -> 98..101)
+        # AND in B's pre-start grace (B=[100,110], pre=2 -> 98..100).
+        # Policy: post-end (Suricata threshold delay, rock-solid semantic)
+        # beats pre-start (clock-skew correction, speculative).
+        windows = [self._w("a", 90, 98), self._w("b", 100, 110)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_two_pre_start_graces_earliest_start_wins(self):
+        # Two attacks both pre-grace-match one event. Prefer the earlier
+        # attack (closer to the event's actual moment): if event_ts=99.5,
+        # attack starting at 100 is closer than attack starting at 101.
+        # (Note: 101's pre_grace still catches 99.5 since 101-2=99<=99.5.)
+        windows = [self._w("a", 100, 110), self._w("b", 101, 111)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_whois_tunnel_clock_skew_scenario(self):
+        # Literal reproduction of the live-lab case that triggered this fix.
+        # Agent-orange records probe_start=1777066627.05 on controller clock.
+        # Sensor stamps the SURICATA Applayer alert at 1777066626.55
+        # (sensor clock is ~0.9s behind controller). Without pre-grace, the
+        # alert was dropped and whois-tunnel was UNDETECTED despite the
+        # rule firing on every run.
+        # Use target_value="172.31.78.129" to match the real victim IP
+        # from the captured attack.
+        windows = [AttackWindow(
+            name="art-whois-tunnel",
+            start_ts=1777066627.05,
+            end_ts=1777066628.11,
+            target_type="victim",
+            target_value="172.31.78.129",
+        )]
+        events = [self._ev(
+            1777066626.55, dest_ip="172.31.78.129",
+            sid=2260002, signature="SURICATA Applayer Detect protocol only one direction",
+        )]
+        out = attribute_all(events, windows)
+        assert len(out["art-whois-tunnel"]) == 1
+        assert out["art-whois-tunnel"][0]["sid"] == 2260002
+
+    def test_custom_pre_start_grace_in_attribute_all(self):
+        # Caller can adjust pre-grace independently of post-grace.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(96.0, dest_ip="172.31.76.116", sid=1)]
+        # Default 2s pre-grace -> 96 is outside [98, 100)
+        assert attribute_all(events, windows)["a"] == []
+        # Widen to 5s -> inside [95, 100)
+        assert len(attribute_all(events, windows, pre_start_grace_seconds=5)["a"]) == 1

@@ -29,10 +29,24 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 # Default grace window (seconds) appended to the attack's end timestamp.
-# Covers small clock drift between attacker and sensor and slight delay
-# between the attack command returning and the first packet landing on
-# the sensor.
+# Covers Suricata's threshold bucketing / flow aging delay -- the rule
+# engine can emit an alert a second or two after the triggering packet
+# arrived, so we accept events up to this grace after the attack's
+# recorded end.
 DEFAULT_GRACE_SECONDS = 3.0
+
+# Pre-start grace (seconds) subtracted from the attack's start timestamp.
+# Absorbs clock skew between the controller (records probe_start_ts on
+# LOCAL clock via datetime.now()) and the sensor (stamps captured
+# packets on ITS OWN clock via libpcap). NTP-synced hosts typically
+# drift by tens-to-hundreds of milliseconds; a Windows controller and
+# AWS EC2 sensor were measured at ~0.9s skew. 2s accommodates 2x the
+# measured skew with headroom, and is still far shorter than typical
+# attack windows so back-to-back attacks don't overlap pre-grace with
+# their predecessor's real window in most cases. When they do overlap,
+# attribute_all's priority (strict > post-grace > pre-grace) resolves
+# the ambiguity toward the more confident tier.
+DEFAULT_PRE_START_GRACE_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -55,14 +69,24 @@ def in_time_window(
     attack_start_ts: float,
     attack_end_ts: float,
     grace_seconds: float = DEFAULT_GRACE_SECONDS,
+    pre_start_grace_seconds: float = DEFAULT_PRE_START_GRACE_SECONDS,
 ) -> bool:
-    """True iff event_ts falls within [attack_start_ts, attack_end_ts + grace].
+    """True iff event_ts falls within the attack's extended window.
 
-    The grace window extends AFTER the attack, never before -- events that
-    fire before the attack started cannot be caused by it. Equality at
-    either boundary counts as inside (inclusive).
+    The accepted span is:
+        [attack_start_ts - pre_start_grace, attack_end_ts + grace_seconds]
+
+    Both boundaries are inclusive. The post-end grace handles Suricata's
+    threshold/flow-aging emit delay; the pre-start grace absorbs clock
+    skew between the controller (which records probe_start_ts on its
+    own clock) and the sensor (which stamps events on its own clock).
+
+    Set either grace to 0 to disable it. The old "events before start
+    cannot be caused by this attack" semantic assumed single-clock
+    attribution, which breaks when the controller and sensor are
+    separate machines with NTP drift.
     """
-    if event_ts < attack_start_ts:
+    if event_ts < attack_start_ts - pre_start_grace_seconds:
         return False
     return event_ts <= attack_end_ts + grace_seconds
 
@@ -153,6 +177,7 @@ def attribute_all(
     events: Iterable[dict[str, Any]],
     attack_windows: Iterable[AttackWindow],
     grace_seconds: float = DEFAULT_GRACE_SECONDS,
+    pre_start_grace_seconds: float = DEFAULT_PRE_START_GRACE_SECONDS,
 ) -> dict[str, list[dict[str, Any]]]:
     """Exclusive attribution -- each event to AT MOST ONE attack.
 
@@ -164,29 +189,45 @@ def attribute_all(
     disambiguator is useless and back-to-back attacks double-count
     every alert whose timestamp straddles two windows.
 
-    Priority rule (two-tier, discovered empirically in validation run
-    20260424T205801Z):
+    Priority rule (three tiers, discovered empirically during live-lab
+    validation):
 
-    1. STRICT match preferred. If the event's timestamp falls within
-       ANY attack's real [start_ts, end_ts] window (no grace) and the
-       target matches, attribute there. If multiple attacks strict-match
-       (overlapping windows, shouldn't happen with sequential runs but
-       defensive), pick the LATEST start_ts -- most recent activity.
+    1. STRICT match -- event's ts is inside an attack's real
+       [start_ts, end_ts] window. Highest confidence. If multiple
+       strict-match (overlapping windows, defensive case), pick the
+       LATEST start_ts. Ties broken by name for determinism.
 
-    2. GRACE match fallback. Only when no attack strict-matches:
-       consider attacks where the event falls within [start_ts,
-       end_ts + grace]. The grace window accounts for Suricata emitting
-       alerts slightly after the triggering packet (threshold bucketing,
-       flow aging). If multiple graces match, pick the LATEST end_ts
-       -- the most recently finished attack is most likely the cause.
+    2. POST-END GRACE match -- ts is in (end_ts, end_ts + grace].
+       Accounts for Suricata's threshold bucketing / flow aging delay
+       between triggering packet and alert emission. Pick the LATEST
+       end_ts (most recently finished attack is most likely the cause).
 
-    Why "latest" not "first"? A late-arriving alert caused by a recent
-    attack would be wrongly credited to an earlier attack whose grace
-    happens to still overlap. Run 20260424T205801Z: icmpdoor [312-321]
-    grace -> 324 covered an alert at 323.07 that actually came from
-    masscan [322-325] strict window. First-match gave it to icmpdoor
-    (wrong -- icmpdoor is ICMP, can't trip a SYN-scan rule); strict-
-    beats-grace gives it to masscan (right).
+    3. PRE-START GRACE match -- ts is in [start_ts - pre_grace, start_ts).
+       Absorbs clock skew between the controller (records probe
+       timestamps on its own clock) and the sensor (stamps events on
+       its own clock). Pick the EARLIEST start_ts (closest to the
+       event's apparent ts, since ts < start_ts).
+
+    Why the tier ordering? Strict is the ground truth. Post-end grace
+    is a well-understood Suricata semantic (threshold delay). Pre-start
+    grace is a clock-correction heuristic -- speculative, so it loses
+    to both stronger tiers when they apply.
+
+    Why "latest" for strict/post-grace but "earliest" for pre-grace?
+    Each picks the attack temporally CLOSEST to the event. A late
+    alert should go to the most-recently-finished attack; an
+    early-stamped alert should go to the next-to-start attack.
+
+    Run 20260424T205801Z: icmpdoor [312-321] grace -> 324 covered an
+    alert at 323.07 that actually came from masscan [322-325] strict.
+    First-match-by-start gave it to icmpdoor (wrong -- icmpdoor is
+    ICMP, can't trip a SYN-scan rule); strict-beats-grace gives it
+    to masscan (right).
+
+    Run 20260424T213703Z: whois-tunnel [start=1777066627.05] -- sensor
+    stamped the SURICATA Applayer alert at 1777066626.55 due to ~0.9s
+    clock skew. Without pre-start grace the alert was dropped.
+    Pre-start grace (default 2s) correctly routes it to whois-tunnel.
 
     Returns a dict keyed by window.name, with every supplied window
     appearing in the result (empty list if no events attributed).
@@ -211,22 +252,30 @@ def attribute_all(
             and matches_target(dest_ip, sni, w.target_type, w.target_value)
         ]
         if strict:
-            # Latest start_ts wins; (name) tiebreak makes result independent
-            # of input iteration order even when two windows happen to share
-            # start_ts (shouldn't happen with sequential runs, but we don't
-            # require the caller to guarantee uniqueness).
             chosen = max(strict, key=lambda w: (w.start_ts, w.name))
             result[chosen.name].append(event)
             continue
 
-        # Tier 2: grace fallback.
-        grace = [
+        # Tier 2: post-end grace (Suricata threshold delay).
+        post_grace = [
             w for w in windows_list
-            if w.start_ts <= ts_f <= w.end_ts + grace_seconds
+            if w.end_ts < ts_f <= w.end_ts + grace_seconds
             and matches_target(dest_ip, sni, w.target_type, w.target_value)
         ]
-        if grace:
-            chosen = max(grace, key=lambda w: (w.end_ts, w.name))
+        if post_grace:
+            chosen = max(post_grace, key=lambda w: (w.end_ts, w.name))
+            result[chosen.name].append(event)
+            continue
+
+        # Tier 3: pre-start grace (clock skew correction).
+        pre_grace = [
+            w for w in windows_list
+            if w.start_ts - pre_start_grace_seconds <= ts_f < w.start_ts
+            and matches_target(dest_ip, sni, w.target_type, w.target_value)
+        ]
+        if pre_grace:
+            # Earliest start = closest boundary to the pre-start event.
+            chosen = min(pre_grace, key=lambda w: (w.start_ts, w.name))
             result[chosen.name].append(event)
 
     return result
