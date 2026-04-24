@@ -14,7 +14,9 @@ import pytest
 from agent_orange_pkg.attribution import (
     AttackWindow,
     DEFAULT_GRACE_SECONDS,
+    DEFAULT_PRE_START_GRACE_SECONDS,
     attribute_all,
+    compute_flow_owners,
     filter_events,
     in_time_window,
     matches_target,
@@ -25,12 +27,14 @@ class TestInTimeWindow:
     def test_inside_window(self):
         assert in_time_window(event_ts=100.5, attack_start_ts=100.0, attack_end_ts=101.0)
 
-    def test_before_window_rejected(self):
-        assert not in_time_window(99.9, 100.0, 101.0)
+    def test_before_window_beyond_pre_grace_rejected(self):
+        # Events outside the pre-start grace (default 2s) are rejected.
+        # A 3s-early event is beyond the default pre-grace.
+        assert not in_time_window(97.0, 100.0, 101.0)
 
     def test_after_window_plus_grace_rejected(self):
-        # 101 + 3 (default grace) = 104; 104.5 is outside
-        assert not in_time_window(104.5, 100.0, 101.0)
+        # 101 + 10 (default grace) = 111; 112 is outside
+        assert not in_time_window(112.0, 100.0, 101.0)
 
     def test_within_grace_accepted(self):
         assert in_time_window(103.0, 100.0, 101.0)
@@ -47,6 +51,33 @@ class TestInTimeWindow:
     def test_custom_grace_zero(self):
         # With grace=0, post-end events are rejected
         assert not in_time_window(101.5, 100.0, 101.0, grace_seconds=0.0)
+
+    def test_pre_start_grace_default_is_2_seconds(self):
+        # Absorbs clock skew between controller (records probe_start_ts
+        # on local clock) and sensor (stamps events on its own clock).
+        # Default is sized for typical NTP-synced hosts (~0.1-1s skew).
+        assert DEFAULT_PRE_START_GRACE_SECONDS == 2.0
+
+    def test_event_1s_before_start_accepted_with_default_pre_grace(self):
+        # Clock-skew case: sensor timestamp is 1s earlier than the
+        # controller's recorded probe_start_ts. Within default 2s pre-grace.
+        assert in_time_window(99.0, 100.0, 101.0)
+
+    def test_event_3s_before_start_rejected(self):
+        # Beyond default 2s pre-grace -> not attributable (too early).
+        assert not in_time_window(97.0, 100.0, 101.0)
+
+    def test_event_at_pre_start_grace_boundary_accepted(self):
+        # start - pre_grace = 98.0; equality counts as inside.
+        assert in_time_window(98.0, 100.0, 101.0)
+
+    def test_custom_pre_start_grace_honored(self):
+        # Caller can widen the pre-grace if they know skew is larger.
+        assert in_time_window(95.0, 100.0, 101.0, pre_start_grace_seconds=10)
+
+    def test_pre_start_grace_zero_rejects_all_pre_events(self):
+        # Disables the new behavior for callers that want the old semantics.
+        assert not in_time_window(99.5, 100.0, 101.0, pre_start_grace_seconds=0.0)
 
 
 class TestMatchesTarget:
@@ -116,11 +147,13 @@ class TestFilterEvents:
         return {"ts": ts, "dest_ip": dest_ip, "sni": sni, **extras}
 
     def test_combined_time_and_target(self):
+        # Use ts=96.0 for "too early" -- beyond the default 2s pre-grace
+        # (old test used 99.0 back when there was no pre-grace).
         events = [
             self._ev(100.5, dest_ip="172.31.76.116", sid=2001219),  # in window, right ip
-            self._ev(99.0,  dest_ip="172.31.76.116", sid=2001219),  # too early
+            self._ev(96.0,  dest_ip="172.31.76.116", sid=2001219),  # too early (outside pre-grace)
             self._ev(100.5, dest_ip="10.0.0.1",       sid=2001219),  # wrong ip
-            self._ev(103.0, dest_ip="172.31.76.116", sid=2031502),  # in grace, right ip
+            self._ev(103.0, dest_ip="172.31.76.116", sid=2031502),  # in post-grace, right ip
         ]
         out = filter_events(events, 100.0, 101.0, "victim", "172.31.76.116")
         assert len(out) == 2
@@ -150,17 +183,17 @@ class TestFilterEvents:
         assert filter_events([], 0, 100, "victim", "1.1.1.1") == []
 
     def test_grace_parameter_honored(self):
-        events = [self._ev(105.0, dest_ip="1.1.1.1")]
-        # default grace 3s -> outside
+        events = [self._ev(115.0, dest_ip="1.1.1.1")]
+        # default grace 10s -> 115 outside [100, 111]
         assert filter_events(events, 100, 101, "victim", "1.1.1.1") == []
         # expand grace -> inside
-        got = filter_events(events, 100, 101, "victim", "1.1.1.1", grace_seconds=10)
+        got = filter_events(events, 100, 101, "victim", "1.1.1.1", grace_seconds=20)
         assert len(got) == 1
 
     def test_default_grace_matches_constant(self):
-        # If someone changes DEFAULT_GRACE_SECONDS, the test that depends on
-        # the 3-second boundary should move with it. Fail loudly otherwise.
-        assert DEFAULT_GRACE_SECONDS == 3.0
+        # If someone changes DEFAULT_GRACE_SECONDS, the tests that depend
+        # on the boundary must move with it. Fail loudly otherwise.
+        assert DEFAULT_GRACE_SECONDS == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +259,7 @@ class TestAttributeAll:
         # window AND attack A's grace extension is attributed to B (the
         # attack that was actually running when the alert fired).
         # Scenario from run 20260424T205801Z: icmpdoor [312.14, 321.12]
-        # + grace=3 -> 324.12 covers 323.07. masscan [322, 325] strictly
+        # + default post-grace covers 323.07. masscan [322, 325] strictly
         # covers 323.07. Attribute to masscan (strict wins over grace).
         windows = [
             self._w("icmpdoor", 312.14, 321.12),
@@ -324,11 +357,11 @@ class TestAttributeAll:
 
     def test_event_in_grace_of_a_and_strict_of_b_goes_to_b(self):
         # Back-to-back attacks: a ends, b starts next, alert arrives during
-        # b's real window but within a's grace.
-        # a: [100, 110] + 3s grace = valid up to 113.
+        # b's real window but within a's post-end grace.
+        # a: [100, 110] + default post-grace covers up past b's start.
         # b: [112, 122] starts at 112.
-        # Event at 112.5 is in a's grace (112.5 <= 113) AND b's strict
-        # window (112 <= 112.5 <= 122). Strict beats grace -> b.
+        # Event at 112.5 is in a's post-grace AND b's strict window.
+        # Strict beats post-grace -> b.
         windows = [self._w("a", 100, 110), self._w("b", 112, 122)]
         events = [self._ev(112.5, dest_ip="172.31.76.116", sid=9000003)]
         out = attribute_all(events, windows)
@@ -340,13 +373,13 @@ class TestAttributeAll:
         assert out == {}
 
     def test_custom_grace_honored(self):
-        # Same 3-parameter shape as filter_events; grace extends end_ts.
+        # Same shape as filter_events; grace extends end_ts.
         windows = [self._w("a", 100, 110)]
-        events = [self._ev(115.0, dest_ip="172.31.76.116", sid=1)]
-        # Default grace 3s -> 115 outside [100, 113]
+        events = [self._ev(125.0, dest_ip="172.31.76.116", sid=1)]
+        # Default grace 10s -> 125 outside [100, 120]
         assert attribute_all(events, windows)["a"] == []
-        # Custom grace 10s -> inside [100, 120]
-        assert len(attribute_all(events, windows, grace_seconds=10)["a"]) == 1
+        # Custom grace 20s -> inside [100, 130]
+        assert len(attribute_all(events, windows, grace_seconds=20)["a"]) == 1
 
     def test_sni_target_works(self):
         windows = [self._w(
@@ -377,3 +410,330 @@ class TestAttributeAll:
         # Only one "a" key; we don't require specific contents for
         # pathological duplicate-name input, just don't crash.
         assert "a" in out
+
+    # Pre-start grace tier ---------------------------------------------------
+
+    def test_pre_start_grace_event_attributed(self):
+        # Clock-skew case: sensor stamps a packet at ts=99.5 even though
+        # the controller recorded probe_start_ts=100. With 2s pre-grace,
+        # the event still attributes to window 'a'.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=2260002)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+
+    def test_pre_start_grace_beyond_window_not_attributed(self):
+        # 5s before start is beyond the 2s pre-grace -- unattributed.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(95.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert out["a"] == []
+
+    def test_strict_beats_pre_start_grace(self):
+        # Event at ts=99.5 is in A's strict window [90, 100] AND within
+        # B's pre-grace (B.start=100, pre_grace=2 -> pre span 98..100).
+        # Strict (A) must win.
+        windows = [self._w("a", 90, 100), self._w("b", 100, 110)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=9000003)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_post_end_grace_beats_pre_start_grace(self):
+        # Event at ts=99.5 is in A's post-end grace (A=[90,98] + 10s grace
+        # covers 98..108) AND in B's pre-start grace (B=[100,110], pre=2
+        # -> 98..100). Policy: post-end beats pre-start (threshold-delay
+        # semantic is rock solid; pre-start is clock-skew heuristic).
+        windows = [self._w("a", 90, 98), self._w("b", 100, 110)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_two_pre_start_graces_earliest_start_wins(self):
+        # Two attacks both pre-grace-match one event. Prefer the earlier
+        # attack (closer to the event's actual moment): if event_ts=99.5,
+        # attack starting at 100 is closer than attack starting at 101.
+        # (Note: 101's pre_grace still catches 99.5 since 101-2=99<=99.5.)
+        windows = [self._w("a", 100, 110), self._w("b", 101, 111)]
+        events = [self._ev(99.5, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_zeek_service_detection_delay_scenario(self):
+        # Literal reproduction of run 20260424T215121Z:
+        # whois-tunnel probe_start=1777067485.05, probe_end=1777067486.20
+        # (1.15s attack). Zeek's ProtocolDetector::Protocol_Found fired
+        # 4.6s after probe_start (at 1777067489.66). Under the old 3s
+        # post-end grace, the notice was dropped. The 10s default grace
+        # now catches it.
+        windows = [AttackWindow(
+            name="art-whois-tunnel",
+            start_ts=1777067485.05,
+            end_ts=1777067486.20,
+            target_type="victim",
+            target_value="172.31.78.129",
+        )]
+        events = [self._ev(
+            1777067489.66, dest_ip="172.31.78.129",
+            note="ProtocolDetector::Protocol_Found",
+        )]
+        out = attribute_all(events, windows)
+        assert len(out["art-whois-tunnel"]) == 1
+        assert out["art-whois-tunnel"][0]["note"] == "ProtocolDetector::Protocol_Found"
+
+    def test_whois_tunnel_clock_skew_scenario(self):
+        # Literal reproduction of the live-lab case that triggered this fix.
+        # Agent-orange records probe_start=1777066627.05 on controller clock.
+        # Sensor stamps the SURICATA Applayer alert at 1777066626.55
+        # (sensor clock is ~0.9s behind controller). Without pre-grace, the
+        # alert was dropped and whois-tunnel was UNDETECTED despite the
+        # rule firing on every run.
+        # Use target_value="172.31.78.129" to match the real victim IP
+        # from the captured attack.
+        windows = [AttackWindow(
+            name="art-whois-tunnel",
+            start_ts=1777066627.05,
+            end_ts=1777066628.11,
+            target_type="victim",
+            target_value="172.31.78.129",
+        )]
+        events = [self._ev(
+            1777066626.55, dest_ip="172.31.78.129",
+            sid=2260002, signature="SURICATA Applayer Detect protocol only one direction",
+        )]
+        out = attribute_all(events, windows)
+        assert len(out["art-whois-tunnel"]) == 1
+        assert out["art-whois-tunnel"][0]["sid"] == 2260002
+
+    def test_custom_pre_start_grace_in_attribute_all(self):
+        # Caller can adjust pre-grace independently of post-grace.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(96.0, dest_ip="172.31.76.116", sid=1)]
+        # Default 2s pre-grace -> 96 is outside [98, 100)
+        assert attribute_all(events, windows)["a"] == []
+        # Widen to 5s -> inside [95, 100)
+        assert len(attribute_all(events, windows, pre_start_grace_seconds=5)["a"]) == 1
+
+    # Flow-aware attribution (by community_id / uid / flow_id) -------------
+
+    def test_flow_events_attribute_together_to_first_owner(self):
+        # Two events share a community_id. The earliest (ts=105, in a's
+        # strict window) anchors the flow. The later event (ts=125, inside
+        # b's strict window) would by time alone attribute to b -- but
+        # because it's the SAME flow as the earlier event, it goes to a.
+        # This is the whois-tunnel scenario: Zeek's late ProtocolDetector
+        # notice belongs to the flow that whois opened, even though the
+        # emission timestamp lands in icmpdoor's window.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="COMM1", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="COMM1", note="Protocol_Found"),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+        assert out["b"] == []
+
+    def test_flow_earliest_event_used_for_attribution_anchor(self):
+        # Events arrive out of order in the input list; attribute_all must
+        # still pick the EARLIEST event's ts as the flow anchor.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="C", note="n1"),  # late first
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="C", sid=1),      # early second
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+
+    def test_uid_used_as_flow_key_when_community_id_absent(self):
+        # Zeek events typically carry `uid` (always) and `community_id`
+        # (when policy/protocols/conn/community-id is loaded). uid is the
+        # reliable fallback.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", uid="CXXX", note="n1"),
+            self._ev(125.0, dest_ip="172.31.76.116", uid="CXXX", note="n2"),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+
+    def test_suricata_flow_id_used_as_flow_key(self):
+        # Suricata eve.json alerts carry `flow_id` (integer). If neither
+        # community_id nor uid present, flow_id is the fallback.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", flow_id=12345, sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", flow_id=12345, sid=2),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2
+
+    def test_events_with_different_flow_ids_attribute_independently(self):
+        # Two unrelated flows running at the same time -> each attributes
+        # to its own time-window owner.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="FLOW1", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="FLOW2", sid=2),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 1
+        assert len(out["b"]) == 1
+
+    def test_event_with_no_flow_id_falls_back_to_time_attribution(self):
+        # Backward compat: events without any flow identifier use the old
+        # 3-tier time-based attribution logic. Must not regress.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [self._ev(125.0, dest_ip="172.31.76.116", sid=1)]
+        out = attribute_all(events, windows)
+        assert len(out["b"]) == 1  # no flow_id -> pure time attribution
+
+    def test_flow_with_unmatchable_anchor_falls_back_per_event(self):
+        # If the flow's earliest event falls outside all windows (even
+        # with graces), we shouldn't drop the whole flow. Fall back to
+        # per-event time-based attribution as if there were no flow group.
+        windows = [self._w("a", 100, 110)]
+        events = [
+            self._ev(50.0, dest_ip="172.31.76.116", community_id="C", sid=1),  # orphan anchor
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="C", sid=2),  # in a's strict
+        ]
+        out = attribute_all(events, windows)
+        # Anchor at 50 unassignable; fall back per-event.
+        # 50 has no home; 105 lands in a.
+        assert len(out["a"]) == 1
+        assert out["a"][0]["sid"] == 2
+
+    def test_mixed_events_flow_and_singleton(self):
+        # Three events: two share a flow, one is standalone.
+        # Flow anchor at ts=105 -> a. Singleton at ts=125 -> b.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="FX", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="FX", note="n"),
+            self._ev(122.0, dest_ip="172.31.76.116", sid=9),  # no flow_id
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2   # flow FX
+        assert len(out["b"]) == 1   # singleton sid=9
+
+    def test_flow_key_precedence_community_id_wins_over_uid(self):
+        # When both are present, community_id is preferred because it's
+        # consistent between Suricata and Zeek (same 5-tuple hash). uid
+        # is Zeek-specific. Two events with the SAME community_id but
+        # DIFFERENT uids are still the same flow.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="C", uid="U1", sid=1),
+            self._ev(125.0, dest_ip="172.31.76.116", community_id="C", uid="U2", sid=2),
+        ]
+        out = attribute_all(events, windows)
+        assert len(out["a"]) == 2  # one flow via community_id
+
+
+class TestComputeFlowOwners:
+    """compute_flow_owners maps each unique flow key to the attack that
+    owns it, looking at events ACROSS streams. run.py calls this once
+    before running attribute_all per-stream; each stream then reuses
+    the shared owner map so a Suricata alert and a Zeek notice with
+    the same community_id land on the same attack.
+    """
+
+    def _ev(self, ts, **kw):
+        return {"ts": ts, "dest_ip": kw.pop("dest_ip", None),
+                "sni": kw.pop("sni", None), **kw}
+
+    def _w(self, name, start, end, ttype="victim", tval="172.31.76.116"):
+        return AttackWindow(
+            name=name, start_ts=start, end_ts=end,
+            target_type=ttype, target_value=tval,
+        )
+
+    def test_empty_events_returns_empty_map(self):
+        assert compute_flow_owners([], [self._w("a", 0, 10)]) == {}
+
+    def test_single_flow_single_owner(self):
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(105.0, dest_ip="172.31.76.116", community_id="FX", sid=1)]
+        assert compute_flow_owners(events, windows) == {"FX": "a"}
+
+    def test_cross_stream_same_community_id_one_flow(self):
+        # The whois scenario that motivated this fix: a Suricata alert
+        # and a Zeek notice share community_id. compute_flow_owners sees
+        # BOTH in its input and returns a single mapping.
+        windows = [self._w("whois", 100, 101), self._w("icmp", 102, 110)]
+        events = [
+            # Suricata alert during whois's window
+            self._ev(100.5, dest_ip="172.31.76.116", community_id="SAME", sid=2260002),
+            # Zeek notice for the same flow, late-emitted during icmp's window
+            self._ev(105.0, dest_ip="172.31.76.116", community_id="SAME", note="Protocol_Found"),
+        ]
+        owners = compute_flow_owners(events, windows)
+        assert owners == {"SAME": "whois"}
+
+    def test_events_without_flow_key_ignored(self):
+        windows = [self._w("a", 100, 110)]
+        events = [
+            self._ev(105.0, dest_ip="172.31.76.116", sid=1),           # no flow key
+            self._ev(106.0, dest_ip="172.31.76.116", community_id="X", sid=2),
+        ]
+        assert compute_flow_owners(events, windows) == {"X": "a"}
+
+    def test_flow_anchor_outside_any_window_omitted(self):
+        # A flow whose earliest event is outside all windows isn't
+        # included in the map (the attribute_all fallback will deal
+        # with its events individually).
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(50.0, dest_ip="172.31.76.116", community_id="ORPHAN", sid=1)]
+        assert compute_flow_owners(events, windows) == {}
+
+
+class TestAttributeAllWithFlowOwners:
+    """attribute_all accepts an optional pre-computed flow_owners map.
+    When provided, it overrides the local flow-grouping decision for
+    events whose flow_key is in the map. Events without a flow_key
+    (or with an unmapped one) still fall back to the 3-tier time rule.
+    """
+
+    def _ev(self, ts, dest_ip=None, **kw):
+        return {"ts": ts, "dest_ip": dest_ip, "sni": None, **kw}
+
+    def _w(self, name, start, end):
+        return AttackWindow(
+            name=name, start_ts=start, end_ts=end,
+            target_type="victim", target_value="172.31.76.116",
+        )
+
+    def test_flow_owners_override_time_attribution(self):
+        # Without flow_owners, the event at ts=125 in b's window would
+        # go to b. With flow_owners mapping its community_id to "a",
+        # it lands on a instead.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [self._ev(125.0, dest_ip="172.31.76.116",
+                           community_id="FX", note="late")]
+        owners = {"FX": "a"}
+        out = attribute_all(events, windows, flow_owners=owners)
+        assert len(out["a"]) == 1
+        assert out["b"] == []
+
+    def test_flow_key_not_in_owners_falls_back_to_time(self):
+        # Event has a flow_key but it's not in the map (e.g., this is
+        # the only event with that key and its anchor couldn't
+        # attribute). Use per-event time attribution.
+        windows = [self._w("a", 100, 110), self._w("b", 120, 130)]
+        events = [self._ev(125.0, dest_ip="172.31.76.116",
+                           community_id="UNKNOWN", sid=1)]
+        out = attribute_all(events, windows, flow_owners={"OTHER": "a"})
+        assert out["a"] == []
+        assert len(out["b"]) == 1
+
+    def test_empty_flow_owners_same_as_no_flow_owners(self):
+        # Regression: passing {} should behave identically to passing None.
+        windows = [self._w("a", 100, 110)]
+        events = [self._ev(105.0, dest_ip="172.31.76.116",
+                           community_id="X", sid=1)]
+        out_none = attribute_all(events, windows)
+        out_empty = attribute_all(events, windows, flow_owners={})
+        # Both should attribute the event to 'a' via internal flow grouping.
+        assert len(out_none["a"]) == 1
+        assert len(out_empty["a"]) == 1

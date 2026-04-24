@@ -206,6 +206,12 @@ def _normalize_suricata_alert(raw: dict) -> dict | None:
         "src_ip": raw.get("src_ip"),
         "dest_port": raw.get("dest_port"),
         "proto": raw.get("proto"),
+        # Flow identifiers for flow-aware attribution. community_id is
+        # the cross-tool (Zeek <-> Suricata) flow key when both agents
+        # have community-id loaded; flow_id is Suricata-internal. Either
+        # works as a fallback when community_id is absent.
+        "community_id": raw.get("community_id"),
+        "flow_id": raw.get("flow_id"),
     }
 
 
@@ -221,6 +227,12 @@ def _normalize_zeek_notice(raw: dict) -> dict | None:
         "msg": raw.get("msg"),
         "src": raw.get("id.orig_h") or raw.get("src"),
         "suppress_for": raw.get("suppress_for"),
+        # Flow identifiers for flow-aware attribution. Zeek notices
+        # carry both uid (always) and community_id (when policy/
+        # protocols/conn/community-id is loaded). See attribution.py's
+        # _flow_key for how these are used.
+        "uid": raw.get("uid"),
+        "community_id": raw.get("community_id"),
     }
 
 

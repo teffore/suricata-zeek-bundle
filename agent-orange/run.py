@@ -33,13 +33,16 @@ import json
 import os
 import subprocess
 import sys
+import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from agent_orange_pkg import __version__ as AO_VERSION
-from agent_orange_pkg.attribution import AttackWindow, attribute_all
+from agent_orange_pkg.attribution import (
+    DEFAULT_GRACE_SECONDS, AttackWindow, attribute_all, compute_flow_owners,
+)
 from agent_orange_pkg.catalog import Attack, load_attacks_yaml
 from agent_orange_pkg.harvest import (
     SensorHarvest, capture_baseline, harvest,
@@ -202,17 +205,35 @@ def build_ledger(
     ]
 
     # Exclusive attribution across the whole run: each event is assigned
-    # to at most one attack via attribute_all's two-tier priority
-    # (strict [start, end] match beats grace [end, end+grace] match;
-    # latest start_ts / latest end_ts tiebreak). Prevents the
-    # "same SID attributed to 8 attacks" bleed when many attacks all
-    # target the same victim IP.
-    alerts_by_attack = attribute_all(harvest_result.suricata_alerts, windows)
-    notices_by_attack = attribute_all(harvest_result.zeek_notices, windows)
+    # to at most one attack via attribute_all's 3-tier priority.
+    #
+    # First pre-compute a flow_owners map across ALL streams so a flow
+    # that produces both a Suricata alert AND a Zeek notice (sharing
+    # community_id) attributes to the same attack. Without this, each
+    # attribute_all call only sees its own stream's events and can
+    # split a single flow's evidence across multiple attacks -- the
+    # whois-tunnel vs icmpdoor-c2 bug surfaced in run 20260424T221848Z.
+    all_events_for_flow_grouping = (
+        list(harvest_result.suricata_alerts)
+        + list(harvest_result.zeek_notices)
+        + list(harvest_result.zeek_intel)
+    )
+    for events in protocol_logs_by_name.values():
+        all_events_for_flow_grouping.extend(events)
+    flow_owners = compute_flow_owners(all_events_for_flow_grouping, windows)
+
+    alerts_by_attack = attribute_all(
+        harvest_result.suricata_alerts, windows, flow_owners=flow_owners,
+    )
+    notices_by_attack = attribute_all(
+        harvest_result.zeek_notices, windows, flow_owners=flow_owners,
+    )
     # Intel hits are Zeek-side detection signals equivalent to notices.
-    intel_by_attack = attribute_all(harvest_result.zeek_intel, windows)
+    intel_by_attack = attribute_all(
+        harvest_result.zeek_intel, windows, flow_owners=flow_owners,
+    )
     observed_by_log = {
-        logname: attribute_all(events, windows)
+        logname: attribute_all(events, windows, flow_owners=flow_owners)
         for logname, events in protocol_logs_by_name.items()
     }
 
@@ -486,6 +507,25 @@ def main(argv: list[str] | None = None) -> int:
             f"{one.status} ({duration}s)"
         )
         runs.append(one)
+
+    # Wait for late-arriving sensor events to reach disk before harvest.
+    # Zeek's service-detection (ProtocolDetector::Protocol_Found etc.)
+    # can emit notices ~4-5s after a connection closes. Harvesting too
+    # soon misses those notices entirely -- they simply aren't in
+    # notice.log yet. We wait until (last probe_end + attribution
+    # grace + 1s disk-flush buffer) so every event attribute_all might
+    # accept has had time to land on the sensor's on-disk logs.
+    # No-op when runs is empty (e.g., zero attacks matched --only filter).
+    if runs:
+        last_probe_end = max(r.probe_end_ts for r in runs)
+        wait_until_ts = last_probe_end + DEFAULT_GRACE_SECONDS + 1.0
+        delay = wait_until_ts - datetime.now(timezone.utc).timestamp()
+        if delay > 0:
+            print(
+                f"[agent-orange] waiting {delay:.1f}s for sensor to flush "
+                "late events..."
+            )
+            time.sleep(delay)
 
     print("[agent-orange] harvesting sensor logs...")
     harvest_result = harvest(sensor_ssh, baseline, run_start_ts=started_at)
