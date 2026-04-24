@@ -25,6 +25,54 @@ RUN_STATUS_FAILED = "FAILED"
 
 
 # ---------------------------------------------------------------------------
+#  Failure-marker detection
+# ---------------------------------------------------------------------------
+
+# Many attack commands end with `|| true` to swallow EXPECTED non-zero
+# exits (e.g. scp with BatchMode=yes that fails auth on purpose). This is
+# a feature -- those commands still produce real network traffic before
+# exiting, which IS the thing the sensor should have observed. But the
+# pattern also masks SILENT failures: gobuster/ffuf exit 0 after emitting
+# "no such file or directory" for a missing wordlist, producing zero
+# traffic; dnscat exits 0 after a CLI-validation error. Those cases need
+# a secondary signal beyond exit code.
+#
+# FAILURE_MARKERS are substrings that mean "the attack's intended
+# network behavior did NOT happen," regardless of exit code. Kept
+# intentionally narrow -- one false positive here is a real verdict
+# corruption, so each marker should be either shell/syscall-level or
+# tool-specific and unambiguous.
+FAILURE_MARKERS: tuple[str, ...] = (
+    "No such file or directory",              # shell / python / rsync
+    "no such file or directory",              # gobuster (lowercase variant)
+    "Could not resolve host",                 # curl, wget
+    "Name or service not known",              # ssh, getaddrinfo
+    "Temporary failure in name resolution",   # getaddrinfo transient
+    "command not found",                      # bash lookup miss
+    "Encountered error(s)",                   # ffuf
+    "That's not allowed!",                    # dnscat2 CLI validation
+)
+
+
+def detect_failure_marker(stdout: str, stderr: str) -> str | None:
+    """Scan stdout + stderr for a known silent-failure substring.
+
+    Returns the first FAILURE_MARKERS element found, or None if none
+    are present. Scan order matches FAILURE_MARKERS (earlier entries
+    win when multiple markers appear — deterministic output).
+
+    Case-sensitive: each marker is listed explicitly (both "No such..."
+    and "no such..." variants) so case differences don't get treated as
+    separate issues.
+    """
+    combined = f"{stdout}\n{stderr}"
+    for marker in FAILURE_MARKERS:
+        if marker in combined:
+            return marker
+    return None
+
+
+# ---------------------------------------------------------------------------
 #  Types
 # ---------------------------------------------------------------------------
 
@@ -139,8 +187,16 @@ def run_attack(
         status = RUN_STATUS_FAILED
         error = f"non-zero exit: {result.exit_code}"
     else:
-        status = RUN_STATUS_RAN
-        error = ""
+        # Exit 0 by itself isn't proof of success -- `|| true` / `| head`
+        # / `2>&1 | tail` patterns swallow inner errors. Scan output for
+        # known silent-failure markers before classifying RAN.
+        marker = detect_failure_marker(result.stdout, result.stderr)
+        if marker is not None:
+            status = RUN_STATUS_FAILED
+            error = f"failure marker in output: {marker!r}"
+        else:
+            status = RUN_STATUS_RAN
+            error = ""
 
     return AttackRun(
         attack_name=attack.name,

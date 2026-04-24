@@ -12,7 +12,9 @@ import pytest
 from agent_orange_pkg.catalog import Attack, Target
 from agent_orange_pkg.runner import (
     AttackResult, AttackRun,
+    FAILURE_MARKERS,
     RUN_STATUS_FAILED, RUN_STATUS_RAN,
+    detect_failure_marker,
     resolve_attack,
     run_attack, run_attacks,
     substitute_command, substitute_target,
@@ -170,6 +172,146 @@ class TestRunAttack:
 
         run_attack(_attack(timeout=42), "10.0.0.5", fake)
         assert captured["timeout"] == 42
+
+
+# ---------------------------------------------------------------------------
+#  Failure-marker detection (Fix 1: silent-failure classification)
+# ---------------------------------------------------------------------------
+
+class TestDetectFailureMarker:
+    """A command can exit 0 (because of `|| true` in the shell wrapper)
+    yet still have silently failed — e.g., gobuster exits 0 after emitting
+    'no such file or directory' for a missing wordlist, producing no real
+    network traffic. detect_failure_marker scans stdout+stderr for known
+    shell-level failure strings so the runner can override RAN to FAILED.
+    """
+
+    def test_no_markers_returns_none(self):
+        assert detect_failure_marker("ok", "") is None
+
+    def test_empty_inputs_returns_none(self):
+        assert detect_failure_marker("", "") is None
+
+    def test_no_such_file_in_stdout_detected(self):
+        out = 'stat /usr/share/wordlists/dirb/common.txt: no such file or directory'
+        assert detect_failure_marker(out, "") == "no such file or directory"
+
+    def test_no_such_file_capitalized_detected(self):
+        # Some tools print with capital N.
+        out = 'ffuf: No such file or directory'
+        assert detect_failure_marker(out, "") == "No such file or directory"
+
+    def test_could_not_resolve_host_detected(self):
+        out = 'curl: (6) Could not resolve host: devtunnels.ms'
+        assert detect_failure_marker(out, "") == "Could not resolve host"
+
+    def test_command_not_found_detected(self):
+        err = 'bash: dnscat: command not found'
+        assert detect_failure_marker("", err) == "command not found"
+
+    def test_dnscat_not_allowed_detected(self):
+        # dnscat2 exits 0 after printing this CLI-validation error.
+        out = "It looks like you used --dns and also passed a domain on the commandline.\nThat's not allowed!"
+        assert detect_failure_marker(out, "") == "That's not allowed!"
+
+    def test_ffuf_encountered_errors_detected(self):
+        out = 'Encountered error(s): 1 errors occurred.'
+        assert detect_failure_marker(out, "") == "Encountered error(s)"
+
+    def test_name_or_service_not_known_detected(self):
+        err = 'ssh: Could not resolve hostname foo: Name or service not known'
+        # First match wins -- "Could not resolve" appears earlier in the tuple.
+        assert detect_failure_marker("", err) in FAILURE_MARKERS
+
+    def test_marker_in_stderr_detected(self):
+        assert detect_failure_marker("", "no such file or directory") is not None
+
+    def test_marker_with_surrounding_context_detected(self):
+        out = 'prefix noise\n' + 'middle: no such file or directory' + '\nsuffix'
+        assert detect_failure_marker(out, "") == "no such file or directory"
+
+
+class TestRunAttackFailureMarkers:
+    """run_attack must downgrade exit-code-0 results to FAILED when the
+    output contains a known failure marker. Preserves exit_code for ops
+    visibility."""
+
+    def test_exit_zero_with_wordlist_missing_marks_failed(self):
+        def fake(cmd, timeout):
+            return AttackResult(
+                stdout='stat /usr/share/wordlists/dirb/common.txt: no such file or directory\n',
+                stderr="", exit_code=0,
+            )
+        run = run_attack(_attack(), "10.0.0.5", fake)
+        assert run.status == RUN_STATUS_FAILED
+        assert "failure marker" in run.error
+        assert "no such file or directory" in run.error
+        # exit_code is preserved (0) so operators can see shell swallowed it
+        assert run.exit_code == 0
+
+    def test_exit_zero_with_dns_failure_marks_failed(self):
+        def fake(cmd, timeout):
+            return AttackResult(
+                stdout='curl: (6) Could not resolve host: foo.example\n',
+                stderr="", exit_code=0,
+            )
+        run = run_attack(_attack(), "10.0.0.5", fake)
+        assert run.status == RUN_STATUS_FAILED
+        assert "Could not resolve host" in run.error
+
+    def test_exit_zero_with_dnscat_cli_error_marks_failed(self):
+        def fake(cmd, timeout):
+            return AttackResult(
+                stdout="That's not allowed!\n",
+                stderr="", exit_code=0,
+            )
+        run = run_attack(_attack(), "10.0.0.5", fake)
+        assert run.status == RUN_STATUS_FAILED
+        assert "That's not allowed!" in run.error
+
+    def test_clean_output_still_ran(self):
+        # Regression guard: clean output with exit=0 still classifies RAN.
+        def fake(cmd, timeout):
+            return AttackResult(stdout='whatever cleanup complete', stderr="", exit_code=0)
+        run = run_attack(_attack(), "10.0.0.5", fake)
+        assert run.status == RUN_STATUS_RAN
+        assert run.error == ""
+
+    def test_marker_in_stderr_marks_failed(self):
+        # stderr is scanned too, not just stdout.
+        def fake(cmd, timeout):
+            return AttackResult(
+                stdout="", stderr='tool: command not found\n', exit_code=0,
+            )
+        run = run_attack(_attack(), "10.0.0.5", fake)
+        assert run.status == RUN_STATUS_FAILED
+        assert "command not found" in run.error
+
+    def test_ssh_error_takes_precedence_over_marker(self):
+        # If SSH itself failed, that's the primary error, not the marker.
+        def fake(cmd, timeout):
+            return AttackResult(
+                stdout='no such file or directory',
+                stderr="ssh: connect timeout",
+                exit_code=255, ssh_error="connect timeout",
+            )
+        run = run_attack(_attack(), "10.0.0.5", fake)
+        assert run.status == RUN_STATUS_FAILED
+        # ssh_error wins the error message; don't clobber with marker text.
+        assert "ssh transport error" in run.error
+        assert "no such file" not in run.error
+
+    def test_nonzero_exit_takes_precedence_over_marker(self):
+        # Non-zero exit is a stronger signal and should be reported verbatim.
+        def fake(cmd, timeout):
+            return AttackResult(
+                stdout='no such file or directory', stderr="", exit_code=127,
+            )
+        run = run_attack(_attack(), "10.0.0.5", fake)
+        assert run.status == RUN_STATUS_FAILED
+        assert "non-zero exit: 127" in run.error
+        # Don't also stamp the marker -- keeps error messages clean.
+        assert "failure marker" not in run.error
 
 
 # ---------------------------------------------------------------------------
