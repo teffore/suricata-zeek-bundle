@@ -2,9 +2,8 @@
 
 Agent Orange refuses to run an attack whose entry is missing a required
 field. Better to fail at startup with a clear message than to run with a
-silently-broken entry (happens all the time with purple-agent's looser
-schema). Pure functions only; no filesystem or network side effects
-beyond the single read of the yaml path passed in.
+silently-broken entry. Pure functions only; no filesystem or network
+side effects beyond the single read of the yaml path passed in.
 """
 
 from __future__ import annotations

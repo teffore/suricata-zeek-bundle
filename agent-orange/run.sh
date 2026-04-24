@@ -1,11 +1,10 @@
 #!/bin/bash
 # run.sh -- Agent Orange runner.
 #
-# Auto-sources purple-agent/.lab-state (the lab-up.sh state file) when
+# Auto-sources .lab-state from repo root (the lab-up.sh state file) when
 # CLI args aren't provided. Explicit --attacker-ip / --sensor-ip /
 # --victim-ip / --key always win. Prefers VICTIM_PRIVATE (VPC) over
-# VICTIM_IP (public) on the fallback path -- same fix that landed in
-# purple-agent/benchmarks/speedtest.sh, applied here.
+# VICTIM_IP (public) on the fallback path.
 #
 # Usage:
 #   ./agent-orange/run.sh
@@ -60,10 +59,9 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------- auto-fill from .lab-state ----------
-# See purple-agent/benchmarks/speedtest.sh for the rationale of the CLI-
-# first pattern. Preserves explicit CLI args across `source`, preferring
-# VICTIM_PRIVATE on fallback because purple_agent / run.py both require
-# the VPC private IP -- public IPs are SG-blocked.
+# CLI-first pattern: preserves explicit CLI args across `source`, preferring
+# VICTIM_PRIVATE on fallback because run.py requires the VPC private IP --
+# public IPs are SG-blocked.
 if [ -z "$ATTACKER_IP" ] || [ -z "$SENSOR_IP" ] || [ -z "$VICTIM_IP" ] || [ -z "$KEY" ]; then
   if [ -f "$STATE_FILE" ]; then
     _cli_attacker="$ATTACKER_IP"

@@ -1,8 +1,6 @@
 # attacks.yaml -- Agent Orange atomic red team catalog.
 #
-# Sibling to purple-agent/probes.yaml but intentionally divorced. This file
-# contains ONLY atomic-red-team attacks, with a stricter schema than the
-# purple-agent pool:
+# This file contains ONLY atomic-red-team attacks, with a strict schema:
 #
 #   name                  -- unique identifier (required, snake-case w/ art- prefix)
 #   mitre                 -- primary MITRE ATT&CK technique (required)
@@ -27,10 +25,6 @@
 #   command               -- bash to run on the ATTACKER (Kali). {{VICTIM_IP}}
 #                            is substituted at run time with the lab's private
 #                            VPC address of the victim.
-#
-# The set here is the initial port of the 23 ART-tagged entries from
-# purple-agent/probes.yaml as they existed at fork time. Drift is
-# deliberate -- Agent Orange curates independently from here on.
 
 attacks:
 

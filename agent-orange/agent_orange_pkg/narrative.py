@@ -19,8 +19,7 @@ renderer can show "narrative unavailable" and keep the raw ledger
 usable. Pipeline never depends on LLM success.
 
 Uses claude-agent-sdk so the call goes through the user's Claude Code
-subscription (same auth path purple-agent uses). No separate Anthropic
-API key required.
+subscription. No separate Anthropic API key required.
 
 The actual LLM invocation is abstracted behind a callable so tests can
 inject canned responses without spawning a subprocess.

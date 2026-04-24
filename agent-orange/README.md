@@ -1,8 +1,6 @@
 # Agent Orange
 
-Deterministic runner for atomic red team attacks against the shared
-Suricata+Zeek lab. Sibling to `purple-agent/`, not a replacement — both
-coexist and can be compared side by side.
+Deterministic runner for atomic red team attacks against the Suricata+Zeek lab.
 
 ## Philosophy
 
@@ -29,7 +27,7 @@ subscription auth -- no separate Anthropic API key needed.
 ## Running
 
 ```bash
-# Auto-sources purple-agent/.lab-state (if lab-up.sh has run). Prefers
+# Auto-sources .lab-state from repo root (if lab-up.sh has run). Prefers
 # VICTIM_PRIVATE (VPC) over the public VICTIM_IP automatically.
 ./agent-orange/run.sh
 
@@ -50,10 +48,10 @@ subscription auth -- no separate Anthropic API key needed.
 ```
 
 The narrative step uses `claude-agent-sdk`, which authenticates via
-your Claude Code subscription (same path purple-agent uses). If the
-`claude` CLI works on your machine, the narrative step will too. Use
-`--no-llm` to skip it entirely; the ledger + report still render,
-just without the LLM-generated prose sections.
+your Claude Code subscription. If the `claude` CLI works on your
+machine, the narrative step will too. Use `--no-llm` to skip it
+entirely; the ledger + report still render, just without the
+LLM-generated prose sections.
 
 ## What it produces
 
@@ -63,7 +61,7 @@ Every run emits three artifacts under
 | File | Purpose |
 |---|---|
 | `ledger.json` | Structured source of truth. Every verdict, every attributed alert/notice, ruleset snapshot + drift, LLM narrative. Machine-readable. |
-| `report.html` | Self-contained HTML (no external assets). Auto-opens in the default browser unless `--no-open` or `PURPLE_AGENT_NO_OPEN=1`. |
+| `report.html` | Self-contained HTML (no external assets). Auto-opens in the default browser unless `--no-open` or `AGENT_ORANGE_NO_OPEN=1`. |
 | `report.md` | Terminal / git / wiki-friendly rendering of the same content. |
 
 Plus `runs/index.json` — an ordered list of every run's summary,
@@ -113,13 +111,6 @@ behavior can't cause false UNDETECTED results.
 `software.log`, auth failure in `ftp.log`, SNI in `ssl.log`) is
 captured and reported alongside the verdict, but never inflates the
 detection count.
-
-## Comparing with purple-agent
-
-Run both agents against the same lab with the same probe / attack set
-and compare the resulting verdicts. Where they agree, trust grows.
-Where they disagree, investigate — often Agent Orange is right because
-its attribution window is wider and doesn't race Zeek's flush cycle.
 
 ## Tests
 

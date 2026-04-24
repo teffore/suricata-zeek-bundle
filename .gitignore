@@ -24,13 +24,6 @@ update-iam-role.ps1
 .lab-key.pub
 .install-logs/
 
-# Benchmark run outputs — timestamped per run, noisy in git. The .gitkeep
-# keeps the directory tracked; baseline.json is explicitly committed when
-# a new baseline is captured.
-purple-agent/benchmarks/results/*.json
-purple-agent/benchmarks/results/*.log
-!purple-agent/benchmarks/baseline.json
-
 # Agent Orange per-run output directories — noisy in git. Each run is
 # self-contained under agent-orange/runs/<ts>/. A baseline run can be
 # committed by name (e.g., agent-orange/runs/baseline-YYYYMMDD/).

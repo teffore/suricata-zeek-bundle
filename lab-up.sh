@@ -1,7 +1,7 @@
 #!/bin/bash
 # lab-up.sh — provision the Suricata+Zeek 3-box lab (attacker / victim /
 # sensor) with traffic mirror, install the full stack, and print the
-# purple_agent.py invocation to run against it. Mirrors CI workflow
+# agent-orange invocation to run against it. Mirrors CI workflow
 # .github/workflows/validate-detections.yml but kept running indefinitely
 # until lab-down.sh is invoked.
 #
@@ -313,10 +313,9 @@ Recipes:
   # Coverage gate (same as CI)
   ssh -i $KEY_FILE ubuntu@$SENSOR_IP "sudo bash /tmp/verify_alerts.sh"
 
-*** Purple-team agent invocation ***
-  uv run --with claude-agent-sdk --with PyYAML python purple_agent.py \\
-    --attacker-ip $ATTACKER_IP --sensor-ip $SENSOR_IP \\
-    --victim-ip $VICTIM_PRIVATE --key $KEY_FILE --budget 30
+*** Agent Orange invocation ***
+  ./agent-orange/run.sh
+  (auto-sources .lab-state from repo root; no args needed)
 
 Tear down when done:
   ./lab-down.sh

@@ -521,7 +521,7 @@ cat >> /opt/zeek/share/zeek/site/local.zeek <<'EOF'
 @load policy/frameworks/files/hash-all-files
 
 # SSH brute-force threshold — 5 trips on ordinary DevOps automation.
-# Default is 30; tightened to 5 so short hydra bursts in purple-agent
+# Default is 30; tightened to 5 so short hydra bursts in agent-orange
 # runs still produce SSH::Password_Guessing notices.
 redef SSH::password_guesses_limit = 5;
 # SumStats bucket window. Default 30 mins means a burst that completes
@@ -739,7 +739,7 @@ exit 0
 alert tcp any any -> $HOME_NET 22 (msg:"TEST - SSH connection to HOME_NET"; sid:9000002; rev:2;)
 # 9000003 suppression window shortened 60s -> 10s (rev:3) because chained
 # scan probes from the same attacker IP (gobuster -> masscan within 60s, as
-# the purple-agent runs them) were getting silently suppressed: only the
+# agent-orange runs them) were getting silently suppressed: only the
 # first tool's alert fired, subsequent scans within 60s fell inside the
 # `type both` suppression window. 10s is long enough to dedupe a single
 # scan burst's rapid-fire SYNs but short enough that the next distinct scan
