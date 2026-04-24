@@ -187,7 +187,8 @@ def build_ledger(
     # Build one AttackWindow per RAN attack. FAILED attacks are excluded
     # from attribution: they produced no traffic, so any events landing
     # in their original time slot belong to a temporally-adjacent RAN
-    # attack (attribute_all's first-match sort will assign them there).
+    # attack (attribute_all's strict-beats-grace priority will route
+    # them to whichever neighbor's real window contains the event).
     windows = [
         AttackWindow(
             name=attack.name,
@@ -201,8 +202,10 @@ def build_ledger(
     ]
 
     # Exclusive attribution across the whole run: each event is assigned
-    # to at most one attack (first-match by start_ts + target). Prevents
-    # the "same SID attributed to 8 attacks" bleed when many attacks all
+    # to at most one attack via attribute_all's two-tier priority
+    # (strict [start, end] match beats grace [end, end+grace] match;
+    # latest start_ts / latest end_ts tiebreak). Prevents the
+    # "same SID attributed to 8 attacks" bleed when many attacks all
     # target the same victim IP.
     alerts_by_attack = attribute_all(harvest_result.suricata_alerts, windows)
     notices_by_attack = attribute_all(harvest_result.zeek_notices, windows)

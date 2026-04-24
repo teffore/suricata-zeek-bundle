@@ -211,9 +211,11 @@ def attribute_all(
             and matches_target(dest_ip, sni, w.target_type, w.target_value)
         ]
         if strict:
-            # Latest start_ts wins. Stable across input reordering because
-            # we're selecting by a property of the window, not position.
-            chosen = max(strict, key=lambda w: w.start_ts)
+            # Latest start_ts wins; (name) tiebreak makes result independent
+            # of input iteration order even when two windows happen to share
+            # start_ts (shouldn't happen with sequential runs, but we don't
+            # require the caller to guarantee uniqueness).
+            chosen = max(strict, key=lambda w: (w.start_ts, w.name))
             result[chosen.name].append(event)
             continue
 
@@ -224,7 +226,7 @@ def attribute_all(
             and matches_target(dest_ip, sni, w.target_type, w.target_value)
         ]
         if grace:
-            chosen = max(grace, key=lambda w: w.end_ts)
+            chosen = max(grace, key=lambda w: (w.end_ts, w.name))
             result[chosen.name].append(event)
 
     return result
