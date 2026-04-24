@@ -25,6 +25,7 @@ matches_target to classify it as attributable. Missing both => no match.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 # Default grace window (seconds) appended to the attack's end timestamp.
@@ -32,6 +33,21 @@ from typing import Any, Iterable
 # between the attack command returning and the first packet landing on
 # the sensor.
 DEFAULT_GRACE_SECONDS = 3.0
+
+
+@dataclass(frozen=True)
+class AttackWindow:
+    """Attribution parameters for one attack, bundled for attribute_all.
+
+    Instances are frozen + hashable so callers can build them once from
+    the ledger's AttackRun entries and pass them into attribute_all
+    repeatedly (per log stream) without re-deriving the fields.
+    """
+    name: str
+    start_ts: float
+    end_ts: float
+    target_type: str
+    target_value: str
 
 
 def in_time_window(
@@ -131,3 +147,86 @@ def filter_events(
             continue
         out.append(event)
     return out
+
+
+def attribute_all(
+    events: Iterable[dict[str, Any]],
+    attack_windows: Iterable[AttackWindow],
+    grace_seconds: float = DEFAULT_GRACE_SECONDS,
+) -> dict[str, list[dict[str, Any]]]:
+    """Exclusive attribution -- each event to AT MOST ONE attack.
+
+    The run-level entry point. filter_events is still available for
+    per-attack single-pass filtering (used by narrative-only code paths
+    and tests) but for pipelining the whole ledger, callers should use
+    this instead to avoid the same-event-in-N-windows bleed problem:
+    when 20 of 23 attacks all target VICTIM_IP, the dest-match
+    disambiguator is useless and back-to-back attacks double-count
+    every alert whose timestamp straddles two windows.
+
+    Priority rule (two-tier, discovered empirically in validation run
+    20260424T205801Z):
+
+    1. STRICT match preferred. If the event's timestamp falls within
+       ANY attack's real [start_ts, end_ts] window (no grace) and the
+       target matches, attribute there. If multiple attacks strict-match
+       (overlapping windows, shouldn't happen with sequential runs but
+       defensive), pick the LATEST start_ts -- most recent activity.
+
+    2. GRACE match fallback. Only when no attack strict-matches:
+       consider attacks where the event falls within [start_ts,
+       end_ts + grace]. The grace window accounts for Suricata emitting
+       alerts slightly after the triggering packet (threshold bucketing,
+       flow aging). If multiple graces match, pick the LATEST end_ts
+       -- the most recently finished attack is most likely the cause.
+
+    Why "latest" not "first"? A late-arriving alert caused by a recent
+    attack would be wrongly credited to an earlier attack whose grace
+    happens to still overlap. Run 20260424T205801Z: icmpdoor [312-321]
+    grace -> 324 covered an alert at 323.07 that actually came from
+    masscan [322-325] strict window. First-match gave it to icmpdoor
+    (wrong -- icmpdoor is ICMP, can't trip a SYN-scan rule); strict-
+    beats-grace gives it to masscan (right).
+
+    Returns a dict keyed by window.name, with every supplied window
+    appearing in the result (empty list if no events attributed).
+    Events matching no window are silently dropped. Windows with
+    duplicate names are tolerated but collapse to one dict entry.
+    """
+    windows_list = list(attack_windows)
+    result: dict[str, list[dict[str, Any]]] = {w.name: [] for w in windows_list}
+
+    for event in events:
+        ts = event.get("ts")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            continue
+        ts_f = float(ts)
+        dest_ip = event.get("dest_ip")
+        sni = event.get("sni")
+
+        # Tier 1: strict (no-grace) matches.
+        strict = [
+            w for w in windows_list
+            if w.start_ts <= ts_f <= w.end_ts
+            and matches_target(dest_ip, sni, w.target_type, w.target_value)
+        ]
+        if strict:
+            # Latest start_ts wins; (name) tiebreak makes result independent
+            # of input iteration order even when two windows happen to share
+            # start_ts (shouldn't happen with sequential runs, but we don't
+            # require the caller to guarantee uniqueness).
+            chosen = max(strict, key=lambda w: (w.start_ts, w.name))
+            result[chosen.name].append(event)
+            continue
+
+        # Tier 2: grace fallback.
+        grace = [
+            w for w in windows_list
+            if w.start_ts <= ts_f <= w.end_ts + grace_seconds
+            and matches_target(dest_ip, sni, w.target_type, w.target_value)
+        ]
+        if grace:
+            chosen = max(grace, key=lambda w: (w.end_ts, w.name))
+            result[chosen.name].append(event)
+
+    return result

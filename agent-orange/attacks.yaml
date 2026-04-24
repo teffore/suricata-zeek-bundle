@@ -25,6 +25,34 @@
 #   command               -- bash to run on the ATTACKER (Kali). {{VICTIM_IP}}
 #                            is substituted at run time with the lab's private
 #                            VPC address of the victim.
+#
+# ============================================================================
+# Authoring state of `expected_sids` (as of 2026-04-24):
+#
+# Most entries currently have `expected_sids: []` — this is a known authoring
+# gap, not an accident. Empty means one of four things:
+#
+#   1. MIRROR GAP: attack runs attacker -> internet (not -> victim) and the
+#      VPC span port only captures victim-side traffic. The 6 SNI-cluster
+#      attacks (cloudflared, devtunnels, vscode-tunnel, rclone-s3, tor,
+#      remote-access-sni) are all in this bucket. Re-authoring won't help
+#      until the mirror captures attacker egress. expected_verdict: UNDETECTED.
+#   2. RULE NOT YET AUTHORED: the technique is detectable but no rule in the
+#      current stack targets it (custom rsync banner, whois-as-tunnel payload,
+#      icmpdoor sustained ICMP C2, reverse-shell heuristics). Ship a rule
+#      then upgrade this entry.
+#   3. RULE PRESENT BUT SILENT: an ET/custom rule that SHOULD match this
+#      technique is loaded but didn't fire. Needs investigation before
+#      upgrade (ET MALWARE HttpBrowser vs. malicious-ua-fanout, ET POLICY
+#      Slowloris vs. slowhttptest).
+#   4. ATTACKER-SIDE TOOL FAILURE: the attack's shell wrapper swallows the
+#      tool failure (`|| true` / `| head`). With runner.detect_failure_marker
+#      in place these now classify as FAILED rather than UNDETECTED.
+#
+# Populated entries (2 as of 2026-04-24): art-masscan-syn-burst,
+# art-snmp-community-brute, art-tor-bootstrap (tor's are authored but
+# currently blocked by the mirror-direction gap category 1).
+# ============================================================================
 
 attacks:
 
@@ -220,9 +248,13 @@ attacks:
     target:
       type: victim
       value: "{{VICTIM_IP}}"
-    expected_sids: []
+    # SID 9000003 is the TEST - TCP SYN scan rule shipped by standalone.sh
+    # (flags:S,12; threshold type:both by_src count:5 seconds:10). Masscan's
+    # 1000pps burst reliably trips it. Verified firing in runs 20260424T124131Z
+    # and 20260424T201700Z under ruleset hash(es) at that time.
+    expected_sids: [9000003]
     expected_zeek_notices: []
-    expected_verdict: UNDETECTED
+    expected_verdict: DETECTED_EXPECTED
     timeout: 30
     command: |
       timeout 20 sudo masscan {{VICTIM_IP}} -p 22,80,443,445,3389,8080,8081,8443 \
@@ -413,9 +445,13 @@ attacks:
     target:
       type: victim
       value: "{{VICTIM_IP}}"
-    expected_sids: []
+    # SID 2260000 = SURICATA Applayer Mismatch protocol both directions.
+    # SNMP-on-161-UDP with rapid community-string rotation presents as
+    # protocol anomaly vs. Suricata's SNMP parser expectations. Verified
+    # firing in runs 20260424T124131Z and 20260424T201700Z.
+    expected_sids: [2260000]
     expected_zeek_notices: []
-    expected_verdict: UNDETECTED
+    expected_verdict: DETECTED_EXPECTED
     timeout: 30
     command: |
       for c in public private admin cisco snmp community manager monitor default; do
