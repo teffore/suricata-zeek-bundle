@@ -33,13 +33,16 @@ import json
 import os
 import subprocess
 import sys
+import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from agent_orange_pkg import __version__ as AO_VERSION
-from agent_orange_pkg.attribution import AttackWindow, attribute_all
+from agent_orange_pkg.attribution import (
+    DEFAULT_GRACE_SECONDS, AttackWindow, attribute_all,
+)
 from agent_orange_pkg.catalog import Attack, load_attacks_yaml
 from agent_orange_pkg.harvest import (
     SensorHarvest, capture_baseline, harvest,
@@ -486,6 +489,25 @@ def main(argv: list[str] | None = None) -> int:
             f"{one.status} ({duration}s)"
         )
         runs.append(one)
+
+    # Wait for late-arriving sensor events to reach disk before harvest.
+    # Zeek's service-detection (ProtocolDetector::Protocol_Found etc.)
+    # can emit notices ~4-5s after a connection closes. Harvesting too
+    # soon misses those notices entirely -- they simply aren't in
+    # notice.log yet. We wait until (last probe_end + attribution
+    # grace + 1s disk-flush buffer) so every event attribute_all might
+    # accept has had time to land on the sensor's on-disk logs.
+    # No-op when runs is empty (e.g., zero attacks matched --only filter).
+    if runs:
+        last_probe_end = max(r.probe_end_ts for r in runs)
+        wait_until_ts = last_probe_end + DEFAULT_GRACE_SECONDS + 1.0
+        delay = wait_until_ts - datetime.now(timezone.utc).timestamp()
+        if delay > 0:
+            print(
+                f"[agent-orange] waiting {delay:.1f}s for sensor to flush "
+                "late events..."
+            )
+            time.sleep(delay)
 
     print("[agent-orange] harvesting sensor logs...")
     harvest_result = harvest(sensor_ssh, baseline, run_start_ts=started_at)
