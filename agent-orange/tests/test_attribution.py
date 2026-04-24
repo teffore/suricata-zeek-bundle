@@ -32,8 +32,8 @@ class TestInTimeWindow:
         assert not in_time_window(97.0, 100.0, 101.0)
 
     def test_after_window_plus_grace_rejected(self):
-        # 101 + 3 (default grace) = 104; 104.5 is outside
-        assert not in_time_window(104.5, 100.0, 101.0)
+        # 101 + 10 (default grace) = 111; 112 is outside
+        assert not in_time_window(112.0, 100.0, 101.0)
 
     def test_within_grace_accepted(self):
         assert in_time_window(103.0, 100.0, 101.0)
@@ -182,17 +182,17 @@ class TestFilterEvents:
         assert filter_events([], 0, 100, "victim", "1.1.1.1") == []
 
     def test_grace_parameter_honored(self):
-        events = [self._ev(105.0, dest_ip="1.1.1.1")]
-        # default grace 3s -> outside
+        events = [self._ev(115.0, dest_ip="1.1.1.1")]
+        # default grace 10s -> 115 outside [100, 111]
         assert filter_events(events, 100, 101, "victim", "1.1.1.1") == []
         # expand grace -> inside
-        got = filter_events(events, 100, 101, "victim", "1.1.1.1", grace_seconds=10)
+        got = filter_events(events, 100, 101, "victim", "1.1.1.1", grace_seconds=20)
         assert len(got) == 1
 
     def test_default_grace_matches_constant(self):
-        # If someone changes DEFAULT_GRACE_SECONDS, the test that depends on
-        # the 3-second boundary should move with it. Fail loudly otherwise.
-        assert DEFAULT_GRACE_SECONDS == 3.0
+        # If someone changes DEFAULT_GRACE_SECONDS, the tests that depend
+        # on the boundary must move with it. Fail loudly otherwise.
+        assert DEFAULT_GRACE_SECONDS == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ class TestAttributeAll:
         # window AND attack A's grace extension is attributed to B (the
         # attack that was actually running when the alert fired).
         # Scenario from run 20260424T205801Z: icmpdoor [312.14, 321.12]
-        # + grace=3 -> 324.12 covers 323.07. masscan [322, 325] strictly
+        # + default post-grace covers 323.07. masscan [322, 325] strictly
         # covers 323.07. Attribute to masscan (strict wins over grace).
         windows = [
             self._w("icmpdoor", 312.14, 321.12),
@@ -356,11 +356,11 @@ class TestAttributeAll:
 
     def test_event_in_grace_of_a_and_strict_of_b_goes_to_b(self):
         # Back-to-back attacks: a ends, b starts next, alert arrives during
-        # b's real window but within a's grace.
-        # a: [100, 110] + 3s grace = valid up to 113.
+        # b's real window but within a's post-end grace.
+        # a: [100, 110] + default post-grace covers up past b's start.
         # b: [112, 122] starts at 112.
-        # Event at 112.5 is in a's grace (112.5 <= 113) AND b's strict
-        # window (112 <= 112.5 <= 122). Strict beats grace -> b.
+        # Event at 112.5 is in a's post-grace AND b's strict window.
+        # Strict beats post-grace -> b.
         windows = [self._w("a", 100, 110), self._w("b", 112, 122)]
         events = [self._ev(112.5, dest_ip="172.31.76.116", sid=9000003)]
         out = attribute_all(events, windows)
@@ -372,13 +372,13 @@ class TestAttributeAll:
         assert out == {}
 
     def test_custom_grace_honored(self):
-        # Same 3-parameter shape as filter_events; grace extends end_ts.
+        # Same shape as filter_events; grace extends end_ts.
         windows = [self._w("a", 100, 110)]
-        events = [self._ev(115.0, dest_ip="172.31.76.116", sid=1)]
-        # Default grace 3s -> 115 outside [100, 113]
+        events = [self._ev(125.0, dest_ip="172.31.76.116", sid=1)]
+        # Default grace 10s -> 125 outside [100, 120]
         assert attribute_all(events, windows)["a"] == []
-        # Custom grace 10s -> inside [100, 120]
-        assert len(attribute_all(events, windows, grace_seconds=10)["a"]) == 1
+        # Custom grace 20s -> inside [100, 130]
+        assert len(attribute_all(events, windows, grace_seconds=20)["a"]) == 1
 
     def test_sni_target_works(self):
         windows = [self._w(
@@ -439,10 +439,10 @@ class TestAttributeAll:
         assert out["b"] == []
 
     def test_post_end_grace_beats_pre_start_grace(self):
-        # Event at ts=99.5 is in A's post-end grace (A=[90,98]+3 -> 98..101)
-        # AND in B's pre-start grace (B=[100,110], pre=2 -> 98..100).
-        # Policy: post-end (Suricata threshold delay, rock-solid semantic)
-        # beats pre-start (clock-skew correction, speculative).
+        # Event at ts=99.5 is in A's post-end grace (A=[90,98] + 10s grace
+        # covers 98..108) AND in B's pre-start grace (B=[100,110], pre=2
+        # -> 98..100). Policy: post-end beats pre-start (threshold-delay
+        # semantic is rock solid; pre-start is clock-skew heuristic).
         windows = [self._w("a", 90, 98), self._w("b", 100, 110)]
         events = [self._ev(99.5, dest_ip="172.31.76.116", sid=1)]
         out = attribute_all(events, windows)
@@ -459,6 +459,28 @@ class TestAttributeAll:
         out = attribute_all(events, windows)
         assert len(out["a"]) == 1
         assert out["b"] == []
+
+    def test_zeek_service_detection_delay_scenario(self):
+        # Literal reproduction of run 20260424T215121Z:
+        # whois-tunnel probe_start=1777067485.05, probe_end=1777067486.20
+        # (1.15s attack). Zeek's ProtocolDetector::Protocol_Found fired
+        # 4.6s after probe_start (at 1777067489.66). Under the old 3s
+        # post-end grace, the notice was dropped. The 10s default grace
+        # now catches it.
+        windows = [AttackWindow(
+            name="art-whois-tunnel",
+            start_ts=1777067485.05,
+            end_ts=1777067486.20,
+            target_type="victim",
+            target_value="172.31.78.129",
+        )]
+        events = [self._ev(
+            1777067489.66, dest_ip="172.31.78.129",
+            note="ProtocolDetector::Protocol_Found",
+        )]
+        out = attribute_all(events, windows)
+        assert len(out["art-whois-tunnel"]) == 1
+        assert out["art-whois-tunnel"][0]["note"] == "ProtocolDetector::Protocol_Found"
 
     def test_whois_tunnel_clock_skew_scenario(self):
         # Literal reproduction of the live-lab case that triggered this fix.

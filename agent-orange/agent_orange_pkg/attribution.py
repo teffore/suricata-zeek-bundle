@@ -28,12 +28,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-# Default grace window (seconds) appended to the attack's end timestamp.
-# Covers Suricata's threshold bucketing / flow aging delay -- the rule
-# engine can emit an alert a second or two after the triggering packet
-# arrived, so we accept events up to this grace after the attack's
-# recorded end.
-DEFAULT_GRACE_SECONDS = 3.0
+# Default post-end grace (seconds) appended to the attack's end timestamp.
+# Covers two emission-delay sources:
+#
+# 1. Suricata's threshold/flow-aging delay -- the rule engine can emit
+#    an alert a second or two after the triggering packet arrived.
+# 2. Zeek's service-detection delay -- notices like
+#    ProtocolDetector::Protocol_Found are emitted after Zeek has
+#    observed enough bytes to confirm the protocol, which can be 4-5+
+#    seconds after the triggering connection, especially on short
+#    attacks where the connection closes before Zeek finishes analysis.
+#
+# Measured during run 20260424T215121Z: a ProtocolDetector notice for
+# a 1.15s whois-to-8443 attack fired 4.6s after probe_start_ts, 0.46s
+# past the old 3s grace. Bumped to 10s to absorb that and leave
+# headroom for slower service-detection cases.
+#
+# Longer grace means more potential bleed from earlier attacks into
+# later gaps, but attribute_all's strict tier always wins for events
+# inside a later attack's real window, so the extra bleed only lands
+# on events that would otherwise be unattributed entirely.
+DEFAULT_GRACE_SECONDS = 10.0
 
 # Pre-start grace (seconds) subtracted from the attack's start timestamp.
 # Absorbs clock skew between the controller (records probe_start_ts on
