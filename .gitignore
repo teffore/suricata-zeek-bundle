@@ -36,3 +36,8 @@ agent-orange/runs/*.log
 __pycache__/
 *.pyc
 
+# pytest-cov data files — local-only, regenerated each run.
+.coverage
+.coverage.*
+htmlcov/
+
