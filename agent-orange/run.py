@@ -164,6 +164,33 @@ def filter_attacks(
 #  Run assembly
 # ---------------------------------------------------------------------------
 
+def _collect_flow_grouping_events(harvest_result: SensorHarvest) -> list[dict]:
+    """Events fed into compute_flow_owners for cross-stream flow anchoring.
+
+    Includes everything that carries a per-flow identifier (community_id /
+    uid / flow_id) and a timestamp, so a flow whose events span multiple
+    streams gets a single owning attack.
+
+    Conn.log is critical here: every TCP/UDP flow appears once with a
+    stable community_id and the EARLIEST timestamp of the flow. Without
+    conn.log a deferred Zeek notice (e.g. ProtocolDetector::Protocol_Found,
+    which can fire 4-5+s after the triggering connection) is the only
+    event in its flow group, so its anchor ts falls in the wrong attack's
+    post-grace window. Run 20260427T132622Z reproduced this: an HTTP-on-
+    8081 notice fired ~0.5s after port-knock probes ended and was
+    misattributed to port-knock instead of the earlier HTTP attack window
+    where the flow actually started.
+    """
+    events: list[dict] = []
+    events.extend(harvest_result.suricata_alerts)
+    events.extend(harvest_result.zeek_notices)
+    events.extend(harvest_result.zeek_intel)
+    events.extend(harvest_result.zeek_conn)
+    for log_events in harvest_result.zeek_protocol_logs.values():
+        events.extend(log_events)
+    return events
+
+
 def build_ledger(
     *,
     run_id: str,
@@ -213,14 +240,9 @@ def build_ledger(
     # attribute_all call only sees its own stream's events and can
     # split a single flow's evidence across multiple attacks -- the
     # whois-tunnel vs icmpdoor-c2 bug surfaced in run 20260424T221848Z.
-    all_events_for_flow_grouping = (
-        list(harvest_result.suricata_alerts)
-        + list(harvest_result.zeek_notices)
-        + list(harvest_result.zeek_intel)
+    flow_owners = compute_flow_owners(
+        _collect_flow_grouping_events(harvest_result), windows,
     )
-    for events in protocol_logs_by_name.values():
-        all_events_for_flow_grouping.extend(events)
-    flow_owners = compute_flow_owners(all_events_for_flow_grouping, windows)
 
     alerts_by_attack = attribute_all(
         harvest_result.suricata_alerts, windows, flow_owners=flow_owners,

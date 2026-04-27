@@ -362,3 +362,102 @@ class TestFailedAttack:
         assert runs[0].probe_start_ts <= runs[0].probe_end_ts
         assert runs[0].exit_code == 255  # preserved even with ssh_error
         assert "ssh transport error" in runs[0].error
+
+
+# ---------------------------------------------------------------------------
+#  Flow-aware attribution: deferred Zeek notice anchored by conn.log
+# ---------------------------------------------------------------------------
+
+class TestDeferredNoticeAnchorsOnConnLog:
+    """Regression for run 20260427T132622Z: a Zeek notice with delayed
+    emission (ProtocolDetector::Protocol_Found can fire 4-5+s after the
+    triggering connection) carries a community_id matching its earlier
+    conn.log entry. The notice's own ts lands in a temporally-adjacent
+    later attack's post-grace window; without conn.log in the flow-
+    grouping input, the flow has size 1 and anchors on the late ts,
+    misattributing to the wrong attack.
+
+    Setup mirrors the live-lab repro:
+      - "earlier-http"  window [100, 102] -- triggers HTTP-on-8081 flow
+      - "later-knock"   window [110, 111] -- port-knock SYN burst, all
+                                              targeting the same victim IP
+      - conn.log entry at ts=100.5 with community_id=X (flow start)
+      - notice at ts=112 with community_id=X (delayed Protocol_Found
+        emission, lands in later-knock's post-grace)
+
+    Correct attribution: notice -> earlier-http (flow ground truth).
+    """
+
+    def test_delayed_notice_attributes_to_flow_origin_attack(self):
+        from agent_orange_pkg.attribution import (
+            AttackWindow, attribute_all, compute_flow_owners,
+        )
+        from run import _collect_flow_grouping_events
+
+        windows = [
+            AttackWindow(
+                name="earlier-http", start_ts=100.0, end_ts=102.0,
+                target_type="victim", target_value=VICTIM_IP,
+            ),
+            AttackWindow(
+                name="later-knock", start_ts=110.0, end_ts=111.0,
+                target_type="victim", target_value=VICTIM_IP,
+            ),
+        ]
+        conn_event = {
+            "ts": 100.5, "dest_ip": VICTIM_IP, "sni": None,
+            "community_id": "1:fakeflowX=", "_log": "conn.log",
+        }
+        notice_event = {
+            "ts": 112.0, "dest_ip": VICTIM_IP, "sni": None,
+            "note": "ProtocolDetector::Protocol_Found",
+            "msg": "HTTP on port 8081/tcp",
+            "community_id": "1:fakeflowX=",
+            "uid": "Cabc123",
+        }
+        harvest = SensorHarvest(
+            suricata_alerts=[],
+            zeek_notices=[notice_event],
+            zeek_weird=[],
+            zeek_intel=[],
+            zeek_conn=[conn_event],
+            zeek_protocol_logs={},
+            zeek_loaded_scripts="",
+            zeek_stats="",
+            baseline=_baseline(),
+            harvest_at=120.0,
+        )
+
+        flow_owners = compute_flow_owners(
+            _collect_flow_grouping_events(harvest), windows,
+        )
+        # Flow X anchors on the conn.log entry (ts=100.5, inside earlier-http
+        # strict window), so the late notice with the same community_id is
+        # owned by earlier-http -- not later-knock's post-grace.
+        assert flow_owners.get("1:fakeflowX=") == "earlier-http"
+
+        notices_by_attack = attribute_all(
+            harvest.zeek_notices, windows, flow_owners=flow_owners,
+        )
+        assert len(notices_by_attack["earlier-http"]) == 1
+        assert notices_by_attack["later-knock"] == []
+
+    def test_collect_flow_grouping_events_includes_conn_log(self):
+        from run import _collect_flow_grouping_events
+
+        conn_event = {"ts": 1.0, "dest_ip": VICTIM_IP,
+                      "community_id": "C1", "_log": "conn.log"}
+        harvest = SensorHarvest(
+            suricata_alerts=[],
+            zeek_notices=[],
+            zeek_weird=[],
+            zeek_intel=[],
+            zeek_conn=[conn_event],
+            zeek_protocol_logs={},
+            zeek_loaded_scripts="",
+            zeek_stats="",
+            baseline=_baseline(),
+            harvest_at=2.0,
+        )
+        events = _collect_flow_grouping_events(harvest)
+        assert conn_event in events
